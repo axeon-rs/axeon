@@ -1,0 +1,27 @@
+[package]
+name = "axeon"
+version = "0.1.0"
+edition = "2021"
+description = "A modern and flexible backend server framework for Rust"
+license = "MIT"
+authors = ["sketch"]
+repository = "https://github.com/sketch/axeon"
+documentation = "https://docs.rs/axeon"
+readme = "README.md"
+keywords = ["web", "framework", "server", "http", "async"]
+categories = ["web-programming::http-server", "asynchronous"]
+
+[dependencies]
+futures = "0.3.31"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+urlencoding = "2.1.3"
+base64 = "0.22.1"
+httpdate = "1.0.3"
+tokio = { version = "1.0", features = ["full"] }
+lazy_static = "1.5.0"
+moka = { version = "0.12", features = ["future"] }
+flate2 = "1.0"
+rustls = "0.23"
+rustls-pemfile = "2.2"
+tokio-rustls = "0.26"
