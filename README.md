@@ -93,6 +93,10 @@ impl Middleware for Logger {
             res
         })
     }
+
+    fn clone_box(&self) -> Box<dyn Middleware> {
+        Box::new(Self)
+    }
 }
 
 let mut app = Server::new();
