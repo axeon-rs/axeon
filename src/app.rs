@@ -1,18 +1,20 @@
-//! Application is the main entry point for the Axeon framework.
+//! Server is the main entry point for the Axeon framework.
 //!
-//! This module provides the core Application struct that serves as the main
+//! This module provides the core Server struct that serves as the main
 //! entry point for building web applications with Axeon.
 //!
 //! # Examples
 //!
 //! ```rust
-//! use axeon::app::Application;
-//! use axeon::ok_json;
+//! use axeon::{Server, ok_json};
 //!
-//! let mut app = Application::new();
-//! app.get("/", |_req| async {
-//!     ok_json!({ "message": "Hello!" })
-//! });
+//! fn main() {
+//!     let mut app = Server::new();
+//!     app.get("/", |_req| async {
+//!         ok_json!({ "message": "Hello!" })
+//!     });
+//!    app.listen("127.0.0.1:3000").unwrap();
+//! }
 //! ```
 
 use crate::error::ServerError;
@@ -79,25 +81,26 @@ impl TlsConfig {
 /// # Example
 ///
 /// ```rust
-/// use axeon::app::Application;
-/// use axeon::ok_json;
-/// use axeon::http::Response;
+/// use axeon::{ok_json, Server};
 ///
-/// let mut app = Application::new();
 ///
-/// // Add a route
-/// app.get("/", |_req| async {
+/// fn main() {
+///     let mut app = Server::new();
+///
+///     // Add a route
+///     app.get("/", |_req| async {
 ///     ok_json!({ "message": "Hello" })
-/// });
+///     });
 ///
-/// // Start the server
-/// app.listen("127.0.0.1:3000").unwrap();
+///     // Start the server
+///     app.listen("127.0.0.1:3000").unwrap();
+/// }
 /// ```
 ///
 ///
 
 #[derive(Clone)]
-pub struct Application {
+pub struct Server {
     pub max_connections: usize,
     pub keep_alive: Duration,
     router: Router,
@@ -107,7 +110,7 @@ pub struct Application {
     tls_config: Option<Arc<TlsConfig>>,
 }
 
-impl Application {
+impl Server {
     /// Creates a new Application instance
     pub fn new() -> Self {
         Self {
@@ -466,6 +469,10 @@ impl Application {
     ///
     /// # Example
     /// ```rust
+    ///
+    /// use axeon::Server;
+    ///
+    /// let mut app = Server::new();
     /// app.static_dir("public");
     /// ```
     pub fn static_dir(&mut self, dir: &str) -> &mut Self {

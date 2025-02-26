@@ -43,7 +43,7 @@ impl Response {
     }
 
     // Enhanced JSON response handling
-    pub fn json<T: Serialize>(&mut self, value: &T) -> Result<&mut Self, ServerError> {
+    pub(crate) fn json<T: Serialize>(&mut self, value: &T) -> Result<&mut Self, ServerError> {
         let json_string = serde_json::to_string(value)
             .map_err(|e| ServerError::InternalError(format!("JSON serialization error: {}", e)))?;
         self.header("Content-Type", "application/json");
@@ -134,43 +134,43 @@ impl Response {
     }
 
     // New convenience methods
-    pub fn text<T: AsRef<str>>(content: T) -> Response {
+    pub fn text<T: AsRef<str>>(content: T) -> Result<Response, ServerError> {
         let mut response = Response::new(200);
         response
             .header("Content-Type", "text/plain")
             .body(content);
-        response
+        Ok(response)
     }
 
-    pub fn html<T: AsRef<str>>(content: T) -> Response {
+    pub fn html<T: AsRef<str>>(content: T) -> Result<Response, ServerError> {
         let mut response = Response::new(200);
         response
             .header("Content-Type", "text/html")
             .body(content);
-        response
+        Ok(response)
     }
 
-    pub fn xml<T: AsRef<str>>(content: T) -> Response {
+    pub fn xml<T: AsRef<str>>(content: T) -> Result<Response, ServerError> {
         let mut response = Response::new(200);
         response
             .header("Content-Type", "application/xml")
             .body(content);
-        response
+        Ok(response)
     }
 
-    pub fn redirect(location: &str) -> Response {
+    pub fn redirect(location: &str) -> Result<Response, ServerError> {
         let mut response = Response::new(302);
         response.header("Location", location);
-        response
+        Ok(response)
     }
 
-    pub fn permanent_redirect(location: &str) -> Response {
+    pub fn permanent_redirect(location: &str) -> Result<Response, ServerError> {
         let mut response = Response::new(301);
         response.header("Location", location);
-        response
+        Ok(response)
     }
 
-    pub fn method_not_allowed(allowed_methods: &[&str]) -> Response {
+    pub fn method_not_allowed(allowed_methods: &[&str]) -> Result<Response, ServerError> {
         let mut response = Response::new(405);
         response
             .header("Allow", allowed_methods.join(", "))
@@ -180,7 +180,7 @@ impl Response {
                     "allowed_methods": allowed_methods
                 }
             })).expect("Error creating JSON response");
-        response
+        Ok(response)
     }
 
     pub fn with_cache_control(&mut self, directive: &str) -> &mut Self {
@@ -258,17 +258,13 @@ impl Response {
 #[macro_export]
 macro_rules! ok_json {
     ($($json:tt)+) => {{
-        let mut response = axeon::http::Response::new(200);
-        response.json(&axeon::json!($($json)+)).expect("Error creating JSON response");
-        Ok(response)
+        Response::ok(&axeon::json!($($json)+))
     }};
 }
 
 #[macro_export]
 macro_rules! created_json {
    ($($json:tt)+) => {{
-        let mut response =  axeon::http::Response::new(200);
-        response.json(&axeon::json!($($json)+)).expect("Error creating JSON response");
-        Ok(response)
+         Response::created(&axeon::json!($($json)+))
     }};
 }
