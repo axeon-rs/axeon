@@ -122,7 +122,7 @@ app.mount("/api", api);
 
 For detailed documentation and more examples, check out:
 - [API Documentation](https://docs.rs/axeon)
-- [Examples Directory](https://github.com/yourusername/axeon/tree/main/examples)
+- [Examples Directory](https://github.com/axeon-rs/axeon/tree/master/examples)
 
 ## License
 
