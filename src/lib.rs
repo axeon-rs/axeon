@@ -90,6 +90,7 @@ pub mod database;
 pub(crate) mod error;
 pub(crate) mod handler;
 mod lifecycle;
+mod static_files;
 pub(crate) mod http;
 pub mod middleware;
 pub mod sse;

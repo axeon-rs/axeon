@@ -19,6 +19,8 @@ pub struct Response {
     stream: Option<BodyStream>,
     /// End the stream when the server shuts down (server-sent events).
     pub(crate) end_on_shutdown: bool,
+    /// Length of the streamed body, sent as `Content-Length` when known.
+    stream_length: Option<u64>,
 }
 
 impl fmt::Debug for Response {
@@ -56,6 +58,7 @@ impl Response {
             body: Bytes::new(),
             stream: None,
             end_on_shutdown: false,
+            stream_length: None,
         }
     }
 
@@ -85,6 +88,25 @@ impl Response {
         response.header("Content-Type", content_type);
         response.stream = Some(Box::pin(stream.map(|chunk| chunk.map(Into::into).map_err(Into::into))));
         response
+    }
+
+    /// Like [`Response::stream`] for a body whose length is known up front
+    /// (a file, a proxied response). It is sent as `Content-Length`, so
+    /// clients can show progress; the stream must yield exactly `length`
+    /// bytes or the connection is aborted.
+    pub fn stream_with_length<S, B, E>(content_type: &str, length: u64, stream: S) -> Response
+    where
+        S: Stream<Item = Result<B, E>> + Send + 'static,
+        B: Into<Bytes>,
+        E: Into<BoxError>,
+    {
+        let mut response = Response::stream(content_type, stream);
+        response.stream_length = Some(length);
+        response
+    }
+
+    pub(crate) fn stream_length(&self) -> Option<u64> {
+        self.stream_length
     }
 
     /// True if the body is a stream rather than `body`.

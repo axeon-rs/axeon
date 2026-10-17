@@ -18,14 +18,15 @@
 //! ```
 
 use crate::error::ServerError;
-use crate::handler::{HttpResponse, IntoResponse};
+use crate::handler::{error_response, panic_error, ErrorHandler, HttpResponse, IntoResponse};
 use crate::http::response::status_has_body;
 use crate::http::request::parse_query;
 use crate::http::{Body, Method, Request};
 use crate::http::Response;
-use crate::middleware::{Chain, Middleware};
+use crate::middleware::{Chain, Middleware, MiddlewareManager, Next};
 use crate::plugins::Plugins;
 use crate::router::{CompiledRouter, Route, Router};
+use crate::static_files::StaticFiles;
 use bytes::Bytes;
 use futures::FutureExt;
 use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
@@ -42,10 +43,12 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "tls")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -60,7 +63,6 @@ use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 #[cfg(feature = "tls")]
 use crate::tls::TlsConfig;
 
-type ErrorHandler = Arc<dyn Fn(ServerError) -> Response + Send + Sync>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type HyperResponse = hyper::Response<UnsyncBoxBody<Bytes, BoxError>>;
 
@@ -113,7 +115,10 @@ pub struct Server {
     shutdown_timeout: Duration,
     limits: Limits,
     router: Router,
+    /// Middleware that wraps every request.
+    global: MiddlewareManager,
     static_dir: Option<PathBuf>,
+    static_cache_control: String,
     plugins: Plugins,
     on_error: Option<ErrorHandler>,
     #[cfg(feature = "tls")]
@@ -141,7 +146,9 @@ impl Server {
                 max_body_size: 2 * 1024 * 1024,
             },
             router: Router::new(),
+            global: MiddlewareManager::default(),
             static_dir: None,
+            static_cache_control: "no-cache".to_string(),
             plugins: Plugins::new(),
             on_error: None,
             #[cfg(feature = "tls")]
@@ -345,12 +352,15 @@ impl Server {
         self.router.trace(path, handler);
     }
 
-    /// Adds a middleware to the application
+    /// Adds middleware that wraps every request: all routes (registered
+    /// before or after this call), 404 and 405 responses, static files and
+    /// automatic `OPTIONS` replies. Middleware runs in the order added, before
+    /// any [`Router`] middleware.
     ///
     /// # Arguments
     /// * `middleware` - The middleware to add
     pub fn middleware(&mut self, middleware: impl Middleware + 'static) {
-        self.router.middleware(middleware);
+        self.global.add(middleware);
     }
 
     /// Mounts a router at a specific path
@@ -383,8 +393,22 @@ impl Server {
     /// let mut app = Server::new();
     /// app.static_dir("public");
     /// ```
+    ///
+    /// Files are served for GET and HEAD requests that match no route. Large
+    /// files are streamed from disk; range requests (206) and conditional
+    /// requests (304, via `ETag` and `Last-Modified`) are supported. Hidden
+    /// files such as `.env` are never served, except under `/.well-known/`.
     pub fn static_dir(&mut self, dir: &str) -> &mut Self {
         self.static_dir = Some(PathBuf::from(dir));
+        self
+    }
+
+    /// The `Cache-Control` header for static files. Default: `no-cache`,
+    /// which lets browsers cache files but check for changes (a cheap 304)
+    /// before using them. For fingerprinted assets (`app.3f9a1c.js`) use
+    /// something like `public, max-age=31536000, immutable`.
+    pub fn static_cache_control(&mut self, value: &str) -> &mut Self {
+        self.static_cache_control = value.to_string();
         self
     }
 
@@ -577,8 +601,9 @@ pub async fn shutdown_signal() {
 /// # });
 /// ```
 pub struct App {
-    router: CompiledRouter,
-    static_root: Option<PathBuf>,
+    routing: Arc<Routing>,
+    /// Global middleware around routing, if any; requests start here.
+    entry: Option<Arc<Chain>>,
     plugins: Plugins,
     on_error: Option<ErrorHandler>,
     limits: Limits,
@@ -612,12 +637,16 @@ impl App {
     }
 
     async fn build(server: Server) -> Result<Self, BoxError> {
-        let router = server.router.compile()?;
+        let on_error = server.on_error;
+        let router = server.router.compile(on_error.clone())?;
+        if HeaderValue::from_str(&server.static_cache_control).is_err() {
+            return Err(format!("invalid static Cache-Control value {:?}", server.static_cache_control).into());
+        }
 
         // Resolve the static root once instead of on every request.
-        let static_root = match server.static_dir {
+        let static_files = match server.static_dir {
             Some(dir) => match tokio::fs::canonicalize(&dir).await {
-                Ok(root) => Some(root),
+                Ok(root) => Some(StaticFiles::new(root, server.static_cache_control)),
                 Err(e) => {
                     warn!(dir = %dir.display(), error = %e, "static directory is unavailable");
                     None
@@ -625,6 +654,19 @@ impl App {
             },
             None => None,
         };
+
+        let routing = Arc::new(Routing { router, static_files });
+        let entry = (!server.global.middlewares.is_empty()).then(|| {
+            let terminal = Arc::clone(&routing);
+            Arc::new(Chain {
+                middlewares: server.global.middlewares.into(),
+                handler: Arc::new(move |req: Request| {
+                    let routing = Arc::clone(&terminal);
+                    async move { routing.handle(req).await }
+                }),
+                on_error: on_error.clone(),
+            })
+        });
 
         let limits = server.limits;
         let mut http = auto::Builder::new(TokioExecutor::new());
@@ -640,10 +682,10 @@ impl App {
             .max_concurrent_streams(256);
 
         Ok(Self {
-            router,
-            static_root,
+            routing,
+            entry,
             plugins: server.plugins,
-            on_error: server.on_error,
+            on_error,
             limits,
             request_timeout: server.request_timeout,
             write_timeout: server.write_timeout,
@@ -783,10 +825,14 @@ impl App {
         let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let has_body = status_has_body(status.as_u16());
         let stream = response.take_stream();
+        let stream_length = response.stream_length();
         let mut headers = response.headers;
         // Framing is ours to decide.
         headers.remove(TRANSFER_ENCODING);
         headers.remove(CONTENT_LENGTH);
+        if let (true, Some(_), Some(length)) = (has_body, &stream, stream_length) {
+            headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
+        }
         let body = match stream {
             Some(stream) if has_body && response.end_on_shutdown => {
                 // Event streams end cleanly at shutdown so clients reconnect elsewhere.
@@ -811,35 +857,40 @@ impl App {
         out
     }
 
-    /// Runs routing and handlers, converting panics and errors into responses.
+    /// Runs global middleware, routing and handlers. Errors and panics are
+    /// already turned into responses inside the chain; this is a backstop.
     async fn dispatch(&self, request: Request) -> Response {
-        let response = AssertUnwindSafe(self.handle(request)).catch_unwind().await;
-        let response = match response {
-            Ok(response) => response,
-            Err(err) => {
-                let panic_msg = if let Some(msg) = err.downcast_ref::<&str>() {
-                    msg.to_string()
-                } else if let Some(msg) = err.downcast_ref::<String>() {
-                    msg.clone()
-                } else {
-                    "Unknown panic".to_string()
-                };
-                error!(panic = %panic_msg, "handler panicked");
-                Err(ServerError::PanicError(panic_msg))
-            },
+        let response = match &self.entry {
+            Some(entry) => AssertUnwindSafe(Next::start(Arc::clone(entry)).handle(request)).catch_unwind().await,
+            None => AssertUnwindSafe(self.routing.handle(request)).catch_unwind().await,
         };
         match response {
-            Ok(response) => response,
-            Err(err) => self.handle_error(err),
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => self.handle_error(err),
+            Err(payload) => self.handle_error(panic_error(payload)),
         }
     }
 
+    fn handle_error(&self, error: ServerError) -> Response {
+        error_response(self.on_error.as_ref(), error)
+    }
+}
+
+/// Routes, handlers and static files: the end of the global middleware chain.
+struct Routing {
+    router: CompiledRouter,
+    static_files: Option<StaticFiles>,
+}
+
+impl Routing {
     async fn handle(&self, mut req: Request) -> HttpResponse {
         let method = req.method;
         let Some((routes, params)) = self.router.lookup(&req.path) else {
             if method == Method::GET || method == Method::HEAD {
-                if let Some(response) = self.handle_static_file(&req.path).await {
-                    return Ok(response);
+                if let Some(static_files) = &self.static_files {
+                    if let Some(response) = static_files.serve(&req).await {
+                        return Ok(response);
+                    }
                 }
             }
             return Err(ServerError::NotFound);
@@ -858,29 +909,6 @@ impl App {
             return handle_options(routes, allow, req).await;
         }
         Err(ServerError::MethodNotAllowed(allow))
-    }
-
-    fn handle_error(&self, error: ServerError) -> Response {
-        if let Some(handler) = &self.on_error {
-            handler(error)
-        } else {
-            Response::error(error)
-        }
-    }
-
-    async fn handle_static_file(&self, path: &str) -> Option<Response> {
-        let static_root = self.static_root.as_ref()?;
-        let decoded = urlencoding::decode(path.trim_start_matches('/')).ok()?;
-        let file_path = static_root.join(decoded.as_ref());
-        let canonical_path = tokio::fs::canonicalize(&file_path).await.ok()?;
-        if !canonical_path.starts_with(static_root) {
-            return None;
-        }
-        let metadata = tokio::fs::metadata(&canonical_path).await.ok()?;
-        if !metadata.is_file() {
-            return None;
-        }
-        serve_file(&canonical_path, &metadata).await
     }
 }
 
@@ -952,14 +980,13 @@ fn allow_header(routes: &HashMap<Method, Route>) -> String {
 /// Automatic OPTIONS response. Runs the path's middleware so CORS
 /// preflights work for routes without an explicit OPTIONS handler.
 async fn handle_options(routes: &HashMap<Method, Route>, allow: String, req: Request) -> HttpResponse {
-    let middlewares = routes
-        .get(&Method::GET)
-        .or_else(|| routes.values().next())
-        .map(|route| Arc::clone(&route.chain.middlewares))
-        .unwrap_or_else(|| Arc::new([]));
+    let template = routes.get(&Method::GET).or_else(|| routes.values().next());
+    let middlewares = template.map(|route| Arc::clone(&route.chain.middlewares)).unwrap_or_else(|| Arc::new([]));
+    let on_error = template.and_then(|route| route.chain.on_error.clone());
     let route = Route {
         chain: Arc::new(Chain {
             middlewares,
+            on_error,
             handler: Arc::new(move |_req: Request| {
                 let allow = allow.clone();
                 async move {
@@ -972,59 +999,6 @@ async fn handle_options(routes: &HashMap<Method, Route>, allow: String, req: Req
     };
     route.handle(req).await
 }
-
-async fn serve_file(path: &Path, metadata: &std::fs::Metadata) -> Option<Response> {
-    let contents = tokio::fs::read(path).await.ok()?;
-    let mut response = Response::new(200);
-
-    // Set content type based on file extension
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-    let content_type = match ext.as_str() {
-        "html" | "htm" => "text/html; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "js" | "mjs" => "text/javascript; charset=utf-8",
-        "json" => "application/json",
-        "txt" => "text/plain; charset=utf-8",
-        "xml" => "application/xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "avif" => "image/avif",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "wasm" => "application/wasm",
-        "pdf" => "application/pdf",
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        "mp3" => "audio/mpeg",
-        _ => "application/octet-stream",
-    };
-    response.header("Content-Type", content_type);
-
-    // Set cache control headers
-    response.header("Cache-Control", "public, max-age=31536000");
-
-    if let Ok(modified) = metadata.modified() {
-        response.header("Last-Modified", httpdate::fmt_http_date(modified));
-        // ETag from size and modification time
-        let secs = modified
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        response.header("ETag", format!("\"{}-{}\"", metadata.len(), secs));
-    }
-
-    response.body = Bytes::from(contents);
-    Some(response)
-}
-
 
 /// Connection errors that just mean the client went away or timed out.
 fn is_disconnect(e: &(dyn std::error::Error + 'static)) -> bool {

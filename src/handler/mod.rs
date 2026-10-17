@@ -4,10 +4,37 @@ use crate::http::Response;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use serde::Serialize;
+use std::any::Any;
 use std::borrow::Cow;
 use std::future::Future;
+use std::sync::Arc;
 
 pub(crate) type HttpResponse = ServerResult<Response>;
+
+/// The application's error handler (`Server::on_error`).
+pub(crate) type ErrorHandler = Arc<dyn Fn(ServerError) -> Response + Send + Sync>;
+
+/// Turns an error into a response with the error handler, or the default
+/// JSON error body.
+pub(crate) fn error_response(handler: Option<&ErrorHandler>, error: ServerError) -> Response {
+    match handler {
+        Some(handler) => handler(error),
+        None => Response::error(error),
+    }
+}
+
+/// Logs a caught panic and turns it into a `PanicError`.
+pub(crate) fn panic_error(payload: Box<dyn Any + Send>) -> ServerError {
+    let message = if let Some(msg) = payload.downcast_ref::<&str>() {
+        msg.to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "Unknown panic".to_string()
+    };
+    tracing::error!(panic = %message, "handler panicked");
+    ServerError::PanicError(message)
+}
 
 /// Anything a handler or middleware can return.
 ///

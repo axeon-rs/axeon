@@ -150,6 +150,13 @@ impl Middleware for CompressionMiddleware {
                 if compressed.len() < response.body.len() {
                     response.body = compressed.into();
                     response.header("Content-Encoding", encoding.name());
+                    // The bytes changed: a strong ETag would now be wrong, and
+                    // byte ranges of the original no longer apply.
+                    if let Some(etag) = response.get_header("etag").filter(|tag| !tag.starts_with("W/")) {
+                        let weak = format!("W/{}", etag);
+                        response.header("ETag", weak);
+                    }
+                    response.remove_header("accept-ranges");
                 }
             }
 

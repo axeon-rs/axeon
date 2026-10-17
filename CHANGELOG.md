@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.4.1 (unreleased)
+
+### Fixed
+
+- Global middleware (`Server::middleware`) now wraps every request: 404 and
+  405 responses, static files and automatic `OPTIONS` replies used to bypass
+  it, so `RequestLogger` didn't log them, `SetRequestId` and `Cors` didn't add
+  their headers, and `RateLimiter` didn't count them.
+- Global middleware applies to all routes, including ones registered before
+  it; router middleware applies to all of that router's routes.
+- Errors and panics now reach middleware as responses (rendered by
+  `on_error`), so headers added by middleware appear on error responses too.
+- Static files were read entirely into memory before sending, so large files
+  could exhaust memory. They are now streamed from disk with a
+  `Content-Length`.
+- Static files were sent with `Cache-Control: public, max-age=31536000`, so
+  browsers kept stale HTML and assets for a year. The default is now
+  `no-cache` (revalidate before use), configurable with
+  `Server::static_cache_control`.
+
+### Added
+
+- Range requests for static files (`206 Partial Content`, `416`, `If-Range`):
+  resumable downloads and video seeking.
+- Conditional requests for static files: `If-None-Match` and
+  `If-Modified-Since` get `304 Not Modified`.
+- `Response::stream_with_length` for streamed bodies of known length.
+- `Server::static_cache_control`.
+
+### Changed
+
+- Hidden files (`.env`, `.git/...`) in the static directory are no longer
+  served; `/.well-known/` still is.
+- `CompressionMiddleware` marks the `ETag` of compressed responses weak and
+  drops `Accept-Ranges`.
+- Middleware that matched on `Err` from `next.handle(req)` now receives the
+  rendered error response instead; read `res.status` for the status code.
+- Each middleware layer costs about 0.1 µs per request (was about 55 ns),
+  the price of rendering errors into responses between layers. Requests with
+  no global middleware are unaffected.
+
 ## 0.4.0 (unreleased)
 
 A rewrite of the server internals on [hyper](https://hyper.rs), with HTTP/2,

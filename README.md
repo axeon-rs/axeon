@@ -162,10 +162,32 @@ app.on_error(|err| {
 Panics in handlers become `500 Internal Server Error`; their messages are
 logged, never sent to clients.
 
+## Static Files
+
+`app.static_dir("public")` serves files for GET and HEAD requests that match
+no route. Files are streamed from disk, so large downloads don't use memory;
+range requests (resumable downloads, video seeking) get `206`, and browsers
+revalidate cached copies with `ETag`/`Last-Modified` for a cheap `304`. Hidden
+files such as `.env` or `.git/` are never served, except under `/.well-known/`.
+
+By default files are sent with `Cache-Control: no-cache` (cache, but check for
+changes). For fingerprinted assets, cache them for good:
+
+```rust
+use axeon::Server;
+
+let mut app = Server::new();
+app.static_dir("public")
+    .static_cache_control("public, max-age=31536000, immutable");
+```
+
 ## Middleware
 
-Middleware runs around every route registered after it, in order. Write it as
-a closure:
+Middleware added with `app.middleware(..)` wraps every request, in the order
+added: all routes (whenever they were registered), 404 and 405 responses,
+static files and automatic `OPTIONS` replies. Errors and panics from inside
+the chain arrive as responses (rendered by `on_error`), so middleware can add
+headers to every response. Write it as a closure:
 
 ```rust
 use axeon::{Server, ServerError};
@@ -207,7 +229,8 @@ impl Middleware for CountRequests {
 }
 ```
 
-Middleware added to a `Router` applies only to that router's routes. Shared
+Middleware added to a `Router` applies to all of that router's routes, after
+the global middleware, and to nothing else. Shared
 application state (database pools, configuration) is registered once and read
 from any handler:
 
@@ -306,7 +329,8 @@ app.max_connections(10_000)                    // default 1024; extra clients wa
     .max_body_size(1024 * 1024)                // 413 above this; default 2 MiB
     .max_header_size(16 * 1024)                // 431 above this; default 16 KiB, min 8 KiB
     .max_headers(64)                           // default 100
-    .static_dir("public");                     // serve files for unmatched GET requests
+    .static_dir("public")                      // serve files for unmatched GET/HEAD requests
+    .static_cache_control("no-cache");         // default; revalidates with a cheap 304
 ```
 
 HTTPS needs a PEM certificate chain and key; HTTP/2 is negotiated
@@ -417,8 +441,8 @@ axeon = { version = "0.4", default-features = false, features = ["tls"] }
 
 `cargo bench` runs in-process benchmarks of routing, middleware and JSON
 responses. On an Apple Silicon laptop, a request to a dynamic route takes about
-0.55 µs whether the app has 10 or 1000 routes, and each middleware layer adds
-about 55 ns.
+0.6 µs whether the app has 10 or 1000 routes, and each middleware layer adds
+about 0.1 µs.
 
 ## Examples
 

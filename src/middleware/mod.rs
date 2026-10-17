@@ -9,20 +9,27 @@ pub use security::{RateLimitConfig, RateLimiter, SecurityConfig, SecurityHeaders
 pub use compression::{CompressionConfig, CompressionMiddleware};
 pub use observe::{RequestId, RequestLogger, SetRequestId};
 
-use crate::handler::{Handler, HttpResponse, IntoResponse};
+use crate::handler::{error_response, panic_error, ErrorHandler, Handler, HttpResponse, IntoResponse};
 use futures::future::BoxFuture;
+use futures::FutureExt;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-/// The middleware stack and handler for one route, built once at
-/// registration and shared by every request.
+/// A middleware stack and the handler at its end, built once when the
+/// server starts and shared by every request.
 pub(crate) struct Chain {
     pub(crate) middlewares: Arc<[Arc<dyn Middleware>]>,
     pub(crate) handler: Arc<dyn Handler>,
+    pub(crate) on_error: Option<ErrorHandler>,
 }
 
 /// The rest of the middleware chain. Calling [`Next::handle`] runs the next
 /// middleware, or the route handler after the last one.
+///
+/// Errors and panics further down the chain arrive as responses, already
+/// rendered by the error handler (`Server::on_error`), so middleware can add
+/// headers to every response, including 404s and 500s.
 ///
 /// Cloning is cheap: it is a reference to the route's chain plus a position.
 #[derive(Clone)]
@@ -42,6 +49,7 @@ impl Next {
         Self::start(Arc::new(Chain {
             middlewares: Arc::new([]),
             handler: Arc::new(handler),
+            on_error: None,
         }))
     }
 
@@ -50,7 +58,7 @@ impl Next {
     }
 
     pub fn handle(&self, req: Request) -> MiddlewareResult {
-        match self.chain.middlewares.get(self.index) {
+        let started = std::panic::catch_unwind(AssertUnwindSafe(|| match self.chain.middlewares.get(self.index) {
             Some(middleware) => middleware.call(
                 req,
                 Next {
@@ -59,7 +67,29 @@ impl Next {
                 },
             ),
             None => self.chain.handler.handle(req),
+        }));
+        let future = match started {
+            Ok(future) => future,
+            Err(payload) => {
+                let error = panic_error(payload);
+                return Box::pin(async move { Err(error) });
+            }
+        };
+        // The start of a chain returns to routing or to the server, which
+        // handle errors themselves; only middleware awaiting `next` needs
+        // them rendered, so the conversion is skipped there.
+        if self.index == 0 {
+            return future;
         }
+        let on_error = self.chain.on_error.clone();
+        if self.index == self.chain.middlewares.len() {
+            // The handler: catch its panics so middleware sees a 500 response.
+            return Box::pin(async move {
+                let result = AssertUnwindSafe(future).catch_unwind().await.unwrap_or_else(|p| Err(panic_error(p)));
+                Ok(result.unwrap_or_else(|error| error_response(on_error.as_ref(), error)))
+            });
+        }
+        Box::pin(async move { Ok(future.await.unwrap_or_else(|error| error_response(on_error.as_ref(), error))) })
     }
 }
 
@@ -78,7 +108,7 @@ pub trait Middleware: Send + Sync + 'static {
 /// use axeon::middleware::from_fn;
 ///
 /// let mut app = Server::new();
-/// // Runs around every route registered after it.
+/// // Wraps every request, including 404s and static files.
 /// app.middleware(from_fn(|req, next| async move {
 ///     if req.get_header("x-api-key").is_none() {
 ///         return Err(ServerError::Unauthorized("missing API key".into()));
@@ -110,7 +140,7 @@ where
     }
 }
 
-/// Middleware registered on a router, applied to routes added after it.
+/// Middleware registered on the server or a router.
 #[derive(Clone, Default)]
 pub(crate) struct MiddlewareManager {
     pub(crate) middlewares: Vec<Arc<dyn Middleware>>,

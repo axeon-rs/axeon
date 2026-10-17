@@ -120,8 +120,11 @@ pub struct TempDir(pub PathBuf);
 
 impl TempDir {
     pub fn new(name: &str) -> Self {
+        // Unique per call: tests run in parallel and clocks can repeat.
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("axeon-{}-{}-{}", name, std::process::id(), nanos));
+        let path = std::env::temp_dir().join(format!("axeon-{}-{}-{}-{}", name, std::process::id(), nanos, n));
         std::fs::create_dir_all(&path).unwrap();
         TempDir(path)
     }

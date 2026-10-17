@@ -1,4 +1,4 @@
-use crate::handler::IntoResponse;
+use crate::handler::{ErrorHandler, Handler, IntoResponse};
 use crate::http::{Method, Request};
 use crate::middleware::{Chain, Middleware, MiddlewareManager, MiddlewareResult, Next};
 use std::collections::HashMap;
@@ -16,13 +16,24 @@ impl Route {
     }
 }
 
+/// A registered handler and the middleware of the routers it was mounted from.
+#[derive(Clone)]
+pub(crate) struct Endpoint {
+    handler: Arc<dyn Handler>,
+    middlewares: Vec<Arc<dyn Middleware>>,
+}
+
 /// A group of routes with shared middleware. Paths use `:name` for a
 /// parameter segment and `*name` for a trailing catch-all, e.g.
 /// `/users/:id` or `/files/*path`.
+///
+/// Middleware added with [`Router::middleware`] applies to every route of
+/// this router, whether added before or after it, and runs after the
+/// server's global middleware.
 #[derive(Clone, Default)]
 pub struct Router {
     pub(crate) middlewares: MiddlewareManager,
-    pub(crate) routes: HashMap<String, HashMap<Method, Route>>,
+    pub(crate) routes: HashMap<String, HashMap<Method, Endpoint>>,
 }
 
 impl Router {
@@ -126,48 +137,38 @@ impl Router {
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
-        // Middleware registered so far applies to this route.
-        let chain = Chain {
-            middlewares: self.middlewares.middlewares.clone().into(),
-            handler: Arc::new(handler),
-        };
-        self.routes
-            .entry(normalize(path))
-            .or_default()
-            .insert(method, Route { chain: Arc::new(chain) });
+        let endpoint = Endpoint { handler: Arc::new(handler), middlewares: Vec::new() };
+        self.routes.entry(normalize(path)).or_default().insert(method, endpoint);
     }
 
-    /// Adds middleware for the routes registered after this call.
+    /// Adds middleware for every route of this router.
     pub fn middleware(&mut self, middleware: impl Middleware + 'static) {
         self.middlewares.add(middleware);
     }
 
     /// Adds every route of `router` under the `path` prefix. This router's
-    /// current middleware runs before the mounted router's own.
+    /// middleware runs before the mounted router's own.
     pub fn mount(&mut self, path: &str, router: Router) {
         let prefix = path.trim_end_matches('/');
         for (key, methods) in router.routes {
             let full = normalize(&format!("{}{}", prefix, key));
             let entry = self.routes.entry(full).or_default();
-            for (method, route) in methods {
-                let middlewares: Vec<_> = self
+            for (method, endpoint) in methods {
+                let middlewares = router
                     .middlewares
                     .middlewares
                     .iter()
-                    .chain(route.chain.middlewares.iter())
+                    .chain(endpoint.middlewares.iter())
                     .cloned()
                     .collect();
-                let chain = Chain {
-                    middlewares: middlewares.into(),
-                    handler: Arc::clone(&route.chain.handler),
-                };
-                entry.insert(method, Route { chain: Arc::new(chain) });
+                entry.insert(method, Endpoint { handler: endpoint.handler, middlewares });
             }
         }
     }
 
-    /// Builds the radix-tree matcher used to serve requests.
-    pub(crate) fn compile(&self) -> Result<CompiledRouter, String> {
+    /// Builds the radix-tree matcher and the route chains used to serve
+    /// requests.
+    pub(crate) fn compile(&self, on_error: Option<ErrorHandler>) -> Result<CompiledRouter, String> {
         let mut matcher = matchit::Router::new();
         let mut routes = Vec::with_capacity(self.routes.len());
         // Sorted so conflicts are reported the same way on every run.
@@ -177,7 +178,25 @@ impl Router {
             matcher
                 .insert(to_matchit(path), routes.len())
                 .map_err(|e| format!("invalid route {:?}: {}", path, e))?;
-            routes.push(self.routes[path].clone());
+            let methods = self.routes[path]
+                .iter()
+                .map(|(method, endpoint)| {
+                    let middlewares: Vec<_> = self
+                        .middlewares
+                        .middlewares
+                        .iter()
+                        .chain(endpoint.middlewares.iter())
+                        .cloned()
+                        .collect();
+                    let chain = Chain {
+                        middlewares: middlewares.into(),
+                        handler: Arc::clone(&endpoint.handler),
+                        on_error: on_error.clone(),
+                    };
+                    (*method, Route { chain: Arc::new(chain) })
+                })
+                .collect();
+            routes.push(methods);
         }
         Ok(CompiledRouter { matcher, routes })
     }
@@ -256,7 +275,7 @@ mod tests {
         let mut router = Router::new();
         router.get("/users/:id", |_req| async { crate::Response::text("param") });
         router.get("/users/new", |_req| async { crate::Response::text("static") });
-        let compiled = router.compile().unwrap();
+        let compiled = router.compile(None).unwrap();
         let (_, params) = compiled.lookup("/users/new").unwrap();
         assert!(params.is_empty());
         let (_, params) = compiled.lookup("/users/a%20b").unwrap();
@@ -269,6 +288,6 @@ mod tests {
         let mut router = Router::new();
         router.get("/users/:id", |_req| async { crate::Response::text("a") });
         router.get("/users/:name", |_req| async { crate::Response::text("b") });
-        assert!(router.compile().is_err());
+        assert!(router.compile(None).is_err());
     }
 }
