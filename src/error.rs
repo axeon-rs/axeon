@@ -22,6 +22,7 @@ pub enum ServerError {
     UriTooLong,
     HeadersTooLarge,
     NotImplemented(String),
+    UnsupportedMediaType(String),
 }
 
 impl ServerError {
@@ -35,6 +36,7 @@ impl ServerError {
             ServerError::RequestTimeout => 408,
             ServerError::Conflict(_) => 409,
             ServerError::PayloadTooLarge => 413,
+            ServerError::UnsupportedMediaType(_) => 415,
             ServerError::UriTooLong => 414,
             ServerError::ParseError(_) => 422,
             ServerError::ValidationError(_) => 422,
@@ -76,6 +78,7 @@ impl fmt::Display for ServerError {
             ServerError::UriTooLong => write!(f, "URI too long"),
             ServerError::HeadersTooLarge => write!(f, "Request header fields too large"),
             ServerError::NotImplemented(msg) => write!(f, "Not implemented: {}", msg),
+            ServerError::UnsupportedMediaType(msg) => write!(f, "Unsupported media type: {}", msg),
         }
     }
 }

@@ -15,6 +15,7 @@ cargo run --example <example_name>
 - **hello_world**: A minimal Axeon server that responds with "Hello, World!"
 - **routing**: Demonstrates different routing techniques and HTTP methods
 - **middleware**: How to use and create middleware for request/response processing
+- **realtime**: Plain-value handlers, closure middleware, server-sent events and WebSockets
 
 ## Example Structure
 

@@ -30,6 +30,8 @@ http = "1"
 http-body-util = "0.1"
 bytes = "1"
 matchit = "0.9"
+serde_urlencoded = "0.7"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"], optional = true }
 
 [[example]]
 name = "hello_world"
@@ -43,6 +45,16 @@ path = "examples/routing.rs"
 name = "middleware"
 path = "examples/middleware.rs"
 
+[[example]]
+name = "realtime"
+path = "examples/realtime.rs"
+required-features = ["ws"]
+
 [dev-dependencies]
 h2 = "0.4"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+
+[features]
+default = ["ws"]
+# WebSocket support (`Request::upgrade_websocket`, `axeon::ws`).
+ws = ["dep:tokio-tungstenite"]

@@ -2,6 +2,7 @@ use crate::handler::IntoResponse;
 use crate::http::{Method, Request};
 use crate::middleware::{Chain, Middleware, MiddlewareManager, MiddlewareResult, Next};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -32,7 +33,8 @@ impl Router {
     pub fn get<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.add(Method::GET, path, handler);
         self
@@ -41,7 +43,8 @@ impl Router {
     pub fn post<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.add(Method::POST, path, handler);
         self
@@ -50,7 +53,8 @@ impl Router {
     pub fn put<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.add(Method::PUT, path, handler);
         self
@@ -59,7 +63,8 @@ impl Router {
     pub fn patch<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.add(Method::PATCH, path, handler);
         self
@@ -68,7 +73,8 @@ impl Router {
     pub fn delete<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.add(Method::DELETE, path, handler);
         self
@@ -77,7 +83,8 @@ impl Router {
     pub fn head<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.add(Method::HEAD, path, handler);
         self
@@ -86,7 +93,8 @@ impl Router {
     pub fn connect<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.add(Method::CONNECT, path, handler);
         self
@@ -95,7 +103,8 @@ impl Router {
     pub fn options<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.add(Method::OPTIONS, path, handler);
         self
@@ -104,7 +113,8 @@ impl Router {
     pub fn trace<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.add(Method::TRACE, path, handler);
         self
@@ -113,7 +123,8 @@ impl Router {
     fn add<F, R>(&mut self, method: Method, path: &str, handler: F)
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         // Middleware registered so far applies to this route.
         let chain = Chain {

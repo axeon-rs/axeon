@@ -1,16 +1,33 @@
 use crate::error::ServerError;
 use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
+use std::fmt;
+use std::pin::Pin;
 
-#[derive(Debug)]
+pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub(crate) type BodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>;
+
 pub struct Response {
     pub status: u16,
     /// Raw body bytes. Binary content (images, compressed data) is sent unchanged.
-    /// Cloning `Bytes` is cheap (reference counted).
+    /// Cloning `Bytes` is cheap (reference counted). Ignored for streamed responses.
     pub body: Bytes,
     /// Response headers. Names are case-insensitive.
     pub headers: HeaderMap,
+    stream: Option<BodyStream>,
+}
+
+impl fmt::Debug for Response {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("body", &self.body)
+            .field("streaming", &self.stream.is_some())
+            .finish()
+    }
 }
 
 /// Statuses that never carry a body (RFC 9110 §6.4.1).
@@ -35,7 +52,45 @@ impl Response {
             status,
             headers: HeaderMap::new(),
             body: Bytes::new(),
+            stream: None,
         }
+    }
+
+    /// A 200 response whose body is sent as the stream produces chunks,
+    /// without buffering it all first (chunked over HTTP/1.1).
+    ///
+    /// If the stream yields an error the connection is aborted, since the
+    /// status line has already been sent.
+    ///
+    /// ```rust
+    /// use axeon::{Response, Server};
+    /// use futures::stream;
+    ///
+    /// let mut app = Server::new();
+    /// app.get("/numbers", |_req| async {
+    ///     let chunks = stream::iter((1..=3).map(|n| Ok::<_, std::io::Error>(format!("{}\n", n))));
+    ///     Response::stream("text/plain", chunks)
+    /// });
+    /// ```
+    pub fn stream<S, B, E>(content_type: &str, stream: S) -> Response
+    where
+        S: Stream<Item = Result<B, E>> + Send + 'static,
+        B: Into<Bytes>,
+        E: Into<BoxError>,
+    {
+        let mut response = Response::new(200);
+        response.header("Content-Type", content_type);
+        response.stream = Some(Box::pin(stream.map(|chunk| chunk.map(Into::into).map_err(Into::into))));
+        response
+    }
+
+    /// True if the body is a stream rather than `body`.
+    pub fn is_streaming(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    pub(crate) fn take_stream(&mut self) -> Option<BodyStream> {
+        self.stream.take()
     }
 
     // Chainable status setter
@@ -185,13 +240,6 @@ impl Response {
             }
         })).expect("Error creating JSON response");
         response
-    }
-
-    /// Not supported yet: the server always sends a `Content-Length` body, and
-    /// any `Transfer-Encoding` header is dropped. Only sets the content type.
-    #[deprecated(since = "0.3.0", note = "streaming responses are not supported yet; this only sets Content-Type")]
-    pub fn stream(&mut self, content_type: &str) -> &mut Self {
-        self.header("Content-Type", content_type)
     }
 
     // Helper for CORS headers

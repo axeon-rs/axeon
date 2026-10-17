@@ -3,104 +3,16 @@
 
 use axeon::middleware::{CompressionConfig, CompressionMiddleware, Cors, CorsConfig, RateLimitConfig, RateLimiter};
 use axeon::{Response, Server, ServerError};
-use std::collections::HashMap;
+mod common;
+
+use common::{start, Client, Resp, TempDir};
 use std::io::Read;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
-async fn start(app: Server) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = app.serve(listener).await;
-    });
-    addr
-}
-
-#[derive(Debug)]
-struct Resp {
-    status: u16,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-}
-
-impl Resp {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(name).map(String::as_str)
-    }
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.body).into_owned()
-    }
-}
-
-struct Client {
-    reader: BufReader<TcpStream>,
-}
-
-impl Client {
-    async fn connect(addr: SocketAddr) -> Self {
-        Client { reader: BufReader::new(TcpStream::connect(addr).await.unwrap()) }
-    }
-
-    async fn send(&mut self, raw: &[u8]) {
-        self.reader.get_mut().write_all(raw).await.unwrap();
-    }
-
-    async fn get(&mut self, path: &str) -> Resp {
-        self.send(format!("GET {} HTTP/1.1\r\nHost: test\r\n\r\n", path).as_bytes()).await;
-        self.read().await.expect("connection closed")
-    }
-
-    /// Reads one response, or `None` if the server closed the connection.
-    async fn read(&mut self) -> Option<Resp> {
-        self.read_for(false).await
-    }
-
-    async fn read_for(&mut self, head_request: bool) -> Option<Resp> {
-        timeout(Duration::from_secs(5), self.read_inner(head_request))
-            .await
-            .expect("timed out waiting for response")
-    }
-
-    async fn read_inner(&mut self, head_request: bool) -> Option<Resp> {
-        let mut line = String::new();
-        if self.reader.read_line(&mut line).await.ok()? == 0 {
-            return None;
-        }
-        let status: u16 = line.split(' ').nth(1).expect("status line").parse().unwrap();
-        assert!(line.starts_with("HTTP/1."), "bad status line {:?}", line);
-        let mut headers = HashMap::new();
-        loop {
-            line.clear();
-            self.reader.read_line(&mut line).await.unwrap();
-            let l = line.trim_end();
-            if l.is_empty() {
-                break;
-            }
-            let (k, v) = l.split_once(':').expect("header line");
-            let prev = headers.insert(k.to_ascii_lowercase(), v.trim().to_string());
-            assert!(prev.is_none(), "duplicate header {}", k);
-        }
-        let mut body = Vec::new();
-        let has_body = !head_request && status != 204 && status != 304 && !(100..200).contains(&status);
-        if has_body {
-            let len: usize = headers.get("content-length").expect("content-length").parse().unwrap();
-            body.resize(len, 0);
-            self.reader.read_exact(&mut body).await.unwrap();
-        }
-        Some(Resp { status, headers, body })
-    }
-
-    /// True if the server closes the connection within the timeout.
-    async fn closed_within(&mut self, dur: Duration) -> bool {
-        let mut buf = [0u8; 1];
-        matches!(timeout(dur, self.reader.read(&mut buf)).await, Ok(Ok(0)) | Ok(Err(_)))
-    }
-}
 
 fn hello_app() -> Server {
     let mut app = Server::new();
@@ -364,22 +276,6 @@ async fn binary_bodies_are_sent_unchanged() {
     assert_eq!(r.body, expected);
 }
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(name: &str) -> Self {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("axeon-{}-{}-{}", name, std::process::id(), nanos));
-        std::fs::create_dir_all(&path).unwrap();
-        TempDir(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 #[tokio::test]
 async fn static_files_are_binary_safe_and_contained() {
@@ -583,7 +479,12 @@ async fn json_body_accepts_charset_parameter() {
 #[tokio::test]
 async fn panics_become_generic_500_and_connection_survives() {
     let mut app = hello_app();
-    app.get("/boom", |_req| async { panic!("database password is hunter2") });
+    app.get("/boom", |_req| async {
+        if true {
+            panic!("database password is hunter2");
+        }
+        "unreachable"
+    });
     let addr = start(app).await;
     let mut c = Client::connect(addr).await;
     let r = c.get("/boom").await;
@@ -598,7 +499,7 @@ async fn header_injection_is_dropped() {
     app.get("/", |_req| async {
         let mut r = Response::new(200);
         r.header("X-Name", "a\r\nSet-Cookie: evil=1").header("X-Ok", "fine");
-        Ok(r)
+        r
     });
     let addr = start(app).await;
     let r = Client::connect(addr).await.get("/").await;
@@ -728,7 +629,7 @@ async fn repeated_response_headers_are_kept() {
     app.get("/", |_req| async {
         let mut r = Response::new(200);
         r.append_header("Set-Cookie", "a=1").append_header("Set-Cookie", "b=2");
-        Ok(r)
+        r
     });
     let addr = start(app).await;
     let mut c = Client::connect(addr).await;

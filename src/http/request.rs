@@ -1,8 +1,10 @@
 use crate::plugins::Plugins;
 use base64::Engine;
 use serde_json::{json, Map, Value};
+use crate::error::{ServerError, ServerResult};
 use bytes::Bytes;
-use http::HeaderMap;
+use http::{Extensions, HeaderMap};
+use std::str::FromStr;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
@@ -125,7 +127,7 @@ impl Body {
 
     /// The media type without parameters, e.g. `application/json` for
     /// `application/json; charset=utf-8`.
-    fn mime_is(&self, expected: &str) -> bool {
+    pub(crate) fn mime_is(&self, expected: &str) -> bool {
         self.content_type
             .split(';')
             .next()
@@ -451,9 +453,76 @@ pub struct Request {
     pub plugins: Plugins,
     /// Address of the TCP peer. This is the proxy's address when behind a reverse proxy.
     pub remote_addr: Option<SocketAddr>,
+    /// Typed per-request values, e.g. the current user set by an auth
+    /// middleware. See [`Request::extension`] and [`Request::insert_extension`].
+    pub extensions: Extensions,
 }
 
 impl Request {
+    /// A path parameter parsed into `T`, e.g. `req.param::<u64>("id")` for `/users/:id`.
+    /// Fails with 400 Bad Request if it is missing or doesn't parse.
+    pub fn param<T: FromStr>(&self, name: &str) -> ServerResult<T> {
+        let raw = self
+            .params
+            .get(name)
+            .ok_or_else(|| ServerError::BadRequest(format!("missing path parameter `{}`", name)))?;
+        raw.parse()
+            .map_err(|_| ServerError::BadRequest(format!("invalid path parameter `{}`", name)))
+    }
+
+    /// The query string deserialized into `T`. Missing optional fields are
+    /// `None`; values are parsed into numbers, booleans, etc.
+    /// Fails with 400 Bad Request when it doesn't match `T`.
+    pub fn query_as<T: serde::de::DeserializeOwned>(&self) -> ServerResult<T> {
+        let encoded = serde_urlencoded::to_string(&self.query)
+            .map_err(|e| ServerError::InternalError(e.to_string()))?;
+        serde_urlencoded::from_str(&encoded)
+            .map_err(|e| ServerError::BadRequest(format!("invalid query string: {}", e)))
+    }
+
+    /// The body deserialized from JSON. Fails with 415 if the content type
+    /// isn't JSON, 400 for malformed JSON, and 422 when it doesn't match `T`.
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> ServerResult<T> {
+        if !self.body.mime_is("application/json") {
+            return Err(ServerError::UnsupportedMediaType("expected application/json".to_string()));
+        }
+        serde_json::from_slice(self.body.as_bytes()).map_err(|e| {
+            if e.is_data() {
+                ServerError::ValidationError(e.to_string())
+            } else {
+                ServerError::BadRequest(format!("invalid JSON: {}", e))
+            }
+        })
+    }
+
+    /// The body deserialized from `application/x-www-form-urlencoded`.
+    /// Fails with 415 for other content types and 422 when it doesn't match `T`.
+    pub fn form<T: serde::de::DeserializeOwned>(&self) -> ServerResult<T> {
+        if !self.body.mime_is("application/x-www-form-urlencoded") {
+            return Err(ServerError::UnsupportedMediaType(
+                "expected application/x-www-form-urlencoded".to_string(),
+            ));
+        }
+        serde_urlencoded::from_bytes(self.body.as_bytes())
+            .map_err(|e| ServerError::ValidationError(e.to_string()))
+    }
+
+    /// Application state registered with [`Server::plugins`](crate::Server::plugins).
+    pub fn state<T: 'static>(&self) -> Option<&T> {
+        self.plugins.get::<T>()
+    }
+
+    /// A typed value stored on this request by earlier middleware.
+    pub fn extension<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.extensions.get::<T>()
+    }
+
+    /// Stores a typed value for later middleware and the handler, replacing
+    /// any previous value of the same type.
+    pub fn insert_extension<T: Clone + Send + Sync + 'static>(&mut self, value: T) -> Option<T> {
+        self.extensions.insert(value)
+    }
+
     /// The first value of a header (case-insensitive), if it is valid text.
     /// Use `headers.get_all(name)` for headers that may repeat.
     pub fn get_header(&self, key: &str) -> Option<&str> {

@@ -29,13 +29,16 @@ use bytes::Bytes;
 use futures::FutureExt;
 use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::StatusCode;
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
-use hyper::body::Incoming;
+use futures::TryStreamExt;
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -55,7 +58,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 type ErrorHandler = Arc<dyn Fn(ServerError) -> Response + Send + Sync>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
-type HyperResponse = hyper::Response<Full<Bytes>>;
+type HyperResponse = hyper::Response<UnsyncBoxBody<Bytes, BoxError>>;
 
 /// hyper's HTTP/1 read buffer cannot be smaller than this, so it is also the
 /// smallest header limit we can enforce.
@@ -239,7 +242,8 @@ impl Server {
     pub fn get<F, R>(&mut self, path: &str, handler: F)
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.router.get(path, handler);
     }
@@ -252,7 +256,8 @@ impl Server {
     pub fn post<F, R>(&mut self, path: &str, handler: F)
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.router.post(path, handler);
     }
@@ -265,7 +270,8 @@ impl Server {
     pub fn put<F, R>(&mut self, path: &str, handler: F)
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.router.put(path, handler);
     }
@@ -278,7 +284,8 @@ impl Server {
     pub fn patch<F, R>(&mut self, path: &str, handler: F)
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.router.patch(path, handler);
     }
@@ -291,7 +298,8 @@ impl Server {
     pub fn delete<F, R>(&mut self, path: &str, handler: F)
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.router.delete(path, handler);
     }
@@ -304,7 +312,8 @@ impl Server {
     pub fn head<F, R>(&mut self, path: &str, handler: F)
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.router.head(path, handler);
     }
@@ -317,7 +326,8 @@ impl Server {
     pub fn connect<F, R>(&mut self, path: &str, handler: F)
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.router.connect(path, handler);
     }
@@ -330,7 +340,8 @@ impl Server {
     pub fn options<F, R>(&mut self, path: &str, handler: F)
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.router.options(path, handler);
     }
@@ -343,7 +354,8 @@ impl Server {
     pub fn trace<F, R>(&mut self, path: &str, handler: F)
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
-        R: IntoResponse + 'static,
+        R: Future + Send + 'static,
+        R::Output: IntoResponse,
     {
         self.router.trace(path, handler);
     }
@@ -539,7 +551,8 @@ impl App {
             })
         };
 
-        let conn = self.http.serve_connection(TokioIo::new(stream), service);
+        // With upgrades, so WebSocket handshakes can take over the connection.
+        let conn = self.http.serve_connection_with_upgrades(TokioIo::new(stream), service);
         tokio::pin!(conn);
         let mut closing = false;
         loop {
@@ -612,6 +625,7 @@ impl App {
             data: HashMap::new(),
             plugins: self.plugins.clone(),
             remote_addr: Some(peer),
+            extensions: parts.extensions,
         };
         let response = self.dispatch(request).await;
         self.to_hyper(response)
@@ -625,17 +639,25 @@ impl App {
         response
     }
 
-    fn to_hyper(&self, response: Response) -> HyperResponse {
+    fn to_hyper(&self, mut response: Response) -> HyperResponse {
         let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let has_body = status_has_body(status.as_u16());
+        let stream = response.take_stream();
         let mut headers = response.headers;
         // Framing is ours to decide.
         headers.remove(TRANSFER_ENCODING);
         headers.remove(CONTENT_LENGTH);
-        if status_has_body(status.as_u16()) {
-            headers.insert(CONTENT_LENGTH, HeaderValue::from(response.body.len()));
-        }
-        let body = if status_has_body(status.as_u16()) { response.body } else { Bytes::new() };
-        let mut out = hyper::Response::new(Full::new(body));
+        let body = match stream {
+            Some(stream) if has_body => StreamBody::new(stream.map_ok(Frame::data)).boxed_unsync(),
+            _ => {
+                let body = if has_body { response.body } else { Bytes::new() };
+                if has_body {
+                    headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+                }
+                Full::new(body).map_err(|never| match never {}).boxed_unsync()
+            }
+        };
+        let mut out = hyper::Response::new(body);
         *out.status_mut() = status;
         *out.headers_mut() = headers;
         out
@@ -795,7 +817,7 @@ async fn handle_options(routes: &HashMap<Method, Route>, allow: String, req: Req
                 async move {
                     let mut response = Response::new(204);
                     response.header("Allow", allow);
-                    Ok(response)
+                    response
                 }
             }),
         }),

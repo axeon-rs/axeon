@@ -126,15 +126,24 @@ pub(crate) mod error;
 pub(crate) mod handler;
 pub(crate) mod http;
 pub mod middleware;
+pub mod sse;
+#[cfg(feature = "ws")]
+pub mod ws;
 pub(crate) mod plugins;
 pub(crate) mod router;
 
 pub use app::Server;
 pub use router::Router;
 
-pub use crate::error::ServerError;
+pub use crate::error::{ServerError, ServerResult};
+pub use crate::handler::{Html, IntoResponse, Json};
 pub use crate::http::request::{Body, Method, ParseError, Request};
 pub use crate::http::response::Response;
 
 // Reexport serde_json
 pub use serde_json::{json, Value};
+
+// Compile the README's examples as doctests so they stay correct.
+#[cfg(all(doctest, feature = "ws"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

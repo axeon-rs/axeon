@@ -134,7 +134,8 @@ impl Middleware for CompressionMiddleware {
 
             let mut response = next.handle(req).await?;
 
-            let compressible = crate::http::response::status_has_body(response.status)
+            let compressible = !response.is_streaming()
+                && crate::http::response::status_has_body(response.status)
                 && response.status != 206
                 && response.get_header("content-encoding").is_none()
                 && config.should_compress(response.get_header("content-type"), response.body.len());

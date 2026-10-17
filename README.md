@@ -24,7 +24,7 @@ axeon = "0.3.0"
 
 Create a simple server:
 
-```rust
+```rust,no_run
 use axeon::{Response, Server};
 
 fn main() {
@@ -70,6 +70,8 @@ struct User {
     role: String,
 }
 
+let mut app = Server::new();
+
 // POST endpoint with JSON handling
 app.post("/users", |req| async move {
     match req.body.json::<User>() {
@@ -103,7 +105,7 @@ app.middleware(Logger);
 ### Router Groups
 
 ```rust
-use axeon::{Router, Server};
+use axeon::{Response, Router, Server};
 
 let mut app = Server::new();
 let mut api = Router::new();
@@ -118,6 +120,80 @@ api.get("/status", |_req| async {
 // Mount the API router with a prefix
 app.mount("/api", api);
 ```
+
+### Handlers Return Anything
+
+Handlers can return `&str`, `String`, `Json(..)`, `Html(..)`, `Vec<u8>`,
+`(status, body)`, `Option<T>` (`None` is 404), `()` (204), `Response`, or a
+`Result` of any of these.
+
+```rust
+use axeon::{Json, Server, ServerError, json};
+
+let mut app = Server::new();
+app.get("/", |_req| async { "Hello!" });
+app.post("/users", |req| async move {
+    let user: serde_json::Value = req.json()?; // 415 / 400 / 422 on bad input
+    Ok::<_, ServerError>((201, Json(user)))
+});
+app.get("/users/:id", |req| async move {
+    let id: u64 = req.param("id")?; // 400 if not a number
+    Ok::<_, ServerError>(Json(json!({ "id": id })))
+});
+```
+
+When a handler's only result is `Ok(..)` (no `?` or `Err`), write the error
+type once: `Ok::<_, ServerError>(..)`, or return the value directly.
+
+### Closure Middleware
+
+```rust
+use axeon::{Server, ServerError};
+use axeon::middleware::from_fn;
+
+let mut app = Server::new();
+app.middleware(from_fn(|req, next| async move {
+    if req.get_header("authorization").is_none() {
+        return Err(ServerError::Unauthorized("login required".into()));
+    }
+    let mut res = next.handle(req).await?;
+    res.header("X-Powered-By", "axeon");
+    Ok(res)
+}));
+```
+
+Middleware can pass typed values to handlers with `req.insert_extension(value)`
+and `req.extension::<T>()`. Shared app state registered with
+`app.plugins(value)` is available as `req.state::<T>()`.
+
+### Streaming, Server-Sent Events and WebSockets
+
+```rust
+use axeon::Server;
+use axeon::sse::{self, Event};
+use axeon::ws::{SinkExt, StreamExt};
+
+let mut app = Server::new();
+
+app.get("/events", |_req| async {
+    let (tx, response) = sse::channel(16);
+    tokio::spawn(async move {
+        let _ = tx.send(Event::new().event("greeting").data("hello")).await;
+    });
+    response
+});
+
+app.get("/ws", |mut req| async move {
+    req.upgrade_websocket(|mut socket| async move {
+        while let Some(Ok(msg)) = socket.next().await {
+            let _ = socket.send(msg).await;
+        }
+    })
+});
+```
+
+`Response::stream(content_type, stream)` sends any `Stream` of chunks without
+buffering it. WebSockets need the default `ws` feature.
 
 ## Documentation
 
