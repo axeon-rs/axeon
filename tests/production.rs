@@ -184,3 +184,172 @@ async fn in_process_calls_run_routing_middleware_and_error_handlers() {
     let res = app.call(Request::new(Method::POST, "/users/x").with_json(&axeon::json!({}))).await;
     assert_eq!(res.status, 400);
 }
+
+#[tokio::test]
+async fn sse_streams_end_cleanly_on_shutdown() {
+    let mut app = Server::new();
+    app.shutdown_timeout(Duration::from_secs(10));
+    app.get("/events", |_req| async {
+        let (tx, response) = axeon::sse::channel(4);
+        tokio::spawn(async move {
+            while tx.send(axeon::sse::Event::new().data("tick")).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        response
+    });
+    let (addr, trigger, server) = start_with_shutdown(app).await;
+    let mut c = Client::connect(addr).await;
+    c.send(b"GET /events HTTP/1.1\r\nHost: t\r\n\r\n").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let started = Instant::now();
+    trigger.send(()).unwrap();
+    // The chunked stream is terminated properly, then the connection closes.
+    let mut raw = Vec::new();
+    use tokio::io::AsyncReadExt;
+    timeout(Duration::from_secs(2), c.reader.read_to_end(&mut raw)).await.expect("stream did not end").unwrap();
+    assert!(raw.ends_with(b"0\r\n\r\n"), "{:?}", String::from_utf8_lossy(&raw[raw.len().saturating_sub(40)..]));
+    timeout(Duration::from_secs(2), server).await.expect("server did not stop").unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2), "waited for the shutdown timeout");
+}
+
+#[tokio::test]
+async fn write_timeout_closes_clients_that_stop_reading() {
+    let mut app = Server::new();
+    app.max_connections(1).write_timeout(Duration::from_millis(200));
+    app.get("/big", |_req| async { vec![b'x'; 32 * 1024 * 1024] });
+    app.get("/", |_req| async { "ok" });
+    let (addr, _trigger, _server) = start_with_shutdown(app).await;
+
+    // This client requests a large body and never reads it.
+    let mut stalled = Client::connect(addr).await;
+    stalled.send(b"GET /big HTTP/1.1\r\nHost: t\r\n\r\n").await;
+
+    // With one connection slot, the next client is served only once the
+    // stalled connection is closed by the write timeout.
+    let started = Instant::now();
+    let mut next = Client::connect(addr).await;
+    next.send(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
+    let r = next.read().await.unwrap();
+    assert_eq!(r.text(), "ok");
+    assert!(started.elapsed() >= Duration::from_millis(150), "slot was free too early");
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    // The stalled client never gets the whole body.
+    let mut raw = Vec::new();
+    use tokio::io::AsyncReadExt;
+    let _ = timeout(Duration::from_secs(2), stalled.reader.read_to_end(&mut raw)).await;
+    assert!(raw.len() < 32 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn hostile_form_bodies_are_rejected_without_crashing() {
+    let mut server = Server::new();
+    server.post("/form", |req| async move {
+        match req.body.x_www_form_urlencoded::<serde_json::Value>() {
+            Some(value) => Ok(Json(value)),
+            None => Err(ServerError::BadRequest("invalid form".into())),
+        }
+    });
+    let app = server.into_app().await.unwrap();
+    let post = |body: String| Request::new(Method::POST, "/form").with_body("application/x-www-form-urlencoded", body);
+
+    // Would overflow the stack and abort the process with a recursive parser.
+    let deep = format!("a{}=1", "[x]".repeat(200_000));
+    assert_eq!(app.call(post(deep)).await.status, 400);
+    // Would allocate a billion-element array.
+    assert_eq!(app.call(post("a[999999999]=x".into())).await.status, 400);
+    let ok = app.call(post("user[name]=Ada&tags[]=a&tags[]=b".into())).await;
+    assert_eq!(ok.body_text(), r#"{"tags":["a","b"],"user":{"name":"Ada"}}"#);
+}
+
+#[cfg(feature = "ws")]
+mod websocket {
+    use super::*;
+    use axeon::ws::{CloseFrame, Message, SinkExt, StreamExt};
+
+    async fn connect(addr: SocketAddr) -> tokio_tungstenite::WebSocketStream<TcpStream> {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        tokio_tungstenite::client_async(format!("ws://{}/ws", addr), tcp).await.unwrap().0
+    }
+
+    fn cooperative_app() -> Server {
+        let mut app = Server::new();
+        app.shutdown_timeout(Duration::from_secs(10));
+        app.get("/ws", |mut req| async move {
+            let shutdown = req.shutdown();
+            req.upgrade_websocket(move |mut socket| async move {
+                loop {
+                    tokio::select! {
+                        message = socket.next() => match message {
+                            Some(Ok(message)) if message.is_text() => { let _ = socket.send(message).await; }
+                            Some(Ok(_)) => {}
+                            _ => break,
+                        },
+                        _ = shutdown.wait() => {
+                            let frame = CloseFrame { code: 1001.into(), reason: "restarting".into() };
+                            let _ = socket.send(Message::Close(Some(frame))).await;
+                            break;
+                        }
+                    }
+                }
+            })
+        });
+        app
+    }
+
+    #[tokio::test]
+    async fn handlers_are_told_about_shutdown() {
+        let (addr, trigger, server) = start_with_shutdown(cooperative_app()).await;
+        let mut ws = connect(addr).await;
+        ws.send(Message::text("hi")).await.unwrap();
+        assert_eq!(ws.next().await.unwrap().unwrap(), Message::text("hi"));
+
+        let started = Instant::now();
+        trigger.send(()).unwrap();
+        match timeout(Duration::from_secs(2), ws.next()).await.expect("no close frame") {
+            Some(Ok(Message::Close(Some(frame)))) => assert_eq!(u16::from(frame.code), 1001),
+            other => panic!("expected a close frame, got {:?}", other),
+        }
+        timeout(Duration::from_secs(2), server).await.expect("server did not stop").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn sockets_that_ignore_shutdown_are_closed_after_the_timeout() {
+        let mut app = Server::new();
+        app.shutdown_timeout(Duration::from_millis(200));
+        app.get("/ws", |mut req| async move {
+            req.upgrade_websocket(|mut socket| async move { while socket.next().await.is_some() {} })
+        });
+        let (addr, trigger, server) = start_with_shutdown(app).await;
+        let mut ws = connect(addr).await;
+
+        let started = Instant::now();
+        trigger.send(()).unwrap();
+        timeout(Duration::from_secs(2), server).await.expect("server did not stop").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let next = timeout(Duration::from_secs(1), ws.next()).await.expect("socket still open");
+        assert!(!matches!(next, Some(Ok(Message::Text(_)))));
+    }
+
+    #[tokio::test]
+    async fn sockets_count_toward_max_connections() {
+        let mut app = cooperative_app();
+        app.max_connections(1);
+        app.get("/", |_req| async { "ok" });
+        let (addr, _trigger, _server) = start_with_shutdown(app).await;
+        let mut ws = connect(addr).await;
+        ws.send(Message::text("ping")).await.unwrap();
+        ws.next().await.unwrap().unwrap();
+
+        let mut c = Client::connect(addr).await;
+        c.send(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        let waited = timeout(Duration::from_millis(300), c.read_inner(false)).await;
+        assert!(waited.is_err(), "served while the WebSocket held the only slot");
+
+        ws.close(None).await.unwrap();
+        assert_eq!(c.read().await.unwrap().text(), "ok");
+    }
+}

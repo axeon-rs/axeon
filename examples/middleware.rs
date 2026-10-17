@@ -17,7 +17,7 @@ impl Middleware for Logger {
         Box::pin(async move {
             let start = Instant::now();
             let url = req.path.clone();
-            let method = req.method.clone();
+            let method = req.method;
             let res = next.handle(req).await;
             let status = match &res {
                 Ok(res) => res.status,

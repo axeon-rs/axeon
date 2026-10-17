@@ -17,9 +17,38 @@
 //!     })
 //! });
 //! ```
-
+//!
+//! To close sockets cleanly when the server shuts down, watch
+//! [`Request::shutdown`] and send a `1001 Going Away` close frame, which
+//! tells clients to reconnect (to another instance):
+//!
+//! ```rust
+//! use axeon::Server;
+//! use axeon::ws::{CloseFrame, Message, SinkExt, StreamExt};
+//!
+//! let mut app = Server::new();
+//! app.get("/ws", |mut req| async move {
+//!     let shutdown = req.shutdown();
+//!     req.upgrade_websocket(move |mut socket| async move {
+//!         loop {
+//!             tokio::select! {
+//!                 message = socket.next() => match message {
+//!                     Some(Ok(message)) => { let _ = socket.send(message).await; }
+//!                     _ => break,
+//!                 },
+//!                 _ = shutdown.wait() => {
+//!                     let frame = CloseFrame { code: 1001.into(), reason: "server restarting".into() };
+//!                     let _ = socket.send(Message::Close(Some(frame))).await;
+//!                     break;
+//!                 }
+//!             }
+//!         }
+//!     })
+//! });
+//! ```
 use crate::error::{ServerError, ServerResult};
 use crate::http::{Method, Request, Response};
+use crate::lifecycle::UpgradeContext;
 use http::header::{CONNECTION, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE};
 use hyper::upgrade::{OnUpgrade, Upgraded};
 use hyper_util::rt::TokioIo;
@@ -48,8 +77,9 @@ impl Request {
     /// Fails with 400 Bad Request if this isn't a valid WebSocket upgrade
     /// request, or if the connection can't be upgraded (HTTP/2).
     ///
-    /// Upgraded connections no longer count toward `max_connections` and
-    /// have no idle timeout; close them from `on_connect` when appropriate.
+    /// The socket keeps counting toward `max_connections`. It has no idle
+    /// timeout; watch [`Request::shutdown`] to close it when the server stops,
+    /// or it is closed after `shutdown_timeout`.
     pub fn upgrade_websocket<F, Fut>(&mut self, on_connect: F) -> ServerResult<Response>
     where
         F: FnOnce(WebSocket) -> Fut + Send + 'static,
@@ -82,7 +112,7 @@ impl Request {
             .remove::<OnUpgrade>()
             .ok_or_else(|| bad_request("this connection can't be upgraded; WebSockets need HTTP/1.1"))?;
 
-        tokio::spawn(async move {
+        let session = async move {
             match on_upgrade.await {
                 Ok(upgraded) => {
                     let socket = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
@@ -90,7 +120,14 @@ impl Request {
                 }
                 Err(e) => tracing::warn!(error = %e, "WebSocket upgrade failed"),
             }
-        });
+        };
+        // Keep the connection's slot and stay tracked for shutdown.
+        match self.extensions.get::<UpgradeContext>() {
+            Some(context) => context.spawn(session),
+            None => {
+                tokio::spawn(session);
+            }
+        }
 
         let mut response = Response::new(101);
         response

@@ -30,7 +30,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::StatusCode;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -50,7 +50,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::{watch, Semaphore};
-use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+use crate::lifecycle::{Shutdown, Slot, WriteTimeout};
+#[cfg(feature = "ws")]
+use crate::lifecycle::UpgradeContext;
 use tracing::{debug, error, info, warn};
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 #[cfg(feature = "tls")]
@@ -105,6 +109,7 @@ pub struct Server {
     /// How long an idle keep-alive connection waits for the next request.
     pub keep_alive: Duration,
     request_timeout: Duration,
+    write_timeout: Duration,
     shutdown_timeout: Duration,
     limits: Limits,
     router: Router,
@@ -128,6 +133,7 @@ impl Server {
             max_connections: 1024,
             keep_alive: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(30),
             limits: Limits {
                 max_header_size: 16 * 1024,
@@ -160,6 +166,14 @@ impl Server {
     /// request body, and to complete a TLS handshake. Default: 30 seconds.
     pub fn request_timeout(&mut self, request_timeout: Duration) -> &mut Self {
         self.request_timeout = request_timeout;
+        self
+    }
+
+    /// How long a write to a client may make no progress before the
+    /// connection is closed, so clients that stop reading can't hold
+    /// connections open. Default: 30 seconds.
+    pub fn write_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.write_timeout = timeout;
         self
     }
 
@@ -419,8 +433,9 @@ impl Server {
 
     /// Like [`Server::serve`], but shuts down gracefully when `signal`
     /// completes: it stops accepting connections, lets in-flight requests
-    /// finish and closes idle connections, then returns. Connections still
-    /// busy after `shutdown_timeout` are closed.
+    /// finish, closes idle connections and ends server-sent event streams,
+    /// then returns. Handlers can watch [`Request::shutdown`]. Connections
+    /// (including WebSockets) still open after `shutdown_timeout` are closed.
     ///
     /// ```rust,no_run
     /// use axeon::{Server, shutdown_signal};
@@ -449,17 +464,12 @@ impl Server {
         // A permit is taken before each accept, so at the limit we simply stop
         // accepting (no busy loop) and resume when a connection finishes.
         let slots = Arc::new(Semaphore::new(max_connections));
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut connections = JoinSet::new();
         tokio::pin!(signal);
         if let Ok(addr) = listener.local_addr() {
             info!(%addr, "listening");
         }
 
         loop {
-            // Reap finished connection tasks.
-            while connections.try_join_next().is_some() {}
-
             let permit = tokio::select! {
                 biased;
                 _ = &mut signal => break,
@@ -479,36 +489,44 @@ impl Server {
                 },
             };
             let _ = stream.set_nodelay(true);
-            let app = Arc::clone(&app);
+            let stream = WriteTimeout::new(stream, app.write_timeout);
+            // Shared with the connection's requests so a WebSocket upgrade
+            // can keep the slot after the HTTP connection ends.
+            let slot: Slot = Arc::new(std::sync::Mutex::new(Some(permit)));
+            let hard_stop = app.hard_stop.clone();
+            let conn_app = Arc::clone(&app);
             #[cfg(feature = "tls")]
             let acceptor = tls_acceptor.clone();
-            let shutdown = shutdown_rx.clone();
 
-            connections.spawn(async move {
-                let _permit = permit;
-                #[cfg(feature = "tls")]
-                if let Some(acceptor) = acceptor {
-                    match timeout(app.request_timeout, acceptor.accept(stream)).await {
-                        Ok(Ok(tls_stream)) => app.serve_connection(tls_stream, peer, shutdown).await,
-                        Ok(Err(e)) => debug!(%peer, error = %e, "TLS handshake failed"),
-                        Err(_) => debug!(%peer, "TLS handshake timed out"),
+            app.tasks.spawn(async move {
+                let app = conn_app;
+                let connection = async move {
+                    #[cfg(feature = "tls")]
+                    if let Some(acceptor) = acceptor {
+                        match timeout(app.request_timeout, acceptor.accept(stream)).await {
+                            Ok(Ok(tls_stream)) => app.serve_connection(tls_stream, peer, slot).await,
+                            Ok(Err(e)) => debug!(%peer, error = %e, "TLS handshake failed"),
+                            Err(_) => debug!(%peer, "TLS handshake timed out"),
+                        }
+                        return;
                     }
-                    return;
+                    app.serve_connection(stream, peer, slot).await;
+                };
+                tokio::select! {
+                    _ = connection => {}
+                    _ = hard_stop.cancelled() => {}
                 }
-                app.serve_connection(stream, peer, shutdown).await;
             });
         }
 
         drop(listener);
-        info!(open_connections = connections.len(), "shutting down");
-        let _ = shutdown_tx.send(true);
-        let drained = timeout(shutdown_timeout, async {
-            while connections.join_next().await.is_some() {}
-        })
-        .await;
-        if drained.is_err() {
-            warn!(remaining = connections.len(), "shutdown timeout elapsed; closing remaining connections");
-            connections.shutdown().await;
+        info!(open_connections = app.tasks.len(), "shutting down");
+        app.shutdown_tx.send_replace(true);
+        app.tasks.close();
+        if timeout(shutdown_timeout, app.tasks.wait()).await.is_err() {
+            warn!(remaining = app.tasks.len(), "shutdown timeout elapsed; closing remaining connections");
+            app.hard_stop.cancel();
+            app.tasks.wait().await;
         }
         info!("shutdown complete");
         Ok(())
@@ -565,8 +583,15 @@ pub struct App {
     on_error: Option<ErrorHandler>,
     limits: Limits,
     request_timeout: Duration,
+    write_timeout: Duration,
     keep_alive: Duration,
     http: auto::Builder<TokioExecutor>,
+    /// Set to true when shutdown starts.
+    shutdown_tx: watch::Sender<bool>,
+    /// Every connection task, including upgraded WebSockets.
+    tasks: TaskTracker,
+    /// Cancelled when shutdown times out, closing what is left.
+    hard_stop: CancellationToken,
 }
 
 impl Server {
@@ -582,6 +607,7 @@ impl App {
     /// response, with errors already converted by the error handler.
     pub async fn call(&self, mut request: Request) -> Response {
         request.plugins = self.plugins.clone();
+        request.extensions.insert(Shutdown::new(self.shutdown_tx.subscribe()));
         self.dispatch(request).await
     }
 
@@ -620,24 +646,36 @@ impl App {
             on_error: server.on_error,
             limits,
             request_timeout: server.request_timeout,
+            write_timeout: server.write_timeout,
             keep_alive: server.keep_alive,
             http,
+            shutdown_tx: watch::channel(false).0,
+            tasks: TaskTracker::new(),
+            hard_stop: CancellationToken::new(),
         })
     }
 
     /// Serves HTTP/1.1 or HTTP/2 on one connection, closing it once it has
     /// been idle for `keep_alive`, or when the server shuts down.
-    async fn serve_connection<S>(self: Arc<Self>, stream: S, peer: SocketAddr, mut shutdown: watch::Receiver<bool>)
+    async fn serve_connection<S>(self: Arc<Self>, stream: S, peer: SocketAddr, slot: Slot)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let mut shutdown = self.shutdown_tx.subscribe();
         let activity = Arc::new(Activity::new());
+        #[cfg(feature = "ws")]
+        let upgrade = UpgradeContext { tasks: self.tasks.clone(), hard_stop: self.hard_stop.clone(), slot };
+        #[cfg(not(feature = "ws"))]
+        let _slot = slot; // held until the connection ends
         let service = {
             let app = Arc::clone(&self);
             let activity = Arc::clone(&activity);
-            service_fn(move |req| {
+            service_fn(move |mut req: hyper::Request<Incoming>| {
                 let app = Arc::clone(&app);
                 let busy = activity.begin();
+                req.extensions_mut().insert(Shutdown::new(app.shutdown_tx.subscribe()));
+                #[cfg(feature = "ws")]
+                req.extensions_mut().insert(upgrade.clone());
                 async move {
                     let response = app.respond(req, peer).await;
                     drop(busy);
@@ -750,6 +788,14 @@ impl App {
         headers.remove(TRANSFER_ENCODING);
         headers.remove(CONTENT_LENGTH);
         let body = match stream {
+            Some(stream) if has_body && response.end_on_shutdown => {
+                // Event streams end cleanly at shutdown so clients reconnect elsewhere.
+                let mut shutdown = self.shutdown_tx.subscribe();
+                let stopping = async move {
+                    let _ = shutdown.wait_for(|stopping| *stopping).await;
+                };
+                StreamBody::new(stream.take_until(stopping).map_ok(Frame::data)).boxed_unsync()
+            }
             Some(stream) if has_body => StreamBody::new(stream.map_ok(Frame::data)).boxed_unsync(),
             _ => {
                 let body = if has_body { response.body } else { Bytes::new() };

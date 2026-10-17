@@ -17,6 +17,8 @@ pub struct Response {
     /// Response headers. Names are case-insensitive.
     pub headers: HeaderMap,
     stream: Option<BodyStream>,
+    /// End the stream when the server shuts down (server-sent events).
+    pub(crate) end_on_shutdown: bool,
 }
 
 impl fmt::Debug for Response {
@@ -53,6 +55,7 @@ impl Response {
             headers: HeaderMap::new(),
             body: Bytes::new(),
             stream: None,
+            end_on_shutdown: false,
         }
     }
 
@@ -359,7 +362,7 @@ impl Response {
 
     pub fn file_download(&mut self, filename: &str, content_type: &str) -> &mut Self {
         self.header("Content-Type", content_type)
-            .header("Content-Disposition", &format!("attachment; filename=\"{}\"", filename))
+            .header("Content-Disposition", format!("attachment; filename=\"{}\"", filename))
     }
 
     pub fn vary(&mut self, headers: &[&str]) -> &mut Self {

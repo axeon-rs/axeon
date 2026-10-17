@@ -125,6 +125,7 @@ pub mod cache;
 pub mod database;
 pub(crate) mod error;
 pub(crate) mod handler;
+mod lifecycle;
 pub(crate) mod http;
 pub mod middleware;
 pub mod sse;
@@ -136,6 +137,7 @@ pub(crate) mod router;
 mod tls;
 
 pub use app::{shutdown_signal, App, Server};
+pub use lifecycle::Shutdown;
 pub use router::Router;
 
 pub use crate::error::{ServerError, ServerResult};

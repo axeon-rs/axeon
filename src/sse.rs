@@ -132,6 +132,8 @@ impl Response {
             .header("Cache-Control", "no-cache")
             // Stop nginx from buffering the stream.
             .header("X-Accel-Buffering", "no");
+        // Browsers' EventSource reconnects, so end cleanly on shutdown.
+        response.end_on_shutdown = true;
         response
     }
 

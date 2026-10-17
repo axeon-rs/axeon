@@ -5,7 +5,7 @@ edition = "2021"
 description = "A modern and flexible backend server framework for Rust"
 license = "MIT"
 authors = ["sketch"]
-repository = "https://github.com/sketch/axeon"
+repository = "https://github.com/axeon-rs/axeon"
 documentation = "https://docs.rs/axeon"
 readme = "README.md"
 keywords = ["web", "framework", "server", "http", "async"]
@@ -33,6 +33,8 @@ matchit = "0.9"
 serde_urlencoded = "0.7"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"], optional = true }
 tracing = "0.1"
+memchr = "2"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [[example]]
 name = "hello_world"
