@@ -12,7 +12,6 @@
 
 use axeon::middleware::from_fn;
 use axeon::sse::{self, Event};
-use axeon::ws::{SinkExt, StreamExt};
 use axeon::{json, Json, Server};
 use std::time::{Duration, Instant};
 
@@ -51,7 +50,7 @@ fn main() {
     // Echo every text or binary message back.
     app.get("/ws", |mut req| async move {
         req.upgrade_websocket(|mut socket| async move {
-            while let Some(Ok(message)) = socket.next().await {
+            while let Some(Ok(message)) = socket.recv().await {
                 if (message.is_text() || message.is_binary()) && socket.send(message).await.is_err() {
                     break;
                 }

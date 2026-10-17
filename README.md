@@ -39,7 +39,7 @@ fn main() {
 
 ```toml
 [dependencies]
-axeon = "1.0.0-rc.1"
+axeon = "1.0"
 tokio = { version = "1", features = ["full"] } # for #[tokio::main], tokio::spawn, etc.
 serde = { version = "1", features = ["derive"] }
 ```
@@ -443,7 +443,6 @@ app.route("/upload").body_limit(1 << 30).stream_body().post(|req| async move {
 ```rust
 use axeon::{Response, Server};
 use axeon::sse::{self, Event};
-use axeon::ws::{SinkExt, StreamExt};
 use futures::stream;
 
 let mut app = Server::new();
@@ -463,7 +462,7 @@ app.get("/events", |_req| async {
 
 app.get("/ws", |mut req| async move {
     req.upgrade_websocket(|mut socket| async move {
-        while let Some(Ok(message)) = socket.next().await {
+        while let Some(Ok(message)) = socket.recv().await {
             if socket.send(message).await.is_err() {
                 break;
             }
@@ -587,6 +586,20 @@ cargo run --example production  # logging, security middleware, graceful shutdow
 [`examples/todo-api`](examples/todo-api) is a complete REST API: SQLite via
 axeon-orm with migrations, JWT login, validation, health checks with a
 database ping, metrics, graceful shutdown, and tests.
+
+## Stability
+
+Axeon follows [semantic versioning](https://semver.org): no breaking
+changes in 1.x. In particular:
+
+- The minimum supported Rust version is **1.88**. Raising it is not
+  considered breaking and only happens in a minor release (1.x.0), noted in
+  the changelog.
+- Axeon's public API exposes a few other crates' types: `http` 1, `bytes`
+  1, `serde_json` 1, `futures` 0.3 (`StreamExt`, `SinkExt`), `tower` 0.3
+  service traits and, with the `cookies` feature, `cookie` 0.18. Moving to
+  a breaking version of any of these waits for Axeon 2.0. WebSocket and JWT
+  types are Axeon's own, so their underlying crates can be upgraded freely.
 
 ## Documentation
 

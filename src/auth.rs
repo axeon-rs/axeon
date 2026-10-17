@@ -199,15 +199,28 @@ pub mod jwt {
     use crate::error::{ServerError, ServerResult};
     use crate::message::Request;
     use crate::middleware::{Middleware, MiddlewareResult, Next};
-    use jsonwebtoken::{DecodingKey, EncodingKey, Validation};
+    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
     use serde::de::DeserializeOwned;
     use serde::Serialize;
     use std::marker::PhantomData;
     use std::sync::Arc;
     use std::time::Duration;
 
-    pub use jsonwebtoken::errors::Error;
-    pub use jsonwebtoken::{Algorithm, Header};
+    /// A PEM key passed to [`Jwt::rs256`] or [`Jwt::es256`] couldn't be read.
+    #[derive(Debug)]
+    pub struct KeyError(jsonwebtoken::errors::Error);
+
+    impl std::fmt::Display for KeyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "invalid key: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for KeyError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
 
     /// Seconds since the Unix epoch, for `exp`, `iat` and `nbf` claims.
     pub fn now() -> u64 {
@@ -245,15 +258,17 @@ pub mod jwt {
 
         /// RSA-SHA256 from PEM keys. Without a private key the instance can
         /// only verify tokens (e.g. issued by an identity provider).
-        pub fn rs256(public_pem: &[u8], private_pem: Option<&[u8]>) -> Result<Self, Error> {
-            let encoding = private_pem.map(EncodingKey::from_rsa_pem).transpose()?;
-            Ok(Self::with(Algorithm::RS256, encoding, DecodingKey::from_rsa_pem(public_pem)?))
+        pub fn rs256(public_pem: &[u8], private_pem: Option<&[u8]>) -> Result<Self, KeyError> {
+            let encoding = private_pem.map(EncodingKey::from_rsa_pem).transpose().map_err(KeyError)?;
+            let decoding = DecodingKey::from_rsa_pem(public_pem).map_err(KeyError)?;
+            Ok(Self::with(Algorithm::RS256, encoding, decoding))
         }
 
         /// ECDSA P-256 from PEM keys; see [`Jwt::rs256`].
-        pub fn es256(public_pem: &[u8], private_pem: Option<&[u8]>) -> Result<Self, Error> {
-            let encoding = private_pem.map(EncodingKey::from_ec_pem).transpose()?;
-            Ok(Self::with(Algorithm::ES256, encoding, DecodingKey::from_ec_pem(public_pem)?))
+        pub fn es256(public_pem: &[u8], private_pem: Option<&[u8]>) -> Result<Self, KeyError> {
+            let encoding = private_pem.map(EncodingKey::from_ec_pem).transpose().map_err(KeyError)?;
+            let decoding = DecodingKey::from_ec_pem(public_pem).map_err(KeyError)?;
+            Ok(Self::with(Algorithm::ES256, encoding, decoding))
         }
 
         /// Only accept tokens with this `iss` claim.

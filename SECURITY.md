@@ -5,11 +5,11 @@ application built on it. Thank you for reporting them responsibly.
 
 ## Supported versions
 
-Security fixes are released for the latest minor version only.
+Security fixes are released for the latest 1.x version.
 
 | Version | Supported |
 |---|---|
-| 1.0.x (including release candidates) | Yes |
+| 1.x | Yes |
 | < 1.0 | No: please upgrade |
 
 Versions before 0.4 have known issues fixed in 0.4.0, including a form body

@@ -264,7 +264,8 @@ async fn hostile_form_bodies_are_rejected_without_crashing() {
 #[cfg(feature = "ws")]
 mod websocket {
     use super::*;
-    use axeon::ws::{CloseFrame, Message, SinkExt, StreamExt};
+    use axeon::ws::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
 
     async fn connect(addr: SocketAddr) -> tokio_tungstenite::WebSocketStream<TcpStream> {
         let tcp = TcpStream::connect(addr).await.unwrap();
@@ -279,14 +280,13 @@ mod websocket {
             req.upgrade_websocket(move |mut socket| async move {
                 loop {
                     tokio::select! {
-                        message = socket.next() => match message {
+                        message = socket.recv() => match message {
                             Some(Ok(message)) if message.is_text() => { let _ = socket.send(message).await; }
                             Some(Ok(_)) => {}
                             _ => break,
                         },
                         _ = shutdown.wait() => {
-                            let frame = CloseFrame { code: 1001.into(), reason: "restarting".into() };
-                            let _ = socket.send(Message::Close(Some(frame))).await;
+                            let _ = socket.close(1001, "restarting").await;
                             break;
                         }
                     }

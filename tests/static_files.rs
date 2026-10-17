@@ -124,6 +124,10 @@ async fn hidden_files_are_not_served_except_well_known() {
     assert_eq!(get(addr, "/.env", "").await.status, 404);
     assert_eq!(get(addr, "/%2Eenv", "").await.status, 404);
     assert_eq!(get(addr, "/sub/.git/config", "").await.status, 404);
+    // Backslashes are path separators on Windows; never accepted.
+    assert_eq!(get(addr, "/sub%5C.git%5Cconfig", "").await.status, 404);
+    assert_eq!(get(addr, "/%5C.env", "").await.status, 404);
+    assert_eq!(get(addr, "/small.txt%00", "").await.status, 404);
     assert_eq!(get(addr, "/.well-known/security.txt", "").await.text(), "Contact: x");
 }
 

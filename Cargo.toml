@@ -1,7 +1,8 @@
 [package]
 name = "axeon"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 edition = "2021"
+rust-version = "1.88"
 description = "A fast, Express-style web framework for Rust, built on hyper"
 license = "MIT"
 authors = ["sketch"]

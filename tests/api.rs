@@ -264,7 +264,8 @@ async fn sse_keep_alive_comments_are_sent_while_idle() {
 #[cfg(feature = "ws")]
 #[tokio::test]
 async fn websocket_echo() {
-    use axeon::ws::{Message, SinkExt, StreamExt};
+    use axeon::ws::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
 
     let mut app = Server::new();
     app.get("/ws", |mut req| async move {
@@ -289,6 +290,69 @@ async fn websocket_echo() {
 
     // A plain GET to the WebSocket route is rejected.
     assert_eq!(Client::connect(addr).await.get("/ws").await.status, 400);
+}
+
+#[cfg(feature = "ws")]
+#[tokio::test]
+async fn websocket_messages_close_and_split() {
+    use axeon::ws::{Message, SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{self, protocol::frame::coding::CloseCode};
+
+    let mut app = Server::new();
+    app.get("/chat", |mut req| async move {
+        req.upgrade_websocket(|mut socket| async move {
+            // recv() and send() with plain text and bytes.
+            match socket.recv().await {
+                Some(Ok(Message::Text(text))) => socket.send(format!("got {}", text)).await.unwrap(),
+                other => panic!("expected text, got {:?}", other),
+            }
+            match socket.recv().await {
+                Some(Ok(Message::Binary(data))) => socket.send(data.to_vec()).await.unwrap(),
+                other => panic!("expected binary, got {:?}", other),
+            }
+            socket.close(4000, "bye").await.unwrap();
+        })
+    });
+    app.get("/split", |mut req| async move {
+        req.upgrade_websocket(|socket| async move {
+            let (mut write, mut read) = socket.split();
+            while let Some(Ok(message)) = read.next().await {
+                if let Some(text) = message.as_text() {
+                    let reply = Message::text(text.to_uppercase());
+                    if write.send(reply).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+    });
+    let addr = start(app).await;
+    let connect = |path: &'static str| async move {
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio_tungstenite::client_async(format!("ws://{}{}", addr, path), tcp).await.unwrap().0
+    };
+
+    let mut ws = connect("/chat").await;
+    ws.send(tungstenite::Message::text("hi")).await.unwrap();
+    assert_eq!(ws.next().await.unwrap().unwrap(), tungstenite::Message::text("got hi"));
+    ws.send(tungstenite::Message::binary(vec![9u8, 8])).await.unwrap();
+    assert_eq!(ws.next().await.unwrap().unwrap(), tungstenite::Message::binary(vec![9u8, 8]));
+    match ws.next().await {
+        Some(Ok(tungstenite::Message::Close(Some(frame)))) => {
+            assert_eq!((frame.code, frame.reason.as_str()), (CloseCode::from(4000), "bye"));
+        }
+        other => panic!("expected a close frame, got {:?}", other),
+    }
+
+    let mut ws = connect("/split").await;
+    ws.send(tungstenite::Message::text("loud")).await.unwrap();
+    assert_eq!(ws.next().await.unwrap().unwrap(), tungstenite::Message::text("LOUD"));
+    ws.close(None).await.unwrap();
+
+    // Conversions between payloads and messages.
+    assert_eq!(Message::from("a"), Message::text("a"));
+    assert_eq!(Message::from(vec![1u8]).into_data().as_ref(), [1u8]);
+    assert!(Message::close(1000, "done").is_close());
 }
 
 #[tokio::test]

@@ -1,6 +1,45 @@
 # Changelog
 
-## 1.0.0-rc.1 (unreleased)
+## 1.0.0 (unreleased)
+
+The first stable release: no breaking changes until 2.0. Upgrading from
+0.4? Read the 1.0.0-rc.1 notes below and
+[Migrating from 0.4](#migrating-from-04). Changes since 1.0.0-rc.1:
+
+### Changed (breaking since rc.1)
+
+So that upgrading their underlying crates never forces a breaking Axeon
+release, WebSocket and JWT types are now Axeon's own:
+
+- `ws::WebSocket` is a struct instead of an alias for tokio-tungstenite's
+  stream. It still implements `Stream` and `Sink`, and adds `recv()`,
+  `send()` (accepting text, bytes or a `Message`) and `close(code, reason)`.
+- `ws::Message`, `ws::CloseFrame` and `ws::Error` are Axeon types:
+  `Message::Text` holds a `String`, `Binary`, `Ping` and `Pong` hold
+  `Bytes`, and `CloseFrame` has a `u16` code and a `String` reason.
+- `Jwt::rs256` and `Jwt::es256` return `auth::jwt::KeyError`;
+  `auth::jwt::{Algorithm, Header, Error}` are no longer re-exported.
+
+### Security
+
+- Static files: request paths containing `\` or NUL are refused on every
+  platform, and `:` on Windows. On Windows `%5C` could otherwise reach
+  hidden files such as `.env`, and `:` alternate data streams.
+- Updated dependencies with security advisories: rustls 0.23.46
+  (RUSTSEC-2026-0285, -0346, -0348, -0349), rustls-webpki (RUSTSEC-2026-0049,
+  -0098, -0099, -0104), bytes 1.11.1 (RUSTSEC-2026-0007), ring
+  (RUSTSEC-2025-0009) and crossbeam-epoch (RUSTSEC-2026-0204). Replaced the
+  unmaintained rustls-pemfile (RUSTSEC-2025-0134).
+- `Server::with_tls` fails on an invalid or empty certificate file instead
+  of skipping bad entries.
+
+### Added
+
+- `rust-version = "1.88"`, tested in CI, and a documented
+  [stability policy](README.md#stability).
+- CI runs the test suite on Windows.
+
+## 1.0.0-rc.1 (2026-10-17)
 
 The first release candidate for 1.0: a stable, consistent API (one
 breaking cleanup now, then no breaking changes in 1.x), a complete backend

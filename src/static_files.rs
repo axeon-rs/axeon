@@ -137,6 +137,12 @@ impl StaticFiles {
     /// such file under the root.
     pub(crate) async fn serve(&self, req: &Request) -> Option<Response> {
         let decoded = urlencoding::decode(req.path.trim_start_matches('/')).ok()?;
+        // `\` is a separator on Windows, so `%5C` could slip a hidden name
+        // past the check below; `:` reaches alternate data streams there.
+        // Neither belongs in a URL path, so refuse them everywhere.
+        if decoded.contains(['\\', '\0']) || (cfg!(windows) && decoded.contains(':')) {
+            return None;
+        }
         // Hidden files (.env, .git) are never served, except /.well-known/.
         let hidden = decoded
             .split('/')

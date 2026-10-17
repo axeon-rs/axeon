@@ -2,6 +2,7 @@
 name = "axeon-orm"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.94"
 description = "An Eloquent-style ORM for Rust on top of sqlx, with first-class Axeon integration"
 license = "MIT"
 repository = "https://github.com/axeon-rs/axeon"
@@ -23,7 +24,7 @@ tokio = { version = "1", features = ["sync"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 uuid = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
-axeon = { version = "1.0.0-rc.1", path = "..", default-features = false, optional = true }
+axeon = { version = "1.0", path = "..", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

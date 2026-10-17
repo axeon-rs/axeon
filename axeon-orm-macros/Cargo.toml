@@ -2,6 +2,7 @@
 name = "axeon-orm-macros"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.94"
 description = "Derive macros for axeon-orm"
 license = "MIT"
 repository = "https://github.com/axeon-rs/axeon"
