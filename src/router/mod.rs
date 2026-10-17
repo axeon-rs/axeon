@@ -122,7 +122,7 @@ impl Router {
         if !self.routes.contains_key(&path) {
             self.routes.insert(path.clone(), HashMap::new());
         }
-        if path.contains(":") {
+        if path.contains(':') && !self.dynamic_routes.contains(&path) {
             self.dynamic_routes.push(path.clone());
         }
         self.routes
@@ -141,13 +141,14 @@ impl Router {
     pub fn mount(&mut self, path: &str, router: Router) {
         for (key, value) in router.routes.into_iter() {
             let path = (path.to_owned() + &key).trim_end_matches('/').to_owned();
+            let path = if path.is_empty() { "/".to_owned() } else { path };
 
             for (method, handler) in value {
                 if !self.routes.contains_key(&path) {
                     self.routes.insert(path.clone(), HashMap::new());
                 }
 
-                if path.contains(":") {
+                if path.contains(':') && !self.dynamic_routes.contains(&path) {
                     self.dynamic_routes.push(path.clone());
                 }
 

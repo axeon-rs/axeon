@@ -2,6 +2,7 @@ use std::io;
 use std::fmt;
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ServerError {
     IoError(io::Error),
     ParseError(String),
@@ -14,6 +15,13 @@ pub enum ServerError {
     Conflict(String),
     PanicError(String),
     TooManyRequests,
+    /// The path exists but not for this method. Holds the value of the `Allow` header.
+    MethodNotAllowed(String),
+    RequestTimeout,
+    PayloadTooLarge,
+    UriTooLong,
+    HeadersTooLarge,
+    NotImplemented(String),
 }
 
 impl ServerError {
@@ -23,13 +31,27 @@ impl ServerError {
             ServerError::Unauthorized(_) => 401,
             ServerError::Forbidden(_) => 403,
             ServerError::NotFound => 404,
+            ServerError::MethodNotAllowed(_) => 405,
+            ServerError::RequestTimeout => 408,
             ServerError::Conflict(_) => 409,
+            ServerError::PayloadTooLarge => 413,
+            ServerError::UriTooLong => 414,
             ServerError::ParseError(_) => 422,
             ServerError::ValidationError(_) => 422,
             ServerError::TooManyRequests => 429,
+            ServerError::HeadersTooLarge => 431,
             ServerError::IoError(_)
             | ServerError::InternalError(_)
             | ServerError::PanicError(_) => 500,
+            ServerError::NotImplemented(_) => 501,
+        }
+    }
+
+    /// The message that is safe to send to clients. Panic and IO details stay server-side.
+    pub(crate) fn public_message(&self) -> String {
+        match self {
+            ServerError::IoError(_) | ServerError::PanicError(_) => "Internal server error".to_string(),
+            other => other.to_string(),
         }
     }
 }
@@ -48,6 +70,12 @@ impl fmt::Display for ServerError {
             ServerError::InternalError(msg) => write!(f, "Internal error: {}", msg),
             ServerError::PanicError(msg) => write!(f, "Panic: {}", msg),
             ServerError::TooManyRequests => write!(f, "Too many requests"),
+            ServerError::MethodNotAllowed(_) => write!(f, "Method not allowed"),
+            ServerError::RequestTimeout => write!(f, "Request timeout"),
+            ServerError::PayloadTooLarge => write!(f, "Payload too large"),
+            ServerError::UriTooLong => write!(f, "URI too long"),
+            ServerError::HeadersTooLarge => write!(f, "Request header fields too large"),
+            ServerError::NotImplemented(msg) => write!(f, "Not implemented: {}", msg),
         }
     }
 }

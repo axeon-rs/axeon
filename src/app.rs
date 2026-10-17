@@ -5,8 +5,8 @@
 //!
 //! # Examples
 //!
-//! ```rust
-//! use axeon::{Server, ok_json};
+//! ```rust,no_run
+//! use axeon::{Server, Response, ok_json};
 //!
 //! fn main() {
 //!     let mut app = Server::new();
@@ -19,23 +19,25 @@
 
 use crate::error::ServerError;
 use crate::handler::{HttpResponse, IntoResponse};
+use crate::http::codec::{self, BodyFraming, Limits, ReadError};
 use crate::http::{Body, Method, Request};
 use crate::http::Response;
 use crate::middleware::Middleware;
 use crate::plugins::Plugins;
 use crate::router::{Route, Router};
-use futures::{FutureExt};
+use futures::FutureExt;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
+use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use std::fs;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
+use tokio::sync::Semaphore;
+use tokio::time::{timeout, timeout_at, Instant};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use std::fs::File;
@@ -43,6 +45,8 @@ use std::io::BufReader as StdBufReader;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 type ErrorHandler = Arc<dyn Fn(ServerError) -> Response + Send + Sync>;
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type PathMatch<'a> = (&'a HashMap<Method, Route>, HashMap<String, String>);
 
 /// TLS configuration for HTTPS support
 pub struct TlsConfig {
@@ -58,7 +62,7 @@ impl TlsConfig {
         }
     }
 
-    fn load_certs(&self) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error>> {
+    fn load_certs(&self) -> Result<Vec<CertificateDer<'static>>, BoxError> {
         let cert_file = File::open(&self.cert_file)?;
         let mut reader = StdBufReader::new(cert_file);
         let certs = rustls_pemfile::certs(&mut reader)
@@ -67,11 +71,11 @@ impl TlsConfig {
         Ok(certs)
     }
 
-    fn load_key(&self) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
+    fn load_key(&self) -> Result<PrivateKeyDer<'static>, BoxError> {
         let key_file = File::open(&self.key_file)?;
         let mut reader = StdBufReader::new(key_file);
         let key = rustls_pemfile::private_key(&mut reader)?
-            .ok_or_else(|| "No private key found")?;
+            .ok_or("No private key found")?;
         Ok(key)
     }
 }
@@ -80,8 +84,8 @@ impl TlsConfig {
 ///
 /// # Example
 ///
-/// ```rust
-/// use axeon::{ok_json, Server};
+/// ```rust,no_run
+/// use axeon::{ok_json, Response, Server};
 ///
 ///
 /// fn main() {
@@ -102,7 +106,10 @@ impl TlsConfig {
 #[derive(Clone)]
 pub struct Server {
     pub max_connections: usize,
+    /// How long an idle keep-alive connection waits for the next request.
     pub keep_alive: Duration,
+    request_timeout: Duration,
+    limits: Limits,
     router: Router,
     static_dir: Option<PathBuf>,
     plugins: Plugins,
@@ -110,12 +117,24 @@ pub struct Server {
     tls_config: Option<Arc<TlsConfig>>,
 }
 
+impl Default for Server {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Server {
     /// Creates a new Application instance
     pub fn new() -> Self {
         Self {
-            max_connections: 256,
+            max_connections: 1024,
             keep_alive: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
+            limits: Limits {
+                max_header_size: 16 * 1024,
+                max_headers: 100,
+                max_body_size: 2 * 1024 * 1024,
+            },
             router: Router::new(),
             static_dir: None,
             plugins: Plugins::new(),
@@ -124,13 +143,41 @@ impl Server {
         }
     }
 
+    /// Maximum number of concurrent connections. Further connections wait in
+    /// the OS accept backlog until a slot frees up. Default: 1024.
     pub fn max_connections(&mut self, max_connections: usize) -> &mut Self {
         self.max_connections = max_connections;
         self
     }
 
+    /// Idle timeout for keep-alive connections. Default: 5 seconds.
     pub fn keep_alive(&mut self, keep_alive: Duration) -> &mut Self {
         self.keep_alive = keep_alive;
+        self
+    }
+
+    /// Time allowed to receive a full request (head and body), to complete a
+    /// TLS handshake, and to write a response. Default: 30 seconds.
+    pub fn request_timeout(&mut self, request_timeout: Duration) -> &mut Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
+    /// Maximum request body size in bytes; larger requests get 413. Default: 2 MiB.
+    pub fn max_body_size(&mut self, bytes: usize) -> &mut Self {
+        self.limits.max_body_size = bytes;
+        self
+    }
+
+    /// Maximum size of the request line plus headers in bytes. Default: 16 KiB.
+    pub fn max_header_size(&mut self, bytes: usize) -> &mut Self {
+        self.limits.max_header_size = bytes;
+        self
+    }
+
+    /// Maximum number of request headers. Default: 100.
+    pub fn max_headers(&mut self, count: usize) -> &mut Self {
+        self.limits.max_headers = count;
         self
     }
 
@@ -290,7 +337,9 @@ impl Server {
         self
     }
 
-    /// Starts the HTTP server
+    /// Starts the HTTP server on its own Tokio runtime and blocks forever.
+    ///
+    /// Use [`Server::serve`] instead when you already run inside a Tokio runtime.
     ///
     /// # Arguments
     /// * `addr` - Address to listen on (e.g. "127.0.0.1:3000")
@@ -298,140 +347,213 @@ impl Server {
         let runtime = Runtime::new()?;
         runtime.block_on(async {
             let listener = TcpListener::bind(addr).await?;
-            let connection_counter = Arc::new(AtomicUsize::new(0));
-
             println!("Server running on {}", if self.tls_config.is_some() {
                 format!("https://{}", addr)
             } else {
                 format!("http://{}", addr)
             });
-
-            let tls_acceptor = if let Some(tls_config) = &self.tls_config {
-                let certs = tls_config.load_certs()?;
-                let key = tls_config.load_key()?;
-                let config = ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_single_cert(certs, key)?;
-                Some(TlsAcceptor::from(Arc::new(config)))
-            } else {
-                None
-            };
-
-            loop {
-                let counter = Arc::clone(&connection_counter);
-                if counter.load(Ordering::Relaxed) >= self.max_connections {
-                    eprintln!("Max connections reached");
-                    continue;
-                }
-
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        counter.fetch_add(1, Ordering::Relaxed);
-                        let app = self.clone();
-                        let counter = Arc::clone(&counter);
-                        let acceptor = tls_acceptor.clone();
-
-                        tokio::spawn(async move {
-                            let result = if let Some(acceptor) = acceptor {
-                                match acceptor.accept(stream).await {
-                                    Ok(tls_stream) => app.handle_connection(tls_stream).await,
-                                    Err(e) => {
-                                        eprintln!("TLS handshake failed: {}", e);
-                                        Ok(())
-                                    }
-                                }
-                            } else {
-                                app.handle_connection(stream).await
-                            };
-
-                            if let Err(e) = result {
-                                eprintln!("Connection error: {}", e);
-                            }
-                            counter.fetch_sub(1, Ordering::Relaxed);
-                        });
-                    }
-                    Err(e) => eprintln!("Connection failed: {}", e),
-                }
-            }
+            self.serve(listener).await.map_err(|e| -> Box<dyn std::error::Error> { e })
         })
     }
 
-    async fn handle_connection<S>(&self, mut stream: S) -> Result<(), Error>
+    /// Serves connections from an already-bound listener on the current Tokio runtime.
+    ///
+    /// ```rust,no_run
+    /// use axeon::{Response, Server};
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let mut app = Server::new();
+    ///     app.get("/", |_req| async { Response::text("Hello") });
+    ///     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    ///     app.serve(listener).await.unwrap();
+    /// }
+    /// ```
+    pub async fn serve(mut self, listener: TcpListener) -> Result<(), BoxError> {
+        let tls_acceptor = if let Some(tls_config) = &self.tls_config {
+            let certs = tls_config.load_certs()?;
+            let key = tls_config.load_key()?;
+            let config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)?;
+            Some(TlsAcceptor::from(Arc::new(config)))
+        } else {
+            None
+        };
+
+        // Resolve the static root once instead of on every request.
+        if let Some(dir) = self.static_dir.take() {
+            match tokio::fs::canonicalize(&dir).await {
+                Ok(root) => self.static_dir = Some(root),
+                Err(e) => eprintln!("Static directory {:?} is unavailable: {}", dir, e),
+            }
+        }
+
+        // One shared, immutable app for every connection.
+        let app = Arc::new(self);
+        // A permit is taken before each accept, so at the limit we simply stop
+        // accepting (no busy loop) and resume when a connection finishes.
+        let slots = Arc::new(Semaphore::new(app.max_connections.max(1)));
+
+        loop {
+            let permit = Arc::clone(&slots).acquire_owned().await?;
+            let (stream, peer) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    // e.g. EMFILE: back off instead of spinning.
+                    eprintln!("Accept failed: {}", e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let _ = stream.set_nodelay(true);
+            let app = Arc::clone(&app);
+            let acceptor = tls_acceptor.clone();
+
+            tokio::spawn(async move {
+                let _permit = permit;
+                let result = if let Some(acceptor) = acceptor {
+                    match timeout(app.request_timeout, acceptor.accept(stream)).await {
+                        Ok(Ok(tls_stream)) => app.handle_connection(tls_stream, Some(peer)).await,
+                        Ok(Err(e)) => {
+                            eprintln!("TLS handshake failed: {}", e);
+                            Ok(())
+                        }
+                        Err(_) => Ok(()),
+                    }
+                } else {
+                    app.handle_connection(stream, Some(peer)).await
+                };
+
+                if let Err(e) = result {
+                    if !is_disconnect(&e) {
+                        eprintln!("Connection error: {}", e);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Serves HTTP/1.x requests on one connection until it closes, keeping it
+    /// alive between requests when the client allows it.
+    async fn handle_connection<S>(&self, stream: S, peer: Option<SocketAddr>) -> Result<(), Error>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let mut buf_reader = BufReader::new(&mut stream);
-        let mut request_line = String::new();
-        buf_reader.read_line(&mut request_line).await?;
+        let mut reader = BufReader::with_capacity(8 * 1024, stream);
+        let mut first_request = true;
 
-        if request_line.is_empty() {
-            return Ok(());
-        }
-
-        // Parse the request line
-        let mut parts = request_line.trim().split_whitespace();
-        let method = parts
-            .next()
-            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid request line"))?
-            .to_string();
-
-        let full_path = parts
-            .next()
-            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid request line"))?;
-
-        // Split path and query
-        let mut path_parts = full_path.split('?');
-        let path = path_parts.next().unwrap_or("/").to_string();
-        let path = path.trim_end_matches('/').to_string();
-        let path = if path.is_empty() { "/".to_string() } else { path };
-        let query = path_parts
-            .next()
-            .map(|query| Self::parse_query(query))
-            .unwrap_or_default();
-
-        // Parse headers efficiently
-        let mut headers = HashMap::new();
         loop {
-            let mut line = String::new();
-            buf_reader.read_line(&mut line).await?;
-
-            if line.trim().is_empty() {
-                break;
+            if !first_request {
+                // Idle keep-alive: wait for the first byte of the next request.
+                match timeout(self.keep_alive, reader.fill_buf()).await {
+                    Err(_) => return Ok(()),
+                    Ok(Ok([])) => return Ok(()),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => return Err(e),
+                }
             }
+            first_request = false;
 
-            if let Some((key, value)) = line.trim().split_once(':') {
-                headers.insert(key.trim().to_lowercase(), value.trim().to_string());
+            let deadline = Instant::now() + self.request_timeout;
+            let head = match timeout_at(deadline, codec::read_head(&mut reader, &self.limits)).await {
+                Err(_) => return self.reject(reader.get_mut(), ServerError::RequestTimeout).await,
+                Ok(Err(ReadError::Eof)) => return Ok(()),
+                Ok(Err(ReadError::Io(e))) => return Err(e),
+                Ok(Err(ReadError::Reject(err))) => return self.reject(reader.get_mut(), err).await,
+                Ok(Ok(head)) => head,
+            };
+
+            let http10 = head.version_minor == 0;
+            let connection = head.headers.get("connection").map(String::as_str).unwrap_or("");
+            let mut keep_alive = if http10 {
+                codec::has_token(connection, "keep-alive")
+            } else {
+                !codec::has_token(connection, "close")
+            };
+
+            let framing = match codec::body_framing(&head.headers, self.limits.max_body_size) {
+                Ok(framing) => framing,
+                Err(err) => return self.reject(reader.get_mut(), err).await,
+            };
+            if framing != BodyFraming::None
+                && !http10
+                && head.headers.get("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
+            {
+                let stream = reader.get_mut();
+                stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+                stream.flush().await?;
+            }
+            let body = match timeout_at(deadline, codec::read_body(&mut reader, framing, &self.limits)).await {
+                Err(_) => return self.reject(reader.get_mut(), ServerError::RequestTimeout).await,
+                Ok(Err(ReadError::Eof)) => return Ok(()),
+                Ok(Err(ReadError::Io(e))) => return Err(e),
+                Ok(Err(ReadError::Reject(err))) => return self.reject(reader.get_mut(), err).await,
+                Ok(Ok(body)) => body,
+            };
+
+            let is_head = head.method == Method::HEAD;
+            let request = Self::build_request(head, body, peer, self.plugins.clone());
+            let response = self.dispatch(request).await;
+
+            if response
+                .get_header("connection")
+                .is_some_and(|v| codec::has_token(v, "close"))
+            {
+                keep_alive = false;
+            }
+            timeout(self.request_timeout, Self::write_response(reader.get_mut(), &response, is_head, keep_alive, http10))
+                .await
+                .map_err(|_| Error::new(ErrorKind::TimedOut, "response write timed out"))??;
+
+            if !keep_alive {
+                return Ok(());
             }
         }
+    }
 
-        // Read body if Content-Length is present
-        let mut body = Vec::new();
-        let mut content_type = "none".to_owned();
-        if headers.contains_key("content-type") {
-            content_type = headers["content-type"].clone();
+    fn build_request(
+        head: codec::RequestHead,
+        body: Vec<u8>,
+        peer: Option<SocketAddr>,
+        plugins: Plugins,
+    ) -> Request {
+        // Absolute-form targets ("http://host/path") are reduced to the path.
+        let mut target = head.target.as_str();
+        if let Some(rest) = target.strip_prefix("http://").or_else(|| target.strip_prefix("https://")) {
+            target = rest.find('/').map(|i| &rest[i..]).unwrap_or("/");
         }
-        if let Some(content_length) = headers.get("content-length") {
-            if let Ok(length) = content_length.parse::<usize>() {
-                body.reserve(length);
-                let mut take = buf_reader.take(length as u64);
-                take.read_to_end(&mut body).await?;
-            }
-        }
+        let (path, query) = match target.split_once('?') {
+            Some((path, query)) => (path, Self::parse_query(query)),
+            None => (target, HashMap::new()),
+        };
+        let path = path.trim_end_matches('/');
+        let path = if path.is_empty() { "/".to_string() } else { path.to_string() };
 
-        let request = Request {
-            method: Method::from_string(&method),
+        let content_type = head
+            .headers
+            .get("content-type")
+            .cloned()
+            .unwrap_or_else(|| "none".to_owned());
+
+        Request {
+            method: head.method,
             path,
             query,
-            headers,
+            headers: head.headers,
             body: Body {
-                content_type: content_type.to_string(),
+                content_type,
                 data: body,
             },
             params: HashMap::new(),
             data: HashMap::new(),
-            plugins: self.plugins.clone(),
-        };
+            plugins,
+            remote_addr: peer,
+        }
+    }
 
+    /// Runs routing and handlers, converting panics and errors into responses.
+    async fn dispatch(&self, request: Request) -> Response {
         let response = AssertUnwindSafe(self.handle(request)).catch_unwind().await;
         let response = match response {
             Ok(response) => response,
@@ -443,23 +565,51 @@ impl Server {
                 } else {
                     "Unknown panic".to_string()
                 };
+                eprintln!("Handler panicked: {}", panic_msg);
                 Err(ServerError::PanicError(panic_msg))
             },
         };
-        let response = match response {
+        match response {
             Ok(response) => response,
             Err(err) => self.handle_error(err),
-        };
-        let mut response_line = format!("HTTP/1.1 {}\r\n", response.status);
-        response.headers.iter().for_each(|(name, value)| {
-            response_line += &format!("{}: {}\r\n", name, value);
-        });
+        }
+    }
 
-        let contents = &response.body;
-        let length = contents.len();
-        response_line += &format!("Content-Length: {}\r\n\r\n{}", length, contents);
-        stream.write_all(response_line.as_bytes()).await?;
+    /// Sends an error response for a request that could not be read, then closes.
+    async fn reject<W>(&self, stream: &mut W, err: ServerError) -> Result<(), Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let response = self.handle_error(err);
+        let write = Self::write_response(stream, &response, false, false, false);
+        // Best effort: the client may already be gone.
+        let _ = timeout(Duration::from_secs(1), write).await;
         Ok(())
+    }
+
+    async fn write_response<W>(
+        stream: &mut W,
+        response: &Response,
+        is_head: bool,
+        keep_alive: bool,
+        http10: bool,
+    ) -> Result<(), Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut out = codec::encode_head(response, keep_alive, http10);
+        let send_body = !is_head && codec::status_has_body(response.status);
+        if send_body && response.body.len() <= 16 * 1024 {
+            // One write for small responses.
+            out.extend_from_slice(&response.body);
+            stream.write_all(&out).await?;
+        } else {
+            stream.write_all(&out).await?;
+            if send_body {
+                stream.write_all(&response.body).await?;
+            }
+        }
+        stream.flush().await
     }
 
     /// Sets the directory for serving static files
@@ -481,72 +631,102 @@ impl Server {
     }
 
     async fn handle(&self, mut req: Request) -> HttpResponse {
-        let path = req.path.clone();
-        let method = req.method.clone();
-        if let Some(routes) = self.router.routes.get(&path) {
-            if let Some(route) = routes.get(&method) {
-                return route.handle(req).await;
-            } else {
-                if method == Method::HEAD {
-                    if let Some(route) = routes.get(&Method::GET) {
-                        return Self::handle_head(route.clone(), req).await;
-                    }
+        let method = req.method;
+        // A path that exists but lacks a handler for this method.
+        let mut path_match: Option<PathMatch> = None;
+
+        // Keys containing ':' are dynamic patterns and are matched below.
+        if !req.path.contains(':') {
+            if let Some(routes) = self.router.routes.get(&req.path) {
+                if let Some((route, as_get)) = Self::select(routes, method) {
+                    return Self::run(route, as_get, req).await;
                 }
-                if method == Method::OPTIONS {
-                    if let Some(route) = routes.get(&Method::GET) {
-                        return Self::handle_options(route.clone(), req).await;
-                    }
-                }
+                path_match = Some((routes, HashMap::new()));
             }
         }
 
         for dynamic_path in &self.router.dynamic_routes {
-            if let Some(params) = self.match_dynamic_path(dynamic_path, &path) {
+            if let Some(params) = Self::match_dynamic_path(dynamic_path, &req.path) {
                 if let Some(routes) = self.router.routes.get(dynamic_path) {
-                    let method = req.method.clone();
-                    if let Some(route) = routes.get(&method) {
+                    if let Some((route, as_get)) = Self::select(routes, method) {
                         req.params = params;
-                        return route.handle(req).await;
-                    } else {
-                        if method == Method::HEAD {
-                            if let Some(route) = routes.get(&Method::GET) {
-                                return Self::handle_head(route.clone(), req).await;
-                            }
-                        }
-                        if method == Method::OPTIONS {
-                            if let Some(route) = routes.get(&Method::GET) {
-                                req.params = params;
-                                return Self::handle_options(route.clone(), req).await;
-                            }
-                        }
+                        return Self::run(route, as_get, req).await;
+                    }
+                    if path_match.is_none() {
+                        path_match = Some((routes, params));
                     }
                 }
             }
         }
-        if let Some(response) = self.handle_static_file(&req.path) {
-            Ok(response)
-        } else {
-            Err(ServerError::NotFound)
-        }
-    }
 
-    async fn handle_head(route: Route, req: Request) -> HttpResponse {
-        let mut req = req;
-        req.method = Method::GET;
-        let response = route.handle(req).await;
-        match response {
-            Ok(mut response) => {
-                response.body = "".to_string();
-                Ok(response)
+        if let Some((routes, params)) = path_match {
+            req.params = params;
+            let allow = Self::allow_header(routes);
+            if method == Method::OPTIONS {
+                return Self::handle_options(routes, allow, req).await;
             }
-            Err(err) => Err(err),
+            return Err(ServerError::MethodNotAllowed(allow));
         }
+
+        if method == Method::GET || method == Method::HEAD {
+            if let Some(response) = self.handle_static_file(&req.path).await {
+                return Ok(response);
+            }
+        }
+        Err(ServerError::NotFound)
     }
 
-    async fn handle_options(route: Route, req: Request) -> HttpResponse {
+    /// The route for `method`, falling back to GET for HEAD requests. The
+    /// flag is true when a GET handler serves a HEAD request.
+    fn select(routes: &HashMap<Method, Route>, method: Method) -> Option<(&Route, bool)> {
+        if let Some(route) = routes.get(&method) {
+            return Some((route, false));
+        }
+        if method == Method::HEAD {
+            return routes.get(&Method::GET).map(|route| (route, true));
+        }
+        None
+    }
+
+    async fn run(route: &Route, as_get: bool, mut req: Request) -> HttpResponse {
+        if as_get {
+            // The body is dropped when the response is written.
+            req.method = Method::GET;
+        }
+        route.handle(req).await
+    }
+
+    fn allow_header(routes: &HashMap<Method, Route>) -> String {
+        Method::ALL
+            .iter()
+            .filter(|m| {
+                routes.contains_key(m)
+                    || (**m == Method::HEAD && routes.contains_key(&Method::GET))
+                    || **m == Method::OPTIONS
+            })
+            .map(|m| m.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Automatic OPTIONS response. Runs the path's middleware so CORS
+    /// preflights work for routes without an explicit OPTIONS handler.
+    async fn handle_options(routes: &HashMap<Method, Route>, allow: String, req: Request) -> HttpResponse {
+        let middlewares = routes
+            .get(&Method::GET)
+            .or_else(|| routes.values().next())
+            .map(|route| route.middlewares.clone())
+            .unwrap_or_else(crate::middleware::MiddlewareManager::new);
         let route = Route {
-            middlewares: route.middlewares.clone(),
-            handler: Box::new(|_| async { Ok(Response::new(200)) }),
+            middlewares,
+            handler: Box::new(move |_| {
+                let allow = allow.clone();
+                async move {
+                    let mut response = Response::new(204);
+                    response.header("Allow", allow);
+                    Ok(response)
+                }
+            }),
         };
         route.handle(req).await
     }
@@ -559,107 +739,125 @@ impl Server {
         }
     }
 
-    fn handle_static_file(&self, path: &str) -> Option<Response> {
-        if let Some(static_dir) = &self.static_dir {
-            let file_path = static_dir.join(path.trim_start_matches('/'));
-            if let Ok(canonical_path) = fs::canonicalize(&file_path) {
-                if canonical_path.starts_with(fs::canonicalize(static_dir).ok()?)
-                    && canonical_path.is_file()
-                {
-                    return self.serve_file(&canonical_path);
-                }
-            }
+    async fn handle_static_file(&self, path: &str) -> Option<Response> {
+        // `static_dir` is canonicalized when the server starts.
+        let static_root = self.static_dir.as_ref()?;
+        let decoded = urlencoding::decode(path.trim_start_matches('/')).ok()?;
+        let file_path = static_root.join(decoded.as_ref());
+        let canonical_path = tokio::fs::canonicalize(&file_path).await.ok()?;
+        if !canonical_path.starts_with(static_root) {
+            return None;
         }
-        None
+        let metadata = tokio::fs::metadata(&canonical_path).await.ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Self::serve_file(&canonical_path, &metadata).await
     }
 
-    fn serve_file(&self, path: &Path) -> Option<Response> {
-        if let Ok(contents) = fs::read(path) {
-            let mut response = Response::new(200);
+    async fn serve_file(path: &Path, metadata: &std::fs::Metadata) -> Option<Response> {
+        let contents = tokio::fs::read(path).await.ok()?;
+        let mut response = Response::new(200);
 
-            // Set content type based on file extension
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let content_type = match ext {
-                    "html" => "text/html",
-                    "css" => "text/css",
-                    "js" => "text/javascript",
-                    "png" => "image/png",
-                    "jpg" | "jpeg" => "image/jpeg",
-                    "gif" => "image/gif",
-                    "svg" => "image/svg+xml",
-                    "ico" => "image/x-icon",
-                    _ => "application/octet-stream",
-                };
-                response.header("Content-Type", content_type);
-            }
+        // Set content type based on file extension
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let content_type = match ext.as_str() {
+            "html" | "htm" => "text/html; charset=utf-8",
+            "css" => "text/css; charset=utf-8",
+            "js" | "mjs" => "text/javascript; charset=utf-8",
+            "json" => "application/json",
+            "txt" => "text/plain; charset=utf-8",
+            "xml" => "application/xml",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "avif" => "image/avif",
+            "svg" => "image/svg+xml",
+            "ico" => "image/x-icon",
+            "woff" => "font/woff",
+            "woff2" => "font/woff2",
+            "wasm" => "application/wasm",
+            "pdf" => "application/pdf",
+            "mp4" => "video/mp4",
+            "webm" => "video/webm",
+            "mp3" => "audio/mpeg",
+            _ => "application/octet-stream",
+        };
+        response.header("Content-Type", content_type);
 
-            // Set cache control headers
-            response.header("Cache-Control", "public, max-age=31536000");
+        // Set cache control headers
+        response.header("Cache-Control", "public, max-age=31536000");
 
-            // Set Last-Modified
-            if let Ok(metadata) = fs::metadata(path) {
-                if let Ok(modified) = metadata.modified() {
-                    if let Ok(duration) = modified.duration_since(SystemTime::UNIX_EPOCH) {
-                        response.header(
-                            "Last-Modified",
-                            &httpdate::fmt_http_date(std::time::UNIX_EPOCH + duration),
-                        );
-                    }
-                }
-            }
-
-            // Set ETag (using file size and modification time as a simple hash)
-            if let Ok(metadata) = fs::metadata(path) {
-                let etag = format!(
-                    "\"{}-{}\"",
-                    metadata.len(),
-                    metadata
-                        .modified()
-                        .map(|m| m.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs())
-                        .unwrap_or(0)
-                );
-                response.header("ETag", &etag);
-            }
-
-            response.body = String::from_utf8_lossy(&contents).to_string();
-            Some(response)
-        } else {
-            None
+        if let Ok(modified) = metadata.modified() {
+            response.header("Last-Modified", httpdate::fmt_http_date(modified));
+            // ETag from size and modification time
+            let secs = modified
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            response.header("ETag", format!("\"{}-{}\"", metadata.len(), secs));
         }
+
+        response.body = contents;
+        Some(response)
     }
 
+    /// Parses a query string, percent-decoding keys and values ('+' is a space).
     fn parse_query(query: &str) -> HashMap<String, String> {
+        fn decode(s: &str) -> String {
+            let s = s.replace('+', " ");
+            match urlencoding::decode(&s) {
+                Ok(decoded) => decoded.into_owned(),
+                Err(_) => s,
+            }
+        }
         query
             .split('&')
             .filter(|s| !s.is_empty())
-            .filter_map(|pair| {
-                let mut parts = pair.split('=');
-                Some((
-                    parts.next()?.to_string(),
-                    parts.next().unwrap_or("").to_string(),
-                ))
+            .map(|pair| match pair.split_once('=') {
+                Some((key, value)) => (decode(key), decode(value)),
+                None => (decode(pair), String::new()),
             })
             .collect()
     }
 
-    fn match_dynamic_path(&self, pattern: &str, path: &str) -> Option<HashMap<String, String>> {
-        let pattern_parts: Vec<&str> = pattern.split('/').collect();
-        let path_parts: Vec<&str> = path.split('/').collect();
-
-        if pattern_parts.len() != path_parts.len() {
-            return None;
-        }
-
+    fn match_dynamic_path(pattern: &str, path: &str) -> Option<HashMap<String, String>> {
+        let mut pattern_parts = pattern.split('/');
+        let mut path_parts = path.split('/');
         let mut params = HashMap::new();
 
-        for (pattern_part, path_part) in pattern_parts.iter().zip(path_parts.iter()) {
-            if pattern_part.starts_with(':') {
-                params.insert(pattern_part[1..].to_string(), path_part.to_string());
-            } else if pattern_part != path_part {
-                return None;
+        loop {
+            match (pattern_parts.next(), path_parts.next()) {
+                (None, None) => return Some(params),
+                (Some(pattern_part), Some(path_part)) => {
+                    if let Some(name) = pattern_part.strip_prefix(':') {
+                        let value = urlencoding::decode(path_part)
+                            .map(|v| v.into_owned())
+                            .unwrap_or_else(|_| path_part.to_string());
+                        params.insert(name.to_string(), value);
+                    } else if pattern_part != path_part {
+                        return None;
+                    }
+                }
+                _ => return None,
             }
         }
-
-        Some(params)
     }
+}
+
+/// Errors that just mean the client went away.
+fn is_disconnect(e: &Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::TimedOut
+    )
 }

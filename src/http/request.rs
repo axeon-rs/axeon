@@ -2,6 +2,7 @@ use crate::plugins::Plugins;
 use base64::Engine;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 #[derive(Eq, Hash, PartialEq, Copy, Clone, Debug)]
 pub enum Method {
@@ -17,19 +18,58 @@ pub enum Method {
 }
 
 impl Method {
-    pub fn from_string(s: &str) -> Method {
+    /// All supported methods, in the order used for `Allow` headers.
+    pub const ALL: [Method; 9] = [
+        Method::GET,
+        Method::HEAD,
+        Method::POST,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+        Method::CONNECT,
+        Method::OPTIONS,
+        Method::TRACE,
+    ];
+
+    /// Parses a method token (case-sensitive, per RFC 9110). Returns `None` for unknown methods.
+    pub fn parse(s: &str) -> Option<Method> {
         match s {
-            "GET" => Method::GET,
-            "POST" => Method::POST,
-            "PUT" => Method::PUT,
-            "DELETE" => Method::DELETE,
-            "HEAD" => Method::HEAD,
-            "CONNECT" => Method::CONNECT,
-            "OPTIONS" => Method::OPTIONS,
-            "TRACE" => Method::TRACE,
-            "PATCH" => Method::PATCH,
-            _ => Method::GET,
+            "GET" => Some(Method::GET),
+            "POST" => Some(Method::POST),
+            "PUT" => Some(Method::PUT),
+            "DELETE" => Some(Method::DELETE),
+            "HEAD" => Some(Method::HEAD),
+            "CONNECT" => Some(Method::CONNECT),
+            "OPTIONS" => Some(Method::OPTIONS),
+            "TRACE" => Some(Method::TRACE),
+            "PATCH" => Some(Method::PATCH),
+            _ => None,
         }
+    }
+
+    #[deprecated(since = "0.3.0", note = "unknown methods silently became GET; use `Method::parse`")]
+    pub fn from_string(s: &str) -> Method {
+        Method::parse(s).unwrap_or(Method::GET)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Method::GET => "GET",
+            Method::POST => "POST",
+            Method::PUT => "PUT",
+            Method::DELETE => "DELETE",
+            Method::HEAD => "HEAD",
+            Method::CONNECT => "CONNECT",
+            Method::OPTIONS => "OPTIONS",
+            Method::TRACE => "TRACE",
+            Method::PATCH => "PATCH",
+        }
+    }
+}
+
+impl std::fmt::Display for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -76,11 +116,21 @@ impl Body {
         &self.data
     }
 
+    /// The media type without parameters, e.g. `application/json` for
+    /// `application/json; charset=utf-8`.
+    fn mime_is(&self, expected: &str) -> bool {
+        self.content_type
+            .split(';')
+            .next()
+            .map(|essence| essence.trim().eq_ignore_ascii_case(expected))
+            .unwrap_or(false)
+    }
+
     pub fn json<T>(&self) -> Option<T>
     where
         T: serde::de::DeserializeOwned,
     {
-        if self.content_type == "application/json" {
+        if self.mime_is("application/json") {
             // Use from_slice instead of converting to string first
             serde_json::from_slice(&self.data).ok()
         } else {
@@ -92,7 +142,7 @@ impl Body {
     where
         T: serde::de::DeserializeOwned,
     {
-        if self.content_type == "application/x-www-form-urlencoded" {
+        if self.mime_is("application/x-www-form-urlencoded") {
             serde_json::from_value(Self::parse_urlencoded(&self.data).ok()?).ok()
         } else {
             None
@@ -103,7 +153,7 @@ impl Body {
     where
         T: serde::de::DeserializeOwned,
     {
-        if self.content_type.starts_with("multipart/form-data") {
+        if self.mime_is("multipart/form-data") {
             serde_json::from_value(
                 Self::parse_multipart(&self.content_type, &self.data).ok()?
             ).ok()
@@ -151,11 +201,13 @@ impl Body {
 
         for pair in data_str.split('&') {
             if let Some((key, value)) = pair.split_once('=') {
-                let decoded_key = urlencoding::decode(key).map_err(|_| {
+                let key = key.replace('+', " ");
+                let value = value.replace('+', " ");
+                let decoded_key = urlencoding::decode(&key).map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to decode key")
                 })?.into_owned();
                 
-                let decoded_value = urlencoding::decode(value).map_err(|_| {
+                let decoded_value = urlencoding::decode(&value).map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to decode value")
                 })?.into_owned();
 
@@ -389,13 +441,17 @@ pub struct Request {
     pub data: HashMap<String, Value>,
     pub body: Body,
     pub plugins: Plugins,
+    /// Address of the TCP peer. This is the proxy's address when behind a reverse proxy.
+    pub remote_addr: Option<SocketAddr>,
 }
 
 impl Request {
+    /// Looks up a header by name, case-insensitively. Repeated headers are joined with ", ".
     pub fn get_header(&self, key: &str) -> Option<&str> {
-        match self.headers.get(key) {
-            Some(v) => Some(v),
-            None => None,
+        if key.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.headers.get(&key.to_ascii_lowercase()).map(|v| v.as_str())
+        } else {
+            self.headers.get(key).map(|v| v.as_str())
         }
     }
 

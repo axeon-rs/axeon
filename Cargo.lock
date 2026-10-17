@@ -70,13 +70,12 @@ dependencies = [
 
 [[package]]
 name = "axeon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "flate2",
  "futures",
  "httpdate",
- "lazy_static",
  "moka",
  "rustls",
  "rustls-pemfile",

@@ -18,7 +18,7 @@ Add Axeon to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-axeon = "0.2.0"
+axeon = "0.3.0"
 ```
 
 Create a simple server:

@@ -5,7 +5,10 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub struct Response {
     pub status: u16,
-    pub body: String,
+    /// Raw body bytes. Binary content (images, compressed data) is sent unchanged.
+    pub body: Vec<u8>,
+    /// Response headers. Prefer [`Response::header`] and [`Response::get_header`],
+    /// which treat names case-insensitively.
     pub headers: HashMap<String, String>,
 }
 
@@ -14,7 +17,7 @@ impl Response {
         Response {
             status,
             headers: HashMap::new(),
-            body: String::new(),
+            body: Vec::new(),
         }
     }
 
@@ -24,16 +27,49 @@ impl Response {
         self
     }
 
-    // Generic body setter
-    pub fn body<T: AsRef<str>>(&mut self, body: T) -> &mut Self {
-        self.body = body.as_ref().to_string();
+    // Generic body setter: accepts `String`, `&str`, `Vec<u8>`, `&[u8]`, ...
+    pub fn body<T: Into<Vec<u8>>>(&mut self, body: T) -> &mut Self {
+        self.body = body.into();
         self
     }
 
-    // Generic header setter
+    /// The body as text, replacing invalid UTF-8.
+    pub fn body_text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.body)
+    }
+
+    /// Sets a header, replacing any existing header with the same name (case-insensitive).
     pub fn header<K: AsRef<str>, V: AsRef<str>>(&mut self, name: K, value: V) -> &mut Self {
-        self.headers.insert(name.as_ref().to_string(), value.as_ref().to_string());
+        let name = name.as_ref();
+        self.remove_header(name);
+        self.headers.insert(name.to_string(), value.as_ref().to_string());
         self
+    }
+
+    /// Looks up a header by name, case-insensitively.
+    pub fn get_header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Removes a header by name, case-insensitively, returning its value.
+    pub fn remove_header(&mut self, name: &str) -> Option<String> {
+        let key = self.headers.keys().find(|k| k.eq_ignore_ascii_case(name))?.clone();
+        self.headers.remove(&key)
+    }
+
+    /// Adds `name` to the `Vary` header, keeping existing entries.
+    pub fn append_vary(&mut self, name: &str) -> &mut Self {
+        match self.get_header("vary") {
+            Some(existing) if existing.split(',').any(|v| v.trim().eq_ignore_ascii_case(name) || v.trim() == "*") => self,
+            Some(existing) => {
+                let value = format!("{}, {}", existing, name);
+                self.header("Vary", value)
+            }
+            None => self.header("Vary", name),
+        }
     }
 
     // Set multiple headers at once
@@ -101,8 +137,11 @@ impl Response {
     // Enhanced error response
     pub fn error(err: ServerError) -> Response {
         let status = err.status_code();
-        let error_message = err.to_string();
+        let error_message = err.public_message();
         let mut response = Response::new(status);
+        if let ServerError::MethodNotAllowed(allow) = &err {
+            response.header("Allow", allow);
+        }
         response.json(&serde_json::json!({
             "error": {
                 "message": error_message,
@@ -112,10 +151,11 @@ impl Response {
         response
     }
 
-    // Helper method for streaming responses
+    /// Not supported yet: the server always sends a `Content-Length` body, and
+    /// any `Transfer-Encoding` header is dropped. Only sets the content type.
+    #[deprecated(since = "0.3.0", note = "streaming responses are not supported yet; this only sets Content-Type")]
     pub fn stream(&mut self, content_type: &str) -> &mut Self {
-        self.header("Transfer-Encoding", "chunked")
-            .header("Content-Type", content_type)
+        self.header("Content-Type", content_type)
     }
 
     // Helper for CORS headers
@@ -130,7 +170,7 @@ impl Response {
         for (name, value) in &self.headers {
             println!("{}: {}", name, value);
         }
-        println!("\r\n{}", self.body);
+        println!("\r\n{}", self.body_text());
     }
 
     // New convenience methods
@@ -138,7 +178,7 @@ impl Response {
         let mut response = Response::new(200);
         response
             .header("Content-Type", "text/plain")
-            .body(content);
+            .body(content.as_ref());
         Ok(response)
     }
 
@@ -146,7 +186,7 @@ impl Response {
         let mut response = Response::new(200);
         response
             .header("Content-Type", "text/html")
-            .body(content);
+            .body(content.as_ref());
         Ok(response)
     }
 
@@ -154,7 +194,14 @@ impl Response {
         let mut response = Response::new(200);
         response
             .header("Content-Type", "application/xml")
-            .body(content);
+            .body(content.as_ref());
+        Ok(response)
+    }
+
+    /// A 200 response with raw bytes, e.g. an image or a generated file.
+    pub fn binary<T: Into<Vec<u8>>>(content_type: &str, data: T) -> Result<Response, ServerError> {
+        let mut response = Response::new(200);
+        response.header("Content-Type", content_type).body(data);
         Ok(response)
     }
 

@@ -13,7 +13,7 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust
+//! ```rust,no_run
 //! use axeon::{Response, Server};
 //!
 //! fn main() {
@@ -59,6 +59,7 @@
 //!     role: String,
 //! }
 //!
+//! let mut app = Server::new();
 //! app.post("/users", |req| async move {
 //!     match req.body.json::<User>() {
 //!         Some(user) => Response::ok(&user),
