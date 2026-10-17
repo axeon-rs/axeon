@@ -112,7 +112,8 @@ pub use crate::http::response::Response;
 // Reexport serde_json
 pub use serde_json::{json, Value};
 
-// Compile the README's examples as doctests so they stay correct.
-#[cfg(all(doctest, feature = "ws"))]
+// Compile the README's examples as doctests so they stay correct. The README
+// documents the default build, so this needs every default feature.
+#[cfg(all(doctest, feature = "tls", feature = "compression", feature = "ws", feature = "cache"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
