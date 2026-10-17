@@ -62,10 +62,6 @@ impl Middleware for SecurityHeaders {
             Ok(response)
         })
     }
-
-    fn clone_box(&self) -> Box<dyn Middleware> {
-        Box::new(Self::new(self.config.clone()))
-    }
 }
 
 #[derive(Clone)]
@@ -135,8 +131,13 @@ impl RateLimiter {
     fn client_key(&self, req: &Request) -> Option<IpAddr> {
         if self.config.trust_proxy {
             // The right-most X-Forwarded-For entry is the one our proxy added.
+            // Several X-Forwarded-For lines may arrive; the last one is our proxy's.
             let forwarded = req
-                .get_header("x-forwarded-for")
+                .headers
+                .get_all("x-forwarded-for")
+                .iter()
+                .next_back()
+                .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.rsplit(',').next())
                 .or_else(|| req.get_header("x-real-ip"))
                 .and_then(|ip| ip.trim().parse().ok());
@@ -185,11 +186,6 @@ impl Middleware for RateLimiter {
                 Err(ServerError::TooManyRequests)
             }
         })
-    }
-
-    fn clone_box(&self) -> Box<dyn Middleware> {
-        // Clones share the bucket state.
-        Box::new(self.clone())
     }
 }
 
@@ -292,9 +288,5 @@ impl Middleware for Cors {
             }
             Ok(response)
         })
-    }
-
-    fn clone_box(&self) -> Box<dyn Middleware> {
-        Box::new(Cors { config: Arc::clone(&self.config), any_origin: self.any_origin })
     }
 }

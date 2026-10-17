@@ -19,25 +19,34 @@
 
 use crate::error::ServerError;
 use crate::handler::{HttpResponse, IntoResponse};
-use crate::http::codec::{self, BodyFraming, Limits, ReadError};
+use crate::http::response::status_has_body;
 use crate::http::{Body, Method, Request};
 use crate::http::Response;
-use crate::middleware::Middleware;
+use crate::middleware::{Chain, Middleware};
 use crate::plugins::Plugins;
-use crate::router::{Route, Router};
+use crate::router::{CompiledRouter, Route, Router};
+use bytes::Bytes;
 use futures::FutureExt;
+use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
+use http::StatusCode;
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
 use std::collections::HashMap;
-use std::io::{Error, ErrorKind};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
-use tokio::time::{timeout, timeout_at, Instant};
+use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use std::fs::File;
@@ -46,7 +55,11 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 type ErrorHandler = Arc<dyn Fn(ServerError) -> Response + Send + Sync>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
-type PathMatch<'a> = (&'a HashMap<Method, Route>, HashMap<String, String>);
+type HyperResponse = hyper::Response<Full<Bytes>>;
+
+/// hyper's HTTP/1 read buffer cannot be smaller than this, so it is also the
+/// smallest header limit we can enforce.
+const MIN_HEADER_LIMIT: usize = 8 * 1024;
 
 /// TLS configuration for HTTPS support
 pub struct TlsConfig {
@@ -78,9 +91,29 @@ impl TlsConfig {
             .ok_or("No private key found")?;
         Ok(key)
     }
+
+    fn acceptor(&self) -> Result<TlsAcceptor, BoxError> {
+        let mut config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(self.load_certs()?, self.load_key()?)?;
+        // Offer HTTP/2, falling back to HTTP/1.1.
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Ok(TlsAcceptor::from(Arc::new(config)))
+    }
+}
+
+/// Size limits applied while reading a request.
+#[derive(Clone, Copy, Debug)]
+struct Limits {
+    max_header_size: usize,
+    max_headers: usize,
+    max_body_size: usize,
 }
 
 /// The main application struct that represents your web server.
+///
+/// Connections are served by [hyper](https://hyper.rs) and speak HTTP/1.1
+/// and HTTP/2 (negotiated with ALPN over TLS, or prior knowledge in clear text).
 ///
 /// # Example
 ///
@@ -156,8 +189,8 @@ impl Server {
         self
     }
 
-    /// Time allowed to receive a full request (head and body), to complete a
-    /// TLS handshake, and to write a response. Default: 30 seconds.
+    /// Time allowed to receive the request headers, and separately the
+    /// request body, and to complete a TLS handshake. Default: 30 seconds.
     pub fn request_timeout(&mut self, request_timeout: Duration) -> &mut Self {
         self.request_timeout = request_timeout;
         self
@@ -169,9 +202,10 @@ impl Server {
         self
     }
 
-    /// Maximum size of the request line plus headers in bytes. Default: 16 KiB.
+    /// Maximum size of the request line plus headers in bytes; larger
+    /// requests get 431. Default: 16 KiB, minimum: 8 KiB.
     pub fn max_header_size(&mut self, bytes: usize) -> &mut Self {
-        self.limits.max_header_size = bytes;
+        self.limits.max_header_size = bytes.max(MIN_HEADER_LIMIT);
         self
     }
 
@@ -200,11 +234,11 @@ impl Server {
     /// Registers a GET route handler
     ///
     /// # Arguments
-    /// * `path` - The URL path to match
+    /// * `path` - The URL path to match, e.g. `/users/:id` or `/files/*path`
     /// * `handler` - The async handler function
     pub fn get<F, R>(&mut self, path: &str, handler: F)
     where
-        F: Fn(Request) -> R + Send + Clone + Sync + 'static,
+        F: Fn(Request) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.router.get(path, handler);
@@ -217,7 +251,7 @@ impl Server {
     /// * `handler` - The async handler function
     pub fn post<F, R>(&mut self, path: &str, handler: F)
     where
-        F: Fn(Request) -> R + Send + Clone + Sync + 'static,
+        F: Fn(Request) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.router.post(path, handler);
@@ -230,7 +264,7 @@ impl Server {
     /// * `handler` - The async handler function
     pub fn put<F, R>(&mut self, path: &str, handler: F)
     where
-        F: Fn(Request) -> R + Send + Clone + Sync + 'static,
+        F: Fn(Request) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.router.put(path, handler);
@@ -243,7 +277,7 @@ impl Server {
     /// * `handler` - The async handler function
     pub fn patch<F, R>(&mut self, path: &str, handler: F)
     where
-        F: Fn(Request) -> R + Send + Clone + Sync + 'static,
+        F: Fn(Request) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.router.patch(path, handler);
@@ -256,7 +290,7 @@ impl Server {
     /// * `handler` - The async handler function
     pub fn delete<F, R>(&mut self, path: &str, handler: F)
     where
-        F: Fn(Request) -> R + Send + Clone + Sync + 'static,
+        F: Fn(Request) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.router.delete(path, handler);
@@ -269,7 +303,7 @@ impl Server {
     /// * `handler` - The async handler function
     pub fn head<F, R>(&mut self, path: &str, handler: F)
     where
-        F: Fn(Request) -> R + Send + Clone + Sync + 'static,
+        F: Fn(Request) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.router.head(path, handler);
@@ -282,7 +316,7 @@ impl Server {
     /// * `handler` - The async handler function
     pub fn connect<F, R>(&mut self, path: &str, handler: F)
     where
-        F: Fn(Request) -> R + Send + Clone + Sync + 'static,
+        F: Fn(Request) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.router.connect(path, handler);
@@ -295,7 +329,7 @@ impl Server {
     /// * `handler` - The async handler function
     pub fn options<F, R>(&mut self, path: &str, handler: F)
     where
-        F: Fn(Request) -> R + Send + Clone + Sync + 'static,
+        F: Fn(Request) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.router.options(path, handler);
@@ -308,7 +342,7 @@ impl Server {
     /// * `handler` - The async handler function
     pub fn trace<F, R>(&mut self, path: &str, handler: F)
     where
-        F: Fn(Request) -> R + Send + Clone + Sync + 'static,
+        F: Fn(Request) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.router.trace(path, handler);
@@ -337,6 +371,24 @@ impl Server {
         self
     }
 
+    /// Sets the directory for serving static files
+    ///
+    /// # Arguments
+    /// * `dir` - Path to the static files directory
+    ///
+    /// # Example
+    /// ```rust
+    ///
+    /// use axeon::Server;
+    ///
+    /// let mut app = Server::new();
+    /// app.static_dir("public");
+    /// ```
+    pub fn static_dir(&mut self, dir: &str) -> &mut Self {
+        self.static_dir = Some(PathBuf::from(dir));
+        self
+    }
+
     /// Starts the HTTP server on its own Tokio runtime and blocks forever.
     ///
     /// Use [`Server::serve`] instead when you already run inside a Tokio runtime.
@@ -358,6 +410,9 @@ impl Server {
 
     /// Serves connections from an already-bound listener on the current Tokio runtime.
     ///
+    /// Fails before accepting anything if TLS files can't be loaded or two
+    /// routes conflict (e.g. `/users/:id` and `/users/:name`).
+    ///
     /// ```rust,no_run
     /// use axeon::{Response, Server};
     ///
@@ -369,31 +424,16 @@ impl Server {
     ///     app.serve(listener).await.unwrap();
     /// }
     /// ```
-    pub async fn serve(mut self, listener: TcpListener) -> Result<(), BoxError> {
-        let tls_acceptor = if let Some(tls_config) = &self.tls_config {
-            let certs = tls_config.load_certs()?;
-            let key = tls_config.load_key()?;
-            let config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)?;
-            Some(TlsAcceptor::from(Arc::new(config)))
-        } else {
-            None
+    pub async fn serve(self, listener: TcpListener) -> Result<(), BoxError> {
+        let tls_acceptor = match &self.tls_config {
+            Some(tls_config) => Some(tls_config.acceptor()?),
+            None => None,
         };
-
-        // Resolve the static root once instead of on every request.
-        if let Some(dir) = self.static_dir.take() {
-            match tokio::fs::canonicalize(&dir).await {
-                Ok(root) => self.static_dir = Some(root),
-                Err(e) => eprintln!("Static directory {:?} is unavailable: {}", dir, e),
-            }
-        }
-
-        // One shared, immutable app for every connection.
-        let app = Arc::new(self);
+        let max_connections = self.max_connections.max(1);
+        let app = Arc::new(App::build(self).await?);
         // A permit is taken before each accept, so at the limit we simply stop
         // accepting (no busy loop) and resume when a connection finishes.
-        let slots = Arc::new(Semaphore::new(app.max_connections.max(1)));
+        let slots = Arc::new(Semaphore::new(max_connections));
 
         loop {
             let permit = Arc::clone(&slots).acquire_owned().await?;
@@ -412,144 +452,193 @@ impl Server {
 
             tokio::spawn(async move {
                 let _permit = permit;
-                let result = if let Some(acceptor) = acceptor {
-                    match timeout(app.request_timeout, acceptor.accept(stream)).await {
-                        Ok(Ok(tls_stream)) => app.handle_connection(tls_stream, Some(peer)).await,
-                        Ok(Err(e)) => {
-                            eprintln!("TLS handshake failed: {}", e);
-                            Ok(())
-                        }
-                        Err(_) => Ok(()),
-                    }
-                } else {
-                    app.handle_connection(stream, Some(peer)).await
-                };
-
-                if let Err(e) = result {
-                    if !is_disconnect(&e) {
-                        eprintln!("Connection error: {}", e);
-                    }
+                match acceptor {
+                    Some(acceptor) => match timeout(app.request_timeout, acceptor.accept(stream)).await {
+                        Ok(Ok(tls_stream)) => app.serve_connection(tls_stream, peer).await,
+                        Ok(Err(e)) => eprintln!("TLS handshake failed: {}", e),
+                        Err(_) => {}
+                    },
+                    None => app.serve_connection(stream, peer).await,
                 }
             });
         }
     }
+}
 
-    /// Serves HTTP/1.x requests on one connection until it closes, keeping it
-    /// alive between requests when the client allows it.
-    async fn handle_connection<S>(&self, stream: S, peer: Option<SocketAddr>) -> Result<(), Error>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-    {
-        let mut reader = BufReader::with_capacity(8 * 1024, stream);
-        let mut first_request = true;
+/// Immutable state shared by every connection once the server starts.
+struct App {
+    router: CompiledRouter,
+    static_root: Option<PathBuf>,
+    plugins: Plugins,
+    on_error: Option<ErrorHandler>,
+    limits: Limits,
+    request_timeout: Duration,
+    keep_alive: Duration,
+    http: auto::Builder<TokioExecutor>,
+}
 
-        loop {
-            if !first_request {
-                // Idle keep-alive: wait for the first byte of the next request.
-                match timeout(self.keep_alive, reader.fill_buf()).await {
-                    Err(_) => return Ok(()),
-                    Ok(Ok([])) => return Ok(()),
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => return Err(e),
+impl App {
+    async fn build(server: Server) -> Result<Self, BoxError> {
+        let router = server.router.compile()?;
+
+        // Resolve the static root once instead of on every request.
+        let static_root = match server.static_dir {
+            Some(dir) => match tokio::fs::canonicalize(&dir).await {
+                Ok(root) => Some(root),
+                Err(e) => {
+                    eprintln!("Static directory {:?} is unavailable: {}", dir, e);
+                    None
                 }
-            }
-            first_request = false;
+            },
+            None => None,
+        };
 
-            let deadline = Instant::now() + self.request_timeout;
-            let head = match timeout_at(deadline, codec::read_head(&mut reader, &self.limits)).await {
-                Err(_) => return self.reject(reader.get_mut(), ServerError::RequestTimeout).await,
-                Ok(Err(ReadError::Eof)) => return Ok(()),
-                Ok(Err(ReadError::Io(e))) => return Err(e),
-                Ok(Err(ReadError::Reject(err))) => return self.reject(reader.get_mut(), err).await,
-                Ok(Ok(head)) => head,
-            };
+        let limits = server.limits;
+        let mut http = auto::Builder::new(TokioExecutor::new());
+        http.http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(server.request_timeout)
+            // The read buffer bounds the request line plus headers.
+            .max_buf_size(limits.max_header_size.max(MIN_HEADER_LIMIT))
+            .max_headers(limits.max_headers);
+        http.http2()
+            .timer(TokioTimer::new())
+            .max_header_list_size(limits.max_header_size.min(u32::MAX as usize) as u32)
+            .max_concurrent_streams(256);
 
-            let http10 = head.version_minor == 0;
-            let connection = head.headers.get("connection").map(String::as_str).unwrap_or("");
-            let mut keep_alive = if http10 {
-                codec::has_token(connection, "keep-alive")
-            } else {
-                !codec::has_token(connection, "close")
-            };
+        Ok(Self {
+            router,
+            static_root,
+            plugins: server.plugins,
+            on_error: server.on_error,
+            limits,
+            request_timeout: server.request_timeout,
+            keep_alive: server.keep_alive,
+            http,
+        })
+    }
 
-            let framing = match codec::body_framing(&head.headers, self.limits.max_body_size) {
-                Ok(framing) => framing,
-                Err(err) => return self.reject(reader.get_mut(), err).await,
-            };
-            if framing != BodyFraming::None
-                && !http10
-                && head.headers.get("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
-            {
-                let stream = reader.get_mut();
-                stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
-                stream.flush().await?;
-            }
-            let body = match timeout_at(deadline, codec::read_body(&mut reader, framing, &self.limits)).await {
-                Err(_) => return self.reject(reader.get_mut(), ServerError::RequestTimeout).await,
-                Ok(Err(ReadError::Eof)) => return Ok(()),
-                Ok(Err(ReadError::Io(e))) => return Err(e),
-                Ok(Err(ReadError::Reject(err))) => return self.reject(reader.get_mut(), err).await,
-                Ok(Ok(body)) => body,
-            };
+    /// Serves HTTP/1.1 or HTTP/2 on one connection, closing it once it has
+    /// been idle for `keep_alive`.
+    async fn serve_connection<S>(self: Arc<Self>, stream: S, peer: SocketAddr)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let activity = Arc::new(Activity::new());
+        let service = {
+            let app = Arc::clone(&self);
+            let activity = Arc::clone(&activity);
+            service_fn(move |req| {
+                let app = Arc::clone(&app);
+                let busy = activity.begin();
+                async move {
+                    let response = app.respond(req, peer).await;
+                    drop(busy);
+                    Ok::<_, Infallible>(response)
+                }
+            })
+        };
 
-            let is_head = head.method == Method::HEAD;
-            let request = Self::build_request(head, body, peer, self.plugins.clone());
-            let response = self.dispatch(request).await;
-
-            if response
-                .get_header("connection")
-                .is_some_and(|v| codec::has_token(v, "close"))
-            {
-                keep_alive = false;
-            }
-            timeout(self.request_timeout, Self::write_response(reader.get_mut(), &response, is_head, keep_alive, http10))
-                .await
-                .map_err(|_| Error::new(ErrorKind::TimedOut, "response write timed out"))??;
-
-            if !keep_alive {
-                return Ok(());
+        let conn = self.http.serve_connection(TokioIo::new(stream), service);
+        tokio::pin!(conn);
+        let mut closing = false;
+        loop {
+            let idle_deadline = activity.last() + self.keep_alive;
+            tokio::select! {
+                result = conn.as_mut() => {
+                    if let Err(e) = result {
+                        if !is_disconnect(e.as_ref()) {
+                            eprintln!("Connection error: {}", e);
+                        }
+                    }
+                    return;
+                }
+                _ = sleep_until(idle_deadline), if !closing => {
+                    if activity.idle_for(self.keep_alive) {
+                        // Finishes any in-flight response, then closes.
+                        conn.as_mut().graceful_shutdown();
+                        closing = true;
+                    }
+                }
             }
         }
     }
 
-    fn build_request(
-        head: codec::RequestHead,
-        body: Vec<u8>,
-        peer: Option<SocketAddr>,
-        plugins: Plugins,
-    ) -> Request {
-        // Absolute-form targets ("http://host/path") are reduced to the path.
-        let mut target = head.target.as_str();
-        if let Some(rest) = target.strip_prefix("http://").or_else(|| target.strip_prefix("https://")) {
-            target = rest.find('/').map(|i| &rest[i..]).unwrap_or("/");
-        }
-        let (path, query) = match target.split_once('?') {
-            Some((path, query)) => (path, Self::parse_query(query)),
-            None => (target, HashMap::new()),
+    /// Reads the body under the limits, then routes the request.
+    async fn respond(&self, req: hyper::Request<Incoming>, peer: SocketAddr) -> HyperResponse {
+        let Some(method) = Method::parse(req.method().as_str()) else {
+            let err = ServerError::NotImplemented(format!("method {}", req.method()));
+            return self.to_hyper(self.handle_error(err));
         };
-        let path = path.trim_end_matches('/');
-        let path = if path.is_empty() { "/".to_string() } else { path.to_string() };
+        let (parts, body) = req.into_parts();
 
-        let content_type = head
+        // Refuse a declared oversized body before reading any of it.
+        let declared = parts
             .headers
-            .get("content-type")
-            .cloned()
-            .unwrap_or_else(|| "none".to_owned());
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        if declared.is_some_and(|len| len > self.limits.max_body_size as u64) {
+            return self.reject(ServerError::PayloadTooLarge);
+        }
 
-        Request {
-            method: head.method,
+        let deadline = Instant::now() + self.request_timeout;
+        let body = match timeout_at(deadline, Limited::new(body, self.limits.max_body_size).collect()).await {
+            Err(_) => return self.reject(ServerError::RequestTimeout),
+            Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
+                return self.reject(ServerError::PayloadTooLarge)
+            }
+            Ok(Err(_)) => return self.reject(ServerError::BadRequest("Invalid request body".to_string())),
+            Ok(Ok(collected)) => collected.to_bytes(),
+        };
+
+        let path = parts.uri.path().trim_end_matches('/');
+        let path = if path.is_empty() { "/".to_string() } else { path.to_string() };
+        let query = parts.uri.query().map(parse_query).unwrap_or_default();
+        let content_type = parts
+            .headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("none")
+            .to_string();
+
+        let request = Request {
+            method,
             path,
             query,
-            headers: head.headers,
-            body: Body {
-                content_type,
-                data: body,
-            },
+            headers: parts.headers,
+            body: Body { content_type, data: body },
             params: HashMap::new(),
             data: HashMap::new(),
-            plugins,
-            remote_addr: peer,
+            plugins: self.plugins.clone(),
+            remote_addr: Some(peer),
+        };
+        let response = self.dispatch(request).await;
+        self.to_hyper(response)
+    }
+
+    /// An error response for a request whose body was not read; the
+    /// connection is closed afterwards so unread bytes can't be misparsed.
+    fn reject(&self, err: ServerError) -> HyperResponse {
+        let mut response = self.to_hyper(self.handle_error(err));
+        response.headers_mut().insert(CONNECTION, HeaderValue::from_static("close"));
+        response
+    }
+
+    fn to_hyper(&self, response: Response) -> HyperResponse {
+        let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let mut headers = response.headers;
+        // Framing is ours to decide.
+        headers.remove(TRANSFER_ENCODING);
+        headers.remove(CONTENT_LENGTH);
+        if status_has_body(status.as_u16()) {
+            headers.insert(CONTENT_LENGTH, HeaderValue::from(response.body.len()));
         }
+        let body = if status_has_body(status.as_u16()) { response.body } else { Bytes::new() };
+        let mut out = hyper::Response::new(Full::new(body));
+        *out.status_mut() = status;
+        *out.headers_mut() = headers;
+        out
     }
 
     /// Runs routing and handlers, converting panics and errors into responses.
@@ -575,160 +664,30 @@ impl Server {
         }
     }
 
-    /// Sends an error response for a request that could not be read, then closes.
-    async fn reject<W>(&self, stream: &mut W, err: ServerError) -> Result<(), Error>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let response = self.handle_error(err);
-        let write = Self::write_response(stream, &response, false, false, false);
-        // Best effort: the client may already be gone.
-        let _ = timeout(Duration::from_secs(1), write).await;
-        Ok(())
-    }
-
-    async fn write_response<W>(
-        stream: &mut W,
-        response: &Response,
-        is_head: bool,
-        keep_alive: bool,
-        http10: bool,
-    ) -> Result<(), Error>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let mut out = codec::encode_head(response, keep_alive, http10);
-        let send_body = !is_head && codec::status_has_body(response.status);
-        if send_body && response.body.len() <= 16 * 1024 {
-            // One write for small responses.
-            out.extend_from_slice(&response.body);
-            stream.write_all(&out).await?;
-        } else {
-            stream.write_all(&out).await?;
-            if send_body {
-                stream.write_all(&response.body).await?;
-            }
-        }
-        stream.flush().await
-    }
-
-    /// Sets the directory for serving static files
-    ///
-    /// # Arguments
-    /// * `dir` - Path to the static files directory
-    ///
-    /// # Example
-    /// ```rust
-    ///
-    /// use axeon::Server;
-    ///
-    /// let mut app = Server::new();
-    /// app.static_dir("public");
-    /// ```
-    pub fn static_dir(&mut self, dir: &str) -> &mut Self {
-        self.static_dir = Some(PathBuf::from(dir));
-        self
-    }
-
     async fn handle(&self, mut req: Request) -> HttpResponse {
         let method = req.method;
-        // A path that exists but lacks a handler for this method.
-        let mut path_match: Option<PathMatch> = None;
-
-        // Keys containing ':' are dynamic patterns and are matched below.
-        if !req.path.contains(':') {
-            if let Some(routes) = self.router.routes.get(&req.path) {
-                if let Some((route, as_get)) = Self::select(routes, method) {
-                    return Self::run(route, as_get, req).await;
-                }
-                path_match = Some((routes, HashMap::new()));
-            }
-        }
-
-        for dynamic_path in &self.router.dynamic_routes {
-            if let Some(params) = Self::match_dynamic_path(dynamic_path, &req.path) {
-                if let Some(routes) = self.router.routes.get(dynamic_path) {
-                    if let Some((route, as_get)) = Self::select(routes, method) {
-                        req.params = params;
-                        return Self::run(route, as_get, req).await;
-                    }
-                    if path_match.is_none() {
-                        path_match = Some((routes, params));
-                    }
+        let Some((routes, params)) = self.router.lookup(&req.path) else {
+            if method == Method::GET || method == Method::HEAD {
+                if let Some(response) = self.handle_static_file(&req.path).await {
+                    return Ok(response);
                 }
             }
-        }
-
-        if let Some((routes, params)) = path_match {
-            req.params = params;
-            let allow = Self::allow_header(routes);
-            if method == Method::OPTIONS {
-                return Self::handle_options(routes, allow, req).await;
-            }
-            return Err(ServerError::MethodNotAllowed(allow));
-        }
-
-        if method == Method::GET || method == Method::HEAD {
-            if let Some(response) = self.handle_static_file(&req.path).await {
-                return Ok(response);
-            }
-        }
-        Err(ServerError::NotFound)
-    }
-
-    /// The route for `method`, falling back to GET for HEAD requests. The
-    /// flag is true when a GET handler serves a HEAD request.
-    fn select(routes: &HashMap<Method, Route>, method: Method) -> Option<(&Route, bool)> {
-        if let Some(route) = routes.get(&method) {
-            return Some((route, false));
-        }
-        if method == Method::HEAD {
-            return routes.get(&Method::GET).map(|route| (route, true));
-        }
-        None
-    }
-
-    async fn run(route: &Route, as_get: bool, mut req: Request) -> HttpResponse {
-        if as_get {
-            // The body is dropped when the response is written.
-            req.method = Method::GET;
-        }
-        route.handle(req).await
-    }
-
-    fn allow_header(routes: &HashMap<Method, Route>) -> String {
-        Method::ALL
-            .iter()
-            .filter(|m| {
-                routes.contains_key(m)
-                    || (**m == Method::HEAD && routes.contains_key(&Method::GET))
-                    || **m == Method::OPTIONS
-            })
-            .map(|m| m.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    /// Automatic OPTIONS response. Runs the path's middleware so CORS
-    /// preflights work for routes without an explicit OPTIONS handler.
-    async fn handle_options(routes: &HashMap<Method, Route>, allow: String, req: Request) -> HttpResponse {
-        let middlewares = routes
-            .get(&Method::GET)
-            .or_else(|| routes.values().next())
-            .map(|route| route.middlewares.clone())
-            .unwrap_or_else(crate::middleware::MiddlewareManager::new);
-        let route = Route {
-            middlewares,
-            handler: Box::new(move |_| {
-                let allow = allow.clone();
-                async move {
-                    let mut response = Response::new(204);
-                    response.header("Allow", allow);
-                    Ok(response)
-                }
-            }),
+            return Err(ServerError::NotFound);
         };
-        route.handle(req).await
+        req.params = params;
+
+        if let Some((route, as_get)) = select(routes, method) {
+            if as_get {
+                // A GET handler serving HEAD; the body is dropped when sending.
+                req.method = Method::GET;
+            }
+            return route.handle(req).await;
+        }
+        let allow = allow_header(routes);
+        if method == Method::OPTIONS {
+            return handle_options(routes, allow, req).await;
+        }
+        Err(ServerError::MethodNotAllowed(allow))
     }
 
     fn handle_error(&self, error: ServerError) -> Response {
@@ -740,8 +699,7 @@ impl Server {
     }
 
     async fn handle_static_file(&self, path: &str) -> Option<Response> {
-        // `static_dir` is canonicalized when the server starts.
-        let static_root = self.static_dir.as_ref()?;
+        let static_root = self.static_root.as_ref()?;
         let decoded = urlencoding::decode(path.trim_start_matches('/')).ok()?;
         let file_path = static_root.join(decoded.as_ref());
         let canonical_path = tokio::fs::canonicalize(&file_path).await.ok()?;
@@ -752,112 +710,186 @@ impl Server {
         if !metadata.is_file() {
             return None;
         }
-        Self::serve_file(&canonical_path, &metadata).await
-    }
-
-    async fn serve_file(path: &Path, metadata: &std::fs::Metadata) -> Option<Response> {
-        let contents = tokio::fs::read(path).await.ok()?;
-        let mut response = Response::new(200);
-
-        // Set content type based on file extension
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .unwrap_or_default();
-        let content_type = match ext.as_str() {
-            "html" | "htm" => "text/html; charset=utf-8",
-            "css" => "text/css; charset=utf-8",
-            "js" | "mjs" => "text/javascript; charset=utf-8",
-            "json" => "application/json",
-            "txt" => "text/plain; charset=utf-8",
-            "xml" => "application/xml",
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            "avif" => "image/avif",
-            "svg" => "image/svg+xml",
-            "ico" => "image/x-icon",
-            "woff" => "font/woff",
-            "woff2" => "font/woff2",
-            "wasm" => "application/wasm",
-            "pdf" => "application/pdf",
-            "mp4" => "video/mp4",
-            "webm" => "video/webm",
-            "mp3" => "audio/mpeg",
-            _ => "application/octet-stream",
-        };
-        response.header("Content-Type", content_type);
-
-        // Set cache control headers
-        response.header("Cache-Control", "public, max-age=31536000");
-
-        if let Ok(modified) = metadata.modified() {
-            response.header("Last-Modified", httpdate::fmt_http_date(modified));
-            // ETag from size and modification time
-            let secs = modified
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            response.header("ETag", format!("\"{}-{}\"", metadata.len(), secs));
-        }
-
-        response.body = contents;
-        Some(response)
-    }
-
-    /// Parses a query string, percent-decoding keys and values ('+' is a space).
-    fn parse_query(query: &str) -> HashMap<String, String> {
-        fn decode(s: &str) -> String {
-            let s = s.replace('+', " ");
-            match urlencoding::decode(&s) {
-                Ok(decoded) => decoded.into_owned(),
-                Err(_) => s,
-            }
-        }
-        query
-            .split('&')
-            .filter(|s| !s.is_empty())
-            .map(|pair| match pair.split_once('=') {
-                Some((key, value)) => (decode(key), decode(value)),
-                None => (decode(pair), String::new()),
-            })
-            .collect()
-    }
-
-    fn match_dynamic_path(pattern: &str, path: &str) -> Option<HashMap<String, String>> {
-        let mut pattern_parts = pattern.split('/');
-        let mut path_parts = path.split('/');
-        let mut params = HashMap::new();
-
-        loop {
-            match (pattern_parts.next(), path_parts.next()) {
-                (None, None) => return Some(params),
-                (Some(pattern_part), Some(path_part)) => {
-                    if let Some(name) = pattern_part.strip_prefix(':') {
-                        let value = urlencoding::decode(path_part)
-                            .map(|v| v.into_owned())
-                            .unwrap_or_else(|_| path_part.to_string());
-                        params.insert(name.to_string(), value);
-                    } else if pattern_part != path_part {
-                        return None;
-                    }
-                }
-                _ => return None,
-            }
-        }
+        serve_file(&canonical_path, &metadata).await
     }
 }
 
-/// Errors that just mean the client went away.
-fn is_disconnect(e: &Error) -> bool {
-    matches!(
-        e.kind(),
-        ErrorKind::UnexpectedEof
-            | ErrorKind::ConnectionReset
-            | ErrorKind::ConnectionAborted
-            | ErrorKind::BrokenPipe
-            | ErrorKind::TimedOut
-    )
+/// Tracks in-flight requests and the last activity on a connection.
+struct Activity {
+    in_flight: AtomicUsize,
+    last: Mutex<Instant>,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self { in_flight: AtomicUsize::new(0), last: Mutex::new(Instant::now()) }
+    }
+
+    fn touch(&self) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    fn last(&self) -> Instant {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn begin(self: &Arc<Self>) -> BusyGuard {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        self.touch();
+        BusyGuard(Arc::clone(self))
+    }
+
+    fn idle_for(&self, duration: Duration) -> bool {
+        self.in_flight.load(Ordering::SeqCst) == 0 && self.last().elapsed() >= duration
+    }
+}
+
+/// Marks a request as in flight until dropped.
+struct BusyGuard(Arc<Activity>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.0.touch();
+    }
+}
+
+/// The route for `method`, falling back to GET for HEAD requests. The flag
+/// is true when a GET handler serves a HEAD request.
+fn select(routes: &HashMap<Method, Route>, method: Method) -> Option<(&Route, bool)> {
+    if let Some(route) = routes.get(&method) {
+        return Some((route, false));
+    }
+    if method == Method::HEAD {
+        return routes.get(&Method::GET).map(|route| (route, true));
+    }
+    None
+}
+
+fn allow_header(routes: &HashMap<Method, Route>) -> String {
+    Method::ALL
+        .iter()
+        .filter(|m| {
+            routes.contains_key(m)
+                || (**m == Method::HEAD && routes.contains_key(&Method::GET))
+                || **m == Method::OPTIONS
+        })
+        .map(|m| m.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Automatic OPTIONS response. Runs the path's middleware so CORS
+/// preflights work for routes without an explicit OPTIONS handler.
+async fn handle_options(routes: &HashMap<Method, Route>, allow: String, req: Request) -> HttpResponse {
+    let middlewares = routes
+        .get(&Method::GET)
+        .or_else(|| routes.values().next())
+        .map(|route| Arc::clone(&route.chain.middlewares))
+        .unwrap_or_else(|| Arc::new([]));
+    let route = Route {
+        chain: Arc::new(Chain {
+            middlewares,
+            handler: Arc::new(move |_req: Request| {
+                let allow = allow.clone();
+                async move {
+                    let mut response = Response::new(204);
+                    response.header("Allow", allow);
+                    Ok(response)
+                }
+            }),
+        }),
+    };
+    route.handle(req).await
+}
+
+async fn serve_file(path: &Path, metadata: &std::fs::Metadata) -> Option<Response> {
+    let contents = tokio::fs::read(path).await.ok()?;
+    let mut response = Response::new(200);
+
+    // Set content type based on file extension
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let content_type = match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "txt" => "text/plain; charset=utf-8",
+        "xml" => "application/xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "wasm" => "application/wasm",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        _ => "application/octet-stream",
+    };
+    response.header("Content-Type", content_type);
+
+    // Set cache control headers
+    response.header("Cache-Control", "public, max-age=31536000");
+
+    if let Ok(modified) = metadata.modified() {
+        response.header("Last-Modified", httpdate::fmt_http_date(modified));
+        // ETag from size and modification time
+        let secs = modified
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        response.header("ETag", format!("\"{}-{}\"", metadata.len(), secs));
+    }
+
+    response.body = Bytes::from(contents);
+    Some(response)
+}
+
+/// Parses a query string, percent-decoding keys and values ('+' is a space).
+fn parse_query(query: &str) -> HashMap<String, String> {
+    fn decode(s: &str) -> String {
+        let s = s.replace('+', " ");
+        match urlencoding::decode(&s) {
+            Ok(decoded) => decoded.into_owned(),
+            Err(_) => s,
+        }
+    }
+    query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((key, value)) => (decode(key), decode(value)),
+            None => (decode(pair), String::new()),
+        })
+        .collect()
+}
+
+/// Connection errors that just mean the client went away or timed out.
+fn is_disconnect(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(e);
+    while let Some(err) = source {
+        if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
+            if hyper_err.is_incomplete_message() || hyper_err.is_canceled() || hyper_err.is_timeout() {
+                return true;
+            }
+        }
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind::*;
+            if matches!(io.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe | TimedOut | NotConnected) {
+                return true;
+            }
+        }
+        source = err.source();
+    }
+    false
 }

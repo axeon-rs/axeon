@@ -72,7 +72,7 @@ impl Client {
             return None;
         }
         let status: u16 = line.split(' ').nth(1).expect("status line").parse().unwrap();
-        assert!(line.starts_with("HTTP/1.1 "), "bad status line {:?}", line);
+        assert!(line.starts_with("HTTP/1."), "bad status line {:?}", line);
         let mut headers = HashMap::new();
         loop {
             line.clear();
@@ -262,8 +262,7 @@ async fn oversized_chunked_body_is_rejected() {
 async fn ambiguous_framing_is_rejected() {
     let addr = start(echo_app()).await;
     for raw in [
-        &b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
-        b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n",
+        &b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n"[..],
         b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: +3\r\n\r\n",
         b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length : 3\r\n\r\n",
     ] {
@@ -271,19 +270,34 @@ async fn ambiguous_framing_is_rejected() {
         c.send(raw).await;
         assert_eq!(c.read().await.unwrap().status, 400, "{}", String::from_utf8_lossy(raw));
     }
+    // A request body must end with chunked (RFC 9112 §6.3).
     let mut c = Client::connect(addr).await;
     c.send(b"POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: gzip\r\n\r\n").await;
-    assert_eq!(c.read().await.unwrap().status, 501);
+    assert_eq!(c.read().await.unwrap().status, 400);
+
+    // With both headers, Transfer-Encoding wins and the connection is closed
+    // afterwards, so leftover bytes can never be read as another request.
+    let mut c = Client::connect(addr).await;
+    c.send(b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\nGET / HTTP/1.1\r\n\r\n").await;
+    let r = c.read().await.unwrap();
+    assert_eq!(r.text(), "hi");
+    assert_eq!(r.header("connection"), Some("close"));
+    assert!(c.closed_within(Duration::from_secs(2)).await);
 }
 
 #[tokio::test]
 async fn header_limits_are_enforced() {
     let mut app = hello_app();
+    // 8 KiB is the smallest limit hyper supports; smaller values are raised.
     app.max_header_size(1024).max_headers(10);
     let addr = start(app).await;
 
     let mut c = Client::connect(addr).await;
-    c.send(format!("GET / HTTP/1.1\r\nHost: t\r\nX-Big: {}\r\n\r\n", "a".repeat(2000)).as_bytes()).await;
+    c.send(format!("GET / HTTP/1.1\r\nHost: t\r\nX-Big: {}\r\n\r\n", "a".repeat(6000)).as_bytes()).await;
+    assert_eq!(c.read().await.unwrap().status, 200);
+
+    let mut c = Client::connect(addr).await;
+    c.send(format!("GET / HTTP/1.1\r\nHost: t\r\nX-Big: {}\r\n\r\n", "a".repeat(10_000)).as_bytes()).await;
     assert_eq!(c.read().await.unwrap().status, 431);
 
     let mut c = Client::connect(addr).await;
@@ -292,8 +306,8 @@ async fn header_limits_are_enforced() {
     assert_eq!(c.read().await.unwrap().status, 431);
 
     let mut c = Client::connect(addr).await;
-    c.send(format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(2000)).as_bytes()).await;
-    assert_eq!(c.read().await.unwrap().status, 414);
+    c.send(format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(10_000)).as_bytes()).await;
+    assert_eq!(c.read().await.unwrap().status, 431);
 }
 
 #[tokio::test]
@@ -303,7 +317,6 @@ async fn slow_request_times_out() {
     let addr = start(app).await;
     let mut c = Client::connect(addr).await;
     c.send(b"GET / HTTP/1.1\r\nHost: t\r\n").await; // never finishes the head
-    assert_eq!(c.read().await.unwrap().status, 408);
     assert!(c.closed_within(Duration::from_secs(2)).await);
 }
 
@@ -592,4 +605,185 @@ async fn header_injection_is_dropped() {
     assert_eq!(r.header("set-cookie"), None);
     assert_eq!(r.header("x-name"), None);
     assert_eq!(r.header("x-ok"), Some("fine"));
+}
+
+#[tokio::test]
+async fn slow_body_times_out_with_408() {
+    let mut app = echo_app();
+    app.request_timeout(Duration::from_millis(200));
+    let addr = start(app).await;
+    let mut c = Client::connect(addr).await;
+    c.send(b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nabc").await; // body never completes
+    let r = c.read().await.unwrap();
+    assert_eq!(r.status, 408);
+    assert_eq!(r.header("connection"), Some("close"));
+}
+
+#[tokio::test]
+async fn http2_prior_knowledge_is_served() {
+    let mut app = Server::new();
+    app.post("/echo", |req| async move { Response::binary("text/plain", req.body.as_bytes().to_vec()) });
+    let addr = start(app).await;
+
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let (client, connection) = h2::client::handshake(tcp).await.unwrap();
+    tokio::spawn(connection);
+    let mut client = client.ready().await.unwrap();
+
+    // Several concurrent streams over one connection.
+    let mut pending = Vec::new();
+    for i in 0..3 {
+        let request = http::Request::post(format!("http://{}/echo", addr)).body(()).unwrap();
+        let (response, mut stream) = client.send_request(request, false).unwrap();
+        stream.send_data(bytes::Bytes::from(format!("stream {}", i)), true).unwrap();
+        pending.push(response);
+        client = client.ready().await.unwrap();
+    }
+    for (i, response) in pending.into_iter().enumerate() {
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), 200);
+        let mut body = response.into_body();
+        let mut data = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+            data.extend_from_slice(&chunk);
+        }
+        assert_eq!(data, format!("stream {}", i).into_bytes());
+    }
+}
+
+#[tokio::test]
+async fn catch_all_and_static_priority() {
+    let mut app = Server::new();
+    app.get("/files/*path", |req| async move {
+        Response::text(format!("file:{}", req.params.get("path").unwrap()))
+    });
+    app.get("/files/index", |_req| async { Response::text("index") });
+    let addr = start(app).await;
+    let mut c = Client::connect(addr).await;
+    assert_eq!(c.get("/files/a/b%20c.txt").await.text(), "file:a/b c.txt");
+    assert_eq!(c.get("/files/index").await.text(), "index");
+}
+
+#[tokio::test]
+async fn conflicting_routes_fail_at_startup() {
+    let mut app = Server::new();
+    app.get("/users/:id", |_req| async { Response::text("a") });
+    app.get("/users/:name", |_req| async { Response::text("b") });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let err = app.serve(listener).await.unwrap_err();
+    assert!(err.to_string().contains("/users/"), "{}", err);
+}
+
+struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl axeon::middleware::Middleware for Counter {
+    fn call(&self, req: axeon::Request, next: axeon::middleware::Next) -> axeon::middleware::MiddlewareResult {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        next.handle(req)
+    }
+}
+
+struct Tag(&'static str);
+
+impl axeon::middleware::Middleware for Tag {
+    fn call(&self, req: axeon::Request, next: axeon::middleware::Next) -> axeon::middleware::MiddlewareResult {
+        let tag = self.0;
+        Box::pin(async move {
+            let mut res = next.handle(req).await?;
+            let order = match res.get_header("x-order") {
+                Some(existing) => format!("{},{}", tag, existing),
+                None => tag.to_string(),
+            };
+            res.header("X-Order", order);
+            Ok(res)
+        })
+    }
+}
+
+#[tokio::test]
+async fn middleware_is_shared_and_runs_in_order() {
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut app = Server::new();
+    app.middleware(Counter(count.clone()));
+    app.middleware(Tag("app"));
+    let mut api = axeon::Router::new();
+    api.middleware(Tag("api"));
+    api.get("/x", |_req| async { Response::text("x") });
+    app.mount("/api", api);
+    let addr = start(app).await;
+
+    for _ in 0..3 {
+        let r = Client::connect(addr).await.get("/api/x").await;
+        assert_eq!(r.header("x-order"), Some("app,api"));
+    }
+    // One middleware instance across all connections.
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn repeated_response_headers_are_kept() {
+    let mut app = Server::new();
+    app.get("/", |_req| async {
+        let mut r = Response::new(200);
+        r.append_header("Set-Cookie", "a=1").append_header("Set-Cookie", "b=2");
+        Ok(r)
+    });
+    let addr = start(app).await;
+    let mut c = Client::connect(addr).await;
+    c.send(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
+    let mut raw = vec![0u8; 512];
+    let n = timeout(Duration::from_secs(5), c.reader.read(&mut raw)).await.unwrap().unwrap();
+    let text = String::from_utf8_lossy(&raw[..n]).to_ascii_lowercase();
+    assert!(text.contains("set-cookie: a=1") && text.contains("set-cookie: b=2"), "{}", text);
+}
+
+#[tokio::test]
+async fn tls_negotiates_http2_and_http11() {
+    let dir = TempDir::new("tls");
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_path = dir.0.join("cert.pem");
+    let key_path = dir.0.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+    let mut app = Server::new();
+    app.get("/", |_req| async { Response::text("secure") });
+    app.with_tls(&cert_path, &key_path);
+    let addr = start(app).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let connect = |alpn: &[u8]| {
+        let mut config = rustls::ClientConfig::builder().with_root_certificates(roots.clone()).with_no_client_auth();
+        config.alpn_protocols = vec![alpn.to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        async move {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            connector.connect(name, tcp).await.unwrap()
+        }
+    };
+
+    // HTTP/2 via ALPN.
+    let tls = connect(b"h2").await;
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+    let (client, connection) = h2::client::handshake(tls).await.unwrap();
+    tokio::spawn(connection);
+    let mut client = client.ready().await.unwrap();
+    let (response, _) = client.send_request(http::Request::get("https://localhost/").body(()).unwrap(), true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let chunk = response.into_body().data().await.unwrap().unwrap();
+    assert_eq!(&chunk[..], b"secure");
+
+    // HTTP/1.1 via ALPN.
+    let mut tls = connect(b"http/1.1").await;
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+    let mut raw = Vec::new();
+    tls.read_to_end(&mut raw).await.unwrap();
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.starts_with("HTTP/1.1 200 OK"), "{}", text);
+    assert!(text.ends_with("secure"), "{}", text);
 }

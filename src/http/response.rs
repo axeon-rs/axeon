@@ -1,23 +1,40 @@
 use crate::error::ServerError;
+use bytes::Bytes;
+use http::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
-use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct Response {
     pub status: u16,
     /// Raw body bytes. Binary content (images, compressed data) is sent unchanged.
-    pub body: Vec<u8>,
-    /// Response headers. Prefer [`Response::header`] and [`Response::get_header`],
-    /// which treat names case-insensitively.
-    pub headers: HashMap<String, String>,
+    /// Cloning `Bytes` is cheap (reference counted).
+    pub body: Bytes,
+    /// Response headers. Names are case-insensitive.
+    pub headers: HeaderMap,
+}
+
+/// Statuses that never carry a body (RFC 9110 §6.4.1).
+pub(crate) fn status_has_body(status: u16) -> bool {
+    !(100..200).contains(&status) && status != 204 && status != 304
+}
+
+fn parse_header(name: &str, value: &str) -> Option<(HeaderName, HeaderValue)> {
+    match (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
+        (Ok(name), Ok(value)) => Some((name, value)),
+        _ => {
+            // Invalid names, or values containing CR/LF, would corrupt the response.
+            eprintln!("Ignoring invalid response header {:?}", name);
+            None
+        }
+    }
 }
 
 impl Response {
     pub fn new(status: u16) -> Response {
         Response {
             status,
-            headers: HashMap::new(),
-            body: Vec::new(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
         }
     }
 
@@ -29,7 +46,13 @@ impl Response {
 
     // Generic body setter: accepts `String`, `&str`, `Vec<u8>`, `&[u8]`, ...
     pub fn body<T: Into<Vec<u8>>>(&mut self, body: T) -> &mut Self {
-        self.body = body.into();
+        self.body = Bytes::from(body.into());
+        self
+    }
+
+    /// Sets the body from `Bytes` without copying, e.g. a cached or shared buffer.
+    pub fn body_bytes(&mut self, body: Bytes) -> &mut Self {
+        self.body = body;
         self
     }
 
@@ -38,26 +61,32 @@ impl Response {
         String::from_utf8_lossy(&self.body)
     }
 
-    /// Sets a header, replacing any existing header with the same name (case-insensitive).
+    /// Sets a header, replacing any existing values (names are case-insensitive).
+    /// Invalid names or values (e.g. containing CR/LF) are ignored.
     pub fn header<K: AsRef<str>, V: AsRef<str>>(&mut self, name: K, value: V) -> &mut Self {
-        let name = name.as_ref();
-        self.remove_header(name);
-        self.headers.insert(name.to_string(), value.as_ref().to_string());
+        if let Some((name, value)) = parse_header(name.as_ref(), value.as_ref()) {
+            self.headers.insert(name, value);
+        }
         self
     }
 
-    /// Looks up a header by name, case-insensitively.
-    pub fn get_header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+    /// Adds a header value, keeping existing ones (e.g. several `Set-Cookie`).
+    pub fn append_header<K: AsRef<str>, V: AsRef<str>>(&mut self, name: K, value: V) -> &mut Self {
+        if let Some((name, value)) = parse_header(name.as_ref(), value.as_ref()) {
+            self.headers.append(name, value);
+        }
+        self
     }
 
-    /// Removes a header by name, case-insensitively, returning its value.
+    /// The first value of a header, if it is valid text.
+    pub fn get_header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name)?.to_str().ok()
+    }
+
+    /// Removes a header, returning its first value.
     pub fn remove_header(&mut self, name: &str) -> Option<String> {
-        let key = self.headers.keys().find(|k| k.eq_ignore_ascii_case(name))?.clone();
-        self.headers.remove(&key)
+        let value = self.headers.remove(name)?;
+        Some(String::from_utf8_lossy(value.as_bytes()).into_owned())
     }
 
     /// Adds `name` to the `Vary` header, keeping existing entries.
@@ -72,9 +101,16 @@ impl Response {
         }
     }
 
-    // Set multiple headers at once
-    pub fn headers(&mut self, headers: HashMap<String, String>) -> &mut Self {
-        self.headers.extend(headers);
+    // Set multiple headers at once, e.g. from a `HashMap<String, String>`
+    pub fn headers<I, K, V>(&mut self, headers: I) -> &mut Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        for (name, value) in headers {
+            self.header(name, value);
+        }
         self
     }
 
@@ -168,7 +204,7 @@ impl Response {
     pub fn send(&self) {
         println!("HTTP/1.1 {} OK", self.status);
         for (name, value) in &self.headers {
-            println!("{}: {}", name, value);
+            println!("{}: {}", name, String::from_utf8_lossy(value.as_bytes()));
         }
         println!("\r\n{}", self.body_text());
     }

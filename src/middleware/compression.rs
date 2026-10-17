@@ -134,7 +134,7 @@ impl Middleware for CompressionMiddleware {
 
             let mut response = next.handle(req).await?;
 
-            let compressible = crate::http::codec::status_has_body(response.status)
+            let compressible = crate::http::response::status_has_body(response.status)
                 && response.status != 206
                 && response.get_header("content-encoding").is_none()
                 && config.should_compress(response.get_header("content-type"), response.body.len());
@@ -147,17 +147,13 @@ impl Middleware for CompressionMiddleware {
             if let Some(encoding) = encoding {
                 let compressed = compress(encoding, config.level, &response.body)?;
                 if compressed.len() < response.body.len() {
-                    response.body = compressed;
+                    response.body = compressed.into();
                     response.header("Content-Encoding", encoding.name());
                 }
             }
 
             Ok(response)
         })
-    }
-
-    fn clone_box(&self) -> Box<dyn Middleware> {
-        Box::new(Self::new(self.config.clone()))
     }
 }
 

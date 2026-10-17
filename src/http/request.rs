@@ -1,6 +1,8 @@
 use crate::plugins::Plugins;
 use base64::Engine;
 use serde_json::{json, Map, Value};
+use bytes::Bytes;
+use http::HeaderMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
@@ -76,7 +78,7 @@ impl std::fmt::Display for Method {
 #[derive(Debug)]
 pub struct Body {
     pub(crate) content_type: String,
-    pub(crate) data: Vec<u8>,
+    pub(crate) data: Bytes,
 }
 
 #[derive(Debug)]
@@ -90,21 +92,21 @@ impl Body {
     pub fn new() -> Body {
         Body {
             content_type: String::new(),
-            data: Vec::new(),
+            data: Bytes::new(),
         }
     }
 
     pub fn from_string(s: &str) -> Body {
         Body {
             content_type: "text/plain".to_string(),
-            data: s.as_bytes().to_vec(),
+            data: Bytes::copy_from_slice(s.as_bytes()),
         }
     }
 
     pub fn from_bytes(b: Vec<u8>) -> Body {
         Body {
             content_type: "application/octet-stream".to_string(),
-            data: b,
+            data: Bytes::from(b),
         }
     }
 
@@ -113,6 +115,11 @@ impl Body {
     }
 
     pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// The body as `Bytes`; cloning it does not copy the data.
+    pub fn bytes(&self) -> &Bytes {
         &self.data
     }
 
@@ -437,7 +444,8 @@ pub struct Request {
     pub path: String,
     pub query: HashMap<String, String>,
     pub params: HashMap<String, String>,
-    pub headers: HashMap<String, String>,
+    /// Request headers. Names are case-insensitive.
+    pub headers: HeaderMap,
     pub data: HashMap<String, Value>,
     pub body: Body,
     pub plugins: Plugins,
@@ -446,13 +454,10 @@ pub struct Request {
 }
 
 impl Request {
-    /// Looks up a header by name, case-insensitively. Repeated headers are joined with ", ".
+    /// The first value of a header (case-insensitive), if it is valid text.
+    /// Use `headers.get_all(name)` for headers that may repeat.
     pub fn get_header(&self, key: &str) -> Option<&str> {
-        if key.bytes().any(|b| b.is_ascii_uppercase()) {
-            self.headers.get(&key.to_ascii_lowercase()).map(|v| v.as_str())
-        } else {
-            self.headers.get(key).map(|v| v.as_str())
-        }
+        self.headers.get(key)?.to_str().ok()
     }
 
     pub fn get_method(&self) -> &Method {

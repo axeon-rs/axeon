@@ -16,33 +16,18 @@ impl<F: Future<Output = HttpResponse> + Send + 'static> IntoResponse for F {
     }
 }
 
+/// A route handler. Stored behind an `Arc` and shared by every request, so
+/// handlers don't need to be `Clone`.
 pub trait Handler: Send + Sync + 'static {
     fn handle(&self, req: Request) -> BoxFuture<'static, HttpResponse>;
-
-    fn dyn_clone<'s>(&self) -> Box<dyn Handler + 's>
-    where
-        Self: 's;
-}
-
-impl Clone for Box<dyn Handler> {
-    fn clone(&self) -> Box<dyn Handler> {
-        self.dyn_clone()
-    }
 }
 
 impl<F, R> Handler for F
 where
-    F: Fn(Request) -> R + Send + Sync + Clone + 'static,
+    F: Fn(Request) -> R + Send + Sync + 'static,
     R: IntoResponse,
 {
     fn handle(&self, req: Request) -> BoxFuture<'static, HttpResponse> {
         (self)(req).into_response_future()
-    }
-
-    fn dyn_clone<'s>(&self) -> Box<dyn Handler + 's>
-    where
-        Self: 's,
-    {
-        Box::new((*self).clone())
     }
 }

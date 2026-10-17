@@ -94,10 +94,6 @@
 //!             res
 //!         })
 //!     }
-//!     
-//!     fn clone_box(&self) -> Box<dyn Middleware> {
-//!         Box::new(Self)
-//!     }
 //! }
 //! ```
 //!

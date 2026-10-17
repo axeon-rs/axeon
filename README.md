@@ -4,7 +4,8 @@ A modern, flexible, and feature-rich web framework for Rust.
 
 ## Features
 
-- Express-style routing with support for path parameters and query parameters
+- Built on [hyper](https://hyper.rs): HTTP/1.1 and HTTP/2 (ALPN over TLS)
+- Express-style routing with path parameters (`/users/:id`), catch-alls (`/files/*path`) and query parameters, matched by a radix tree
 - Modular router system with mounting capabilities
 - Powerful middleware system for request/response processing
 - Built-in security features and authentication support
@@ -81,7 +82,7 @@ app.post("/users", |req| async move {
 ### Middleware
 
 ```rust
-use axeon::{Server, middleware::{Middleware, Next}};
+use axeon::{Request, Server, middleware::{Middleware, MiddlewareResult, Next}};
 
 struct Logger;
 impl Middleware for Logger {
@@ -92,10 +93,6 @@ impl Middleware for Logger {
             // Process response...
             res
         })
-    }
-
-    fn clone_box(&self) -> Box<dyn Middleware> {
-        Box::new(Self)
     }
 }
 

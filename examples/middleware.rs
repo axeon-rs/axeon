@@ -28,10 +28,6 @@ impl Middleware for Logger {
             res
         })
     }
-
-    fn clone_box(&self) -> Box<dyn Middleware> {
-        Box::new(Self)
-    }
 }
 
 // Simple auth middleware
@@ -46,11 +42,6 @@ impl Middleware for AuthMiddleware {
                 _ => Err(ServerError::Unauthorized("Authentication required".to_string())),
             }
         })
-    }
-
-
-    fn clone_box(&self) -> Box<dyn Middleware> {
-        Box::new(Self)
     }
 }
 
