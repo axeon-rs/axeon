@@ -437,6 +437,14 @@ cargo run --example production  # logging, security middleware, graceful shutdow
 - [API documentation](https://docs.rs/axeon)
 - [Changelog and migration guide](CHANGELOG.md)
 
+## Contributing
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for how to
+build, test and submit changes, and [open an issue](https://github.com/axeon-rs/axeon/issues/new/choose)
+for bugs and ideas. Please report security problems privately as described in
+[SECURITY.md](SECURITY.md). Everyone taking part is expected to follow the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the [MIT License](LICENSE).

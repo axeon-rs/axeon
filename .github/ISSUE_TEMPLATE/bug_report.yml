@@ -1,0 +1,57 @@
+name: Bug report
+description: Something in Axeon doesn't work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! For **security problems**, please don't use this form;
+        follow the [security policy](https://github.com/axeon-rs/axeon/blob/master/SECURITY.md) instead.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: The smallest program (and request, e.g. a `curl` command) that shows the problem.
+      render: rust
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Axeon version
+      placeholder: "0.4.0"
+    validations:
+      required: true
+  - type: input
+    id: features
+    attributes:
+      label: Cargo features
+      description: Default features, or the list you enabled with `default-features = false`.
+      placeholder: "default"
+  - type: input
+    id: rust
+    attributes:
+      label: Rust version and OS
+      description: Output of `rustc --version`, and your operating system.
+      placeholder: "rustc 1.90.0, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error output
+      description: Panics, error messages, or `tracing` output if relevant.
+      render: text
