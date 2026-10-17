@@ -120,6 +120,7 @@
 pub extern crate serde_json;
 pub(crate) mod app;
 pub mod buffer;
+#[cfg(feature = "cache")]
 pub mod cache;
 pub mod database;
 pub(crate) mod error;
@@ -131,8 +132,10 @@ pub mod sse;
 pub mod ws;
 pub(crate) mod plugins;
 pub(crate) mod router;
+#[cfg(feature = "tls")]
+mod tls;
 
-pub use app::Server;
+pub use app::{shutdown_signal, App, Server};
 pub use router::Router;
 
 pub use crate::error::{ServerError, ServerResult};

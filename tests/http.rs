@@ -1,15 +1,20 @@
 //! End-to-end tests over a real TCP socket, using raw HTTP/1.1 so the wire
 //! format itself is checked.
 
-use axeon::middleware::{CompressionConfig, CompressionMiddleware, Cors, CorsConfig, RateLimitConfig, RateLimiter};
+#[cfg(feature = "compression")]
+use axeon::middleware::{CompressionConfig, CompressionMiddleware};
+use axeon::middleware::{Cors, CorsConfig, RateLimitConfig, RateLimiter};
 use axeon::{Response, Server, ServerError};
 mod common;
 
 use common::{start, Client, Resp, TempDir};
+#[cfg(feature = "compression")]
 use std::io::Read;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
+#[cfg(feature = "tls")]
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
@@ -304,6 +309,7 @@ async fn static_files_are_binary_safe_and_contained() {
     assert_eq!(c.read().await.unwrap().status, 404);
 }
 
+#[cfg(feature = "compression")]
 fn compressed_app() -> Server {
     let mut app = Server::new();
     app.middleware(CompressionMiddleware::new(CompressionConfig::default()));
@@ -312,6 +318,7 @@ fn compressed_app() -> Server {
     app
 }
 
+#[cfg(feature = "compression")]
 #[tokio::test]
 async fn compression_uses_request_accept_encoding() {
     let addr = start(compressed_app()).await;
@@ -640,6 +647,7 @@ async fn repeated_response_headers_are_kept() {
     assert!(text.contains("set-cookie: a=1") && text.contains("set-cookie: b=2"), "{}", text);
 }
 
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn tls_negotiates_http2_and_http11() {
     let dir = TempDir::new("tls");

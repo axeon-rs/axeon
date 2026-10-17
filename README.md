@@ -195,6 +195,91 @@ app.get("/ws", |mut req| async move {
 `Response::stream(content_type, stream)` sends any `Stream` of chunks without
 buffering it. WebSockets need the default `ws` feature.
 
+## Running in Production
+
+### Graceful Shutdown
+
+`listen()` shuts down gracefully on Ctrl+C or SIGTERM: it stops accepting
+connections, lets in-flight requests finish (up to `shutdown_timeout`, default
+30s) and closes idle keep-alive connections. Inside your own runtime, use
+`serve_with_shutdown` with any future as the signal:
+
+```rust,no_run
+use axeon::{Server, shutdown_signal};
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() {
+    let mut app = Server::new();
+    app.shutdown_timeout(Duration::from_secs(20));
+    app.get("/", |_req| async { "Hello" });
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    app.serve_with_shutdown(listener, shutdown_signal()).await.unwrap();
+}
+```
+
+### Logging
+
+Axeon logs through [`tracing`](https://docs.rs/tracing). Install a subscriber
+to see the logs, and add `SetRequestId` and `RequestLogger` for one line per
+request tagged with its ID:
+
+```rust
+use axeon::Server;
+use axeon::middleware::{RequestLogger, SetRequestId};
+
+// Needs the `tracing-subscriber` crate in your app; `.json()` for JSON logs.
+tracing_subscriber::fmt().init();
+
+let mut app = Server::new();
+app.middleware(SetRequestId::new());   // X-Request-Id in and out
+app.middleware(RequestLogger::new());  // method, path, status, latency
+app.get("/", |_req| async {
+    tracing::info!("this line carries the request ID");
+    "Hello"
+});
+```
+
+### Testing Without a Socket
+
+`Server::into_app()` builds an `App` that handles requests in-process:
+
+```rust
+use axeon::{Method, Request, Server};
+
+# tokio::runtime::Runtime::new().unwrap().block_on(async {
+let mut app = Server::new();
+app.get("/hello/:name", |req| async move { format!("Hello, {}!", req.params["name"]) });
+let app = app.into_app().await.unwrap();
+
+let res = app.call(Request::new(Method::GET, "/hello/Ada")).await;
+assert_eq!(res.body_text(), "Hello, Ada!");
+# });
+```
+
+### Cargo Features
+
+All features are on by default. To trim dependencies and build time, turn off
+the defaults and pick what you need:
+
+```toml
+axeon = { version = "0.3", default-features = false, features = ["tls"] }
+```
+
+| Feature | Enables |
+|---|---|
+| `tls` | HTTPS with rustls (`Server::with_tls`), HTTP/2 over ALPN |
+| `compression` | gzip/deflate `CompressionMiddleware` |
+| `ws` | WebSockets (`Request::upgrade_websocket`) |
+| `cache` | `axeon::cache` helpers backed by moka |
+
+### Benchmarks
+
+`cargo bench` runs in-process benchmarks of routing, middleware and JSON
+responses (criterion). On an Apple Silicon laptop a dynamic route costs about
+0.55 µs whether the app has 10 or 1000 routes, and each middleware layer adds
+about 55 ns.
+
 ## Documentation
 
 For detailed documentation and more examples, check out:

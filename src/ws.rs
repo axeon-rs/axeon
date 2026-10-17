@@ -88,7 +88,7 @@ impl Request {
                     let socket = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
                     on_connect(socket).await;
                 }
-                Err(e) => eprintln!("WebSocket upgrade failed: {}", e),
+                Err(e) => tracing::warn!(error = %e, "WebSocket upgrade failed"),
             }
         });
 

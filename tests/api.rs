@@ -3,7 +3,9 @@
 
 mod common;
 
-use axeon::middleware::{from_fn, CompressionConfig, CompressionMiddleware};
+use axeon::middleware::from_fn;
+#[cfg(feature = "compression")]
+use axeon::middleware::{CompressionConfig, CompressionMiddleware};
 use axeon::sse::{self, Event};
 use axeon::{json, Html, Json, Response, Server, ServerError};
 use common::{start, Client};
@@ -151,6 +153,7 @@ async fn typed_request_helpers() {
 #[tokio::test]
 async fn streamed_responses_are_sent_incrementally() {
     let mut app = Server::new();
+    #[cfg(feature = "compression")]
     app.middleware(CompressionMiddleware::new(CompressionConfig { min_size: 0, ..CompressionConfig::default() }));
     app.get("/stream", |_req| async {
         let chunks = stream::unfold(0, |n| async move {

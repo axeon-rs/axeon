@@ -20,6 +20,7 @@
 use crate::error::ServerError;
 use crate::handler::{HttpResponse, IntoResponse};
 use crate::http::response::status_has_body;
+use crate::http::request::parse_query;
 use crate::http::{Body, Method, Request};
 use crate::http::Response;
 use crate::middleware::{Chain, Middleware};
@@ -48,13 +49,12 @@ use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
+use tracing::{debug, error, info, warn};
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
-use rustls::ServerConfig;
-use tokio_rustls::TlsAcceptor;
-use std::fs::File;
-use std::io::BufReader as StdBufReader;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+#[cfg(feature = "tls")]
+use crate::tls::TlsConfig;
 
 type ErrorHandler = Arc<dyn Fn(ServerError) -> Response + Send + Sync>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -64,46 +64,6 @@ type HyperResponse = hyper::Response<UnsyncBoxBody<Bytes, BoxError>>;
 /// smallest header limit we can enforce.
 const MIN_HEADER_LIMIT: usize = 8 * 1024;
 
-/// TLS configuration for HTTPS support
-pub struct TlsConfig {
-    cert_file: PathBuf,
-    key_file: PathBuf,
-}
-
-impl TlsConfig {
-    pub fn new<P: AsRef<Path>>(cert_file: P, key_file: P) -> Self {
-        Self {
-            cert_file: cert_file.as_ref().to_path_buf(),
-            key_file: key_file.as_ref().to_path_buf(),
-        }
-    }
-
-    fn load_certs(&self) -> Result<Vec<CertificateDer<'static>>, BoxError> {
-        let cert_file = File::open(&self.cert_file)?;
-        let mut reader = StdBufReader::new(cert_file);
-        let certs = rustls_pemfile::certs(&mut reader)
-            .filter_map(|result| result.ok())
-            .collect();
-        Ok(certs)
-    }
-
-    fn load_key(&self) -> Result<PrivateKeyDer<'static>, BoxError> {
-        let key_file = File::open(&self.key_file)?;
-        let mut reader = StdBufReader::new(key_file);
-        let key = rustls_pemfile::private_key(&mut reader)?
-            .ok_or("No private key found")?;
-        Ok(key)
-    }
-
-    fn acceptor(&self) -> Result<TlsAcceptor, BoxError> {
-        let mut config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(self.load_certs()?, self.load_key()?)?;
-        // Offer HTTP/2, falling back to HTTP/1.1.
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        Ok(TlsAcceptor::from(Arc::new(config)))
-    }
-}
 
 /// Size limits applied while reading a request.
 #[derive(Clone, Copy, Debug)]
@@ -145,11 +105,13 @@ pub struct Server {
     /// How long an idle keep-alive connection waits for the next request.
     pub keep_alive: Duration,
     request_timeout: Duration,
+    shutdown_timeout: Duration,
     limits: Limits,
     router: Router,
     static_dir: Option<PathBuf>,
     plugins: Plugins,
     on_error: Option<ErrorHandler>,
+    #[cfg(feature = "tls")]
     tls_config: Option<Arc<TlsConfig>>,
 }
 
@@ -166,6 +128,7 @@ impl Server {
             max_connections: 1024,
             keep_alive: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(30),
             limits: Limits {
                 max_header_size: 16 * 1024,
                 max_headers: 100,
@@ -175,6 +138,7 @@ impl Server {
             static_dir: None,
             plugins: Plugins::new(),
             on_error: None,
+            #[cfg(feature = "tls")]
             tls_config: None,
         }
     }
@@ -196,6 +160,13 @@ impl Server {
     /// request body, and to complete a TLS handshake. Default: 30 seconds.
     pub fn request_timeout(&mut self, request_timeout: Duration) -> &mut Self {
         self.request_timeout = request_timeout;
+        self
+    }
+
+    /// How long a graceful shutdown waits for in-flight requests before
+    /// closing the remaining connections. Default: 30 seconds.
+    pub fn shutdown_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.shutdown_timeout = timeout;
         self
     }
 
@@ -377,7 +348,9 @@ impl Server {
         self.router.mount(path, router);
     }
 
-    /// Configure TLS for HTTPS support
+    /// Serve HTTPS with a PEM certificate chain and private key. HTTP/2 and
+    /// HTTP/1.1 are negotiated with ALPN. Requires the `tls` feature.
+    #[cfg(feature = "tls")]
     pub fn with_tls<P: AsRef<Path>>(&mut self, cert_file: P, key_file: P) -> &mut Self {
         self.tls_config = Some(Arc::new(TlsConfig::new(cert_file, key_file)));
         self
@@ -401,7 +374,9 @@ impl Server {
         self
     }
 
-    /// Starts the HTTP server on its own Tokio runtime and blocks forever.
+    /// Starts the HTTP server on its own Tokio runtime and blocks until
+    /// Ctrl+C or SIGTERM, then shuts down gracefully (see
+    /// [`Server::serve_with_shutdown`]).
     ///
     /// Use [`Server::serve`] instead when you already run inside a Tokio runtime.
     ///
@@ -411,12 +386,14 @@ impl Server {
         let runtime = Runtime::new()?;
         runtime.block_on(async {
             let listener = TcpListener::bind(addr).await?;
-            println!("Server running on {}", if self.tls_config.is_some() {
-                format!("https://{}", addr)
-            } else {
-                format!("http://{}", addr)
-            });
-            self.serve(listener).await.map_err(|e| -> Box<dyn std::error::Error> { e })
+            #[cfg(feature = "tls")]
+            let scheme = if self.tls_config.is_some() { "https" } else { "http" };
+            #[cfg(not(feature = "tls"))]
+            let scheme = "http";
+            println!("Server running on {}://{}", scheme, addr);
+            self.serve_with_shutdown(listener, shutdown_signal())
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { e })
         })
     }
 
@@ -437,48 +414,151 @@ impl Server {
     /// }
     /// ```
     pub async fn serve(self, listener: TcpListener) -> Result<(), BoxError> {
+        self.serve_with_shutdown(listener, std::future::pending()).await
+    }
+
+    /// Like [`Server::serve`], but shuts down gracefully when `signal`
+    /// completes: it stops accepting connections, lets in-flight requests
+    /// finish and closes idle connections, then returns. Connections still
+    /// busy after `shutdown_timeout` are closed.
+    ///
+    /// ```rust,no_run
+    /// use axeon::{Server, shutdown_signal};
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let mut app = Server::new();
+    ///     app.get("/", |_req| async { "Hello" });
+    ///     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    ///     // Ctrl+C or SIGTERM (e.g. from Kubernetes or systemd)
+    ///     app.serve_with_shutdown(listener, shutdown_signal()).await.unwrap();
+    /// }
+    /// ```
+    pub async fn serve_with_shutdown<F>(self, listener: TcpListener, signal: F) -> Result<(), BoxError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        #[cfg(feature = "tls")]
         let tls_acceptor = match &self.tls_config {
             Some(tls_config) => Some(tls_config.acceptor()?),
             None => None,
         };
         let max_connections = self.max_connections.max(1);
+        let shutdown_timeout = self.shutdown_timeout;
         let app = Arc::new(App::build(self).await?);
         // A permit is taken before each accept, so at the limit we simply stop
         // accepting (no busy loop) and resume when a connection finishes.
         let slots = Arc::new(Semaphore::new(max_connections));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut connections = JoinSet::new();
+        tokio::pin!(signal);
+        if let Ok(addr) = listener.local_addr() {
+            info!(%addr, "listening");
+        }
 
         loop {
-            let permit = Arc::clone(&slots).acquire_owned().await?;
-            let (stream, peer) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    // e.g. EMFILE: back off instead of spinning.
-                    eprintln!("Accept failed: {}", e);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
+            // Reap finished connection tasks.
+            while connections.try_join_next().is_some() {}
+
+            let permit = tokio::select! {
+                biased;
+                _ = &mut signal => break,
+                permit = Arc::clone(&slots).acquire_owned() => permit?,
+            };
+            let (stream, peer) = tokio::select! {
+                biased;
+                _ = &mut signal => break,
+                accepted = listener.accept() => match accepted {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        // e.g. EMFILE: back off instead of spinning.
+                        error!(error = %e, "accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                },
             };
             let _ = stream.set_nodelay(true);
             let app = Arc::clone(&app);
+            #[cfg(feature = "tls")]
             let acceptor = tls_acceptor.clone();
+            let shutdown = shutdown_rx.clone();
 
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 let _permit = permit;
-                match acceptor {
-                    Some(acceptor) => match timeout(app.request_timeout, acceptor.accept(stream)).await {
-                        Ok(Ok(tls_stream)) => app.serve_connection(tls_stream, peer).await,
-                        Ok(Err(e)) => eprintln!("TLS handshake failed: {}", e),
-                        Err(_) => {}
-                    },
-                    None => app.serve_connection(stream, peer).await,
+                #[cfg(feature = "tls")]
+                if let Some(acceptor) = acceptor {
+                    match timeout(app.request_timeout, acceptor.accept(stream)).await {
+                        Ok(Ok(tls_stream)) => app.serve_connection(tls_stream, peer, shutdown).await,
+                        Ok(Err(e)) => debug!(%peer, error = %e, "TLS handshake failed"),
+                        Err(_) => debug!(%peer, "TLS handshake timed out"),
+                    }
+                    return;
                 }
+                app.serve_connection(stream, peer, shutdown).await;
             });
         }
+
+        drop(listener);
+        info!(open_connections = connections.len(), "shutting down");
+        let _ = shutdown_tx.send(true);
+        let drained = timeout(shutdown_timeout, async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            warn!(remaining = connections.len(), "shutdown timeout elapsed; closing remaining connections");
+            connections.shutdown().await;
+        }
+        info!("shutdown complete");
+        Ok(())
     }
 }
 
-/// Immutable state shared by every connection once the server starts.
-struct App {
+/// Completes on Ctrl+C, or SIGTERM on Unix. Pass it to
+/// [`Server::serve_with_shutdown`].
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
+/// A built server that handles requests in-process, without a socket:
+/// for tests of your routes and middleware, and for benchmarks.
+///
+/// Routing, middleware, error handlers and static files work as when
+/// serving; network-level behaviour (body size limits, timeouts, HEAD body
+/// stripping) does not apply.
+///
+/// ```rust
+/// use axeon::{Method, Request, Server};
+///
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let mut app = Server::new();
+/// app.get("/users/:id", |req| async move { format!("user {}", req.params["id"]) });
+/// let app = app.into_app().await.unwrap();
+///
+/// let response = app.call(Request::new(Method::GET, "/users/7")).await;
+/// assert_eq!(response.status, 200);
+/// assert_eq!(response.body_text(), "user 7");
+/// # });
+/// ```
+pub struct App {
     router: CompiledRouter,
     static_root: Option<PathBuf>,
     plugins: Plugins,
@@ -489,7 +569,22 @@ struct App {
     http: auto::Builder<TokioExecutor>,
 }
 
+impl Server {
+    /// Builds the server into an [`App`] for in-process requests. Fails if
+    /// routes conflict, like [`Server::serve`].
+    pub async fn into_app(self) -> Result<App, BoxError> {
+        App::build(self).await
+    }
+}
+
 impl App {
+    /// Handles one request through routing and middleware and returns the
+    /// response, with errors already converted by the error handler.
+    pub async fn call(&self, mut request: Request) -> Response {
+        request.plugins = self.plugins.clone();
+        self.dispatch(request).await
+    }
+
     async fn build(server: Server) -> Result<Self, BoxError> {
         let router = server.router.compile()?;
 
@@ -498,7 +593,7 @@ impl App {
             Some(dir) => match tokio::fs::canonicalize(&dir).await {
                 Ok(root) => Some(root),
                 Err(e) => {
-                    eprintln!("Static directory {:?} is unavailable: {}", dir, e);
+                    warn!(dir = %dir.display(), error = %e, "static directory is unavailable");
                     None
                 }
             },
@@ -531,8 +626,8 @@ impl App {
     }
 
     /// Serves HTTP/1.1 or HTTP/2 on one connection, closing it once it has
-    /// been idle for `keep_alive`.
-    async fn serve_connection<S>(self: Arc<Self>, stream: S, peer: SocketAddr)
+    /// been idle for `keep_alive`, or when the server shuts down.
+    async fn serve_connection<S>(self: Arc<Self>, stream: S, peer: SocketAddr, mut shutdown: watch::Receiver<bool>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -560,11 +655,18 @@ impl App {
             tokio::select! {
                 result = conn.as_mut() => {
                     if let Err(e) = result {
-                        if !is_disconnect(e.as_ref()) {
-                            eprintln!("Connection error: {}", e);
+                        if is_disconnect(e.as_ref()) {
+                            debug!(%peer, error = %e, "connection closed");
+                        } else {
+                            warn!(%peer, error = %e, "connection error");
                         }
                     }
                     return;
+                }
+                // Also fires if the server is gone (sender dropped).
+                _ = shutdown.wait_for(|stop| *stop), if !closing => {
+                    conn.as_mut().graceful_shutdown();
+                    closing = true;
                 }
                 _ = sleep_until(idle_deadline), if !closing => {
                     if activity.idle_for(self.keep_alive) {
@@ -676,7 +778,7 @@ impl App {
                 } else {
                     "Unknown panic".to_string()
                 };
-                eprintln!("Handler panicked: {}", panic_msg);
+                error!(panic = %panic_msg, "handler panicked");
                 Err(ServerError::PanicError(panic_msg))
             },
         };
@@ -877,24 +979,6 @@ async fn serve_file(path: &Path, metadata: &std::fs::Metadata) -> Option<Respons
     Some(response)
 }
 
-/// Parses a query string, percent-decoding keys and values ('+' is a space).
-fn parse_query(query: &str) -> HashMap<String, String> {
-    fn decode(s: &str) -> String {
-        let s = s.replace('+', " ");
-        match urlencoding::decode(&s) {
-            Ok(decoded) => decoded.into_owned(),
-            Err(_) => s,
-        }
-    }
-    query
-        .split('&')
-        .filter(|s| !s.is_empty())
-        .map(|pair| match pair.split_once('=') {
-            Some((key, value)) => (decode(key), decode(value)),
-            None => (decode(pair), String::new()),
-        })
-        .collect()
-}
 
 /// Connection errors that just mean the client went away or timed out.
 fn is_disconnect(e: &(dyn std::error::Error + 'static)) -> bool {

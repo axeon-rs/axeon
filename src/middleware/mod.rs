@@ -1,9 +1,13 @@
 mod security;
+#[cfg(feature = "compression")]
 mod compression;
+mod observe;
 
 use crate::http::Request;
 pub use security::{RateLimitConfig, RateLimiter, SecurityConfig, SecurityHeaders, CorsConfig, Cors};
+#[cfg(feature = "compression")]
 pub use compression::{CompressionConfig, CompressionMiddleware};
+pub use observe::{RequestId, RequestLogger, SetRequestId};
 
 use crate::handler::{Handler, HttpResponse, IntoResponse};
 use futures::future::BoxFuture;

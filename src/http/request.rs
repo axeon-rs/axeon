@@ -459,6 +459,48 @@ pub struct Request {
 }
 
 impl Request {
+    /// A request for in-process use with [`App::call`](crate::App::call),
+    /// e.g. `Request::new(Method::GET, "/search?q=rust")`.
+    pub fn new(method: Method, uri: &str) -> Request {
+        let (path, query) = match uri.split_once('?') {
+            Some((path, query)) => (path, parse_query(query)),
+            None => (uri, HashMap::new()),
+        };
+        let path = path.trim_end_matches('/');
+        Request {
+            method,
+            path: if path.is_empty() { "/".to_string() } else { path.to_string() },
+            query,
+            params: HashMap::new(),
+            headers: HeaderMap::new(),
+            data: HashMap::new(),
+            body: Body { content_type: "none".to_string(), data: Bytes::new() },
+            plugins: Plugins::default(),
+            remote_addr: None,
+            extensions: Extensions::new(),
+        }
+    }
+
+    /// Adds a header. Panics if the name or value is invalid.
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        let name = http::HeaderName::from_bytes(name.as_bytes()).expect("invalid header name");
+        let value = http::HeaderValue::from_str(value).expect("invalid header value");
+        self.headers.append(name, value);
+        self
+    }
+
+    /// Sets the body and its `Content-Type`.
+    pub fn with_body(mut self, content_type: &str, body: impl Into<Bytes>) -> Self {
+        self.body = Body { content_type: content_type.to_string(), data: body.into() };
+        self.with_header("content-type", content_type)
+    }
+
+    /// Sets a JSON body.
+    pub fn with_json<T: serde::Serialize>(self, value: &T) -> Self {
+        let json = serde_json::to_vec(value).expect("value serializes to JSON");
+        self.with_body("application/json", json)
+    }
+
     /// A path parameter parsed into `T`, e.g. `req.param::<u64>("id")` for `/users/:id`.
     /// Fails with 400 Bad Request if it is missing or doesn't parse.
     pub fn param<T: FromStr>(&self, name: &str) -> ServerResult<T> {
@@ -556,6 +598,25 @@ impl Request {
             serde_json::from_value(value.to_owned()).ok()
         })
     }
+}
+
+/// Parses a query string, percent-decoding keys and values ('+' is a space).
+pub(crate) fn parse_query(query: &str) -> HashMap<String, String> {
+    fn decode(s: &str) -> String {
+        let s = s.replace('+', " ");
+        match urlencoding::decode(&s) {
+            Ok(decoded) => decoded.into_owned(),
+            Err(_) => s,
+        }
+    }
+    query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((key, value)) => (decode(key), decode(value)),
+            None => (decode(pair), String::new()),
+        })
+        .collect()
 }
 
 pub enum ParseError {

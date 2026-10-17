@@ -40,7 +40,7 @@ fn parse_header(name: &str, value: &str) -> Option<(HeaderName, HeaderValue)> {
         (Ok(name), Ok(value)) => Some((name, value)),
         _ => {
             // Invalid names, or values containing CR/LF, would corrupt the response.
-            eprintln!("Ignoring invalid response header {:?}", name);
+            tracing::warn!(header = %name, "ignoring invalid response header");
             None
         }
     }
