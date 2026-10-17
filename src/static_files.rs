@@ -1,7 +1,7 @@
 //! Static file serving: streamed from disk, with range requests and
 //! conditional (304) responses.
 
-use crate::http::{Request, Response};
+use crate::message::{Request, Response};
 use bytes::Bytes;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -10,13 +10,15 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 /// Ranges up to this size are read into memory (and can be compressed by
-/// `CompressionMiddleware`); larger ones are streamed from disk.
+/// `Compression` middleware); larger ones are streamed from disk.
 const BUFFER_LIMIT: u64 = 256 * 1024;
 const STREAM_CHUNK: usize = 64 * 1024;
 
 pub(crate) struct StaticFiles {
     root: PathBuf,
     cache_control: String,
+    /// Served for unmatched page navigations (single-page apps).
+    fallback: Option<PathBuf>,
 }
 
 /// The outcome of a `Range` header.
@@ -106,8 +108,29 @@ fn content_type(path: &Path) -> &'static str {
 }
 
 impl StaticFiles {
-    pub(crate) fn new(root: PathBuf, cache_control: String) -> Self {
-        Self { root, cache_control }
+    pub(crate) fn new(root: PathBuf, cache_control: String, fallback: Option<PathBuf>) -> Self {
+        Self { root, cache_control, fallback }
+    }
+
+    /// The single-page-app fallback for a browser navigation to a client
+    /// route: a GET/HEAD that accepts HTML, for a path without a file
+    /// extension. Asset and API requests still get 404.
+    pub(crate) async fn fallback(&self, req: &Request) -> Option<Response> {
+        let fallback = self.fallback.as_ref()?;
+        let accepts_html = req.get_header("accept").is_some_and(|accept| accept.contains("text/html"));
+        let last_segment = req.path.rsplit('/').next().unwrap_or("");
+        if !accepts_html || last_segment.contains('.') {
+            return None;
+        }
+        let path = tokio::fs::canonicalize(self.root.join(fallback)).await.ok()?;
+        if !path.starts_with(&self.root) {
+            return None;
+        }
+        let metadata = tokio::fs::metadata(&path).await.ok()?;
+        let mut response = self.serve_path(&path, &metadata, req).await?;
+        // The app shell must be revalidated so deploys take effect.
+        response.header("Cache-Control", "no-cache");
+        Some(response)
     }
 
     /// Serves the file for a GET or HEAD request, or `None` if there is no
@@ -122,15 +145,25 @@ impl StaticFiles {
         if hidden {
             return None;
         }
-        let path = tokio::fs::canonicalize(self.root.join(decoded.as_ref())).await.ok()?;
+        let mut path = tokio::fs::canonicalize(self.root.join(decoded.as_ref())).await.ok()?;
         if !path.starts_with(&self.root) {
             return None;
         }
-        let metadata = tokio::fs::metadata(&path).await.ok()?;
+        let mut metadata = tokio::fs::metadata(&path).await.ok()?;
+        if metadata.is_dir() {
+            // A directory serves its index.html.
+            path = path.join("index.html");
+            metadata = tokio::fs::metadata(&path).await.ok()?;
+        }
         if !metadata.is_file() {
             return None;
         }
+        self.serve_path(&path, &metadata, req).await
+    }
 
+    /// Serves one file, with conditional and range request handling.
+    async fn serve_path(&self, path: &Path, metadata: &std::fs::Metadata, req: &Request) -> Option<Response> {
+        let path = path.to_path_buf();
         let len = metadata.len();
         let modified = metadata.modified().ok();
         let modified_secs = modified.and_then(|m| m.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs());
@@ -236,5 +269,28 @@ mod tests {
         assert!(etag_matches("\"x\", \"a-1\"", "\"a-1\""));
         assert!(etag_matches("*", "\"a-1\""));
         assert!(!etag_matches("\"a-2\"", "\"a-1\""));
+    }
+
+    mod properties {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(5000))]
+
+            /// Any accepted range lies within the file.
+            #[test]
+            fn ranges_stay_in_bounds(header in r"(?i)(bytes|items)? ?= ?[0-9+-]{0,12}(,[0-9-]{0,6})?", len in 0u64..10_000) {
+                if let ByteRange::Partial(start, end) = parse_range(&header, len) {
+                    prop_assert!(start <= end && end < len, "{} for len {} gave {}-{}", header, len, start, end);
+                }
+            }
+
+            #[test]
+            fn arbitrary_headers_never_panic(header in ".{0,64}", len in any::<u64>()) {
+                let _ = parse_range(&header, len);
+                let _ = etag_matches(&header, "\"a-1\"");
+            }
+        }
     }
 }

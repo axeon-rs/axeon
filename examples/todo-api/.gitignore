@@ -1,0 +1,3 @@
+target/
+todos.db*
+.env

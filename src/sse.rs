@@ -25,7 +25,7 @@
 //!
 //! Or turn any `Stream` of events into a response with [`Response::sse`].
 
-use crate::http::Response;
+use crate::message::Response;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use std::convert::Infallible;
@@ -52,6 +52,7 @@ fn single_line(value: &str) -> String {
 }
 
 impl Event {
+    /// An empty event; add fields with the builder methods.
     pub fn new() -> Self {
         Self::default()
     }

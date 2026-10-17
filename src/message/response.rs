@@ -9,7 +9,13 @@ use std::pin::Pin;
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) type BodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>;
 
+/// An HTTP response: status, headers and body (bytes or a stream).
+/// 
+/// Build one with a constructor (`Response::text`, `json`, `html`, ...)
+/// and the `with_*` builders, or return any [`IntoResponse`](crate::IntoResponse)
+/// value from a handler.
 pub struct Response {
+    /// The status code, e.g. 200.
     pub status: u16,
     /// Raw body bytes. Binary content (images, compressed data) is sent unchanged.
     /// Cloning `Bytes` is cheap (reference counted). Ignored for streamed responses.
@@ -51,6 +57,7 @@ fn parse_header(name: &str, value: &str) -> Option<(HeaderName, HeaderValue)> {
 }
 
 impl Response {
+    /// An empty response with this status.
     pub fn new(status: u16) -> Response {
         Response {
             status,
@@ -111,13 +118,121 @@ impl Response {
     }
 
 
-    // Chainable status setter
+    // ---- Constructors ----
+
+    /// A 200 `text/plain` response.
+    pub fn text(content: impl Into<String>) -> Response {
+        Response::new(200)
+            .with_header("Content-Type", "text/plain; charset=utf-8")
+            .with_body(content.into())
+    }
+
+    /// A 200 `text/html` response.
+    pub fn html(content: impl Into<String>) -> Response {
+        Response::new(200)
+            .with_header("Content-Type", "text/html; charset=utf-8")
+            .with_body(content.into())
+    }
+
+    /// A 200 `application/json` response. If `value` can't be serialized
+    /// (rare: e.g. a map with non-string keys) the error is logged and a 500
+    /// is returned. Handlers can also return [`Json`](crate::Json).
+    pub fn json<T: Serialize + ?Sized>(value: &T) -> Response {
+        match serde_json::to_vec(value) {
+            Ok(json) => Response::new(200).with_header("Content-Type", "application/json").with_body(json),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to serialize JSON response");
+                Response::error(ServerError::InternalError("failed to serialize response".to_string()))
+            }
+        }
+    }
+
+    /// A 200 response with raw bytes, e.g. an image or a generated file.
+    pub fn binary(content_type: &str, data: impl Into<Bytes>) -> Response {
+        Response::new(200).with_header("Content-Type", content_type).with_body(data)
+    }
+
+    /// An empty 204 No Content response.
+    pub fn no_content() -> Response {
+        Response::new(204)
+    }
+
+    /// A 302 Found redirect.
+    pub fn redirect(location: &str) -> Response {
+        Response::redirect_with_status(302, location)
+    }
+
+    /// A 301 Moved Permanently redirect.
+    pub fn permanent_redirect(location: &str) -> Response {
+        Response::redirect_with_status(301, location)
+    }
+
+    /// A redirect with a specific status: 303 See Other after a form POST,
+    /// or 307/308 to keep the request method.
+    pub fn redirect_with_status(status: u16, location: &str) -> Response {
+        Response::new(status).with_header("Location", location)
+    }
+
+    /// The response for an error: its status and a JSON body
+    /// `{"error": {"message": ..., "status": ...}}`. Internal details of IO
+    /// errors and panics are not included. Used when no
+    /// [`on_error`](crate::Server::on_error) handler is set.
+    pub fn error(error: ServerError) -> Response {
+        let status = error.status_code();
+        let body = match &error {
+            ServerError::Invalid(fields) => serde_json::json!({
+                "error": { "message": "Validation failed", "status": status, "fields": fields }
+            }),
+            _ => serde_json::json!({
+                "error": { "message": error.public_message(), "status": status }
+            }),
+        };
+        let mut response = Response::new(status)
+            .with_header("Content-Type", "application/json")
+            .with_body(body.to_string());
+        match &error {
+            ServerError::MethodNotAllowed(allow) => {
+                response.header("Allow", allow);
+            }
+            ServerError::TooManyRequests { retry_after: Some(wait) } => {
+                // Whole seconds, rounded up so clients don't retry too early.
+                let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+                response.header("Retry-After", secs.max(1).to_string());
+            }
+            _ => {}
+        }
+        response
+    }
+
+    // ---- Builders (by value, for one-expression responses) ----
+
+    /// Sets the status: `Response::text("made").with_status(201)`.
+    pub fn with_status(mut self, status: u16) -> Self {
+        self.status = status;
+        self
+    }
+
+    /// Sets a header, replacing existing values.
+    pub fn with_header(mut self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        self.header(name, value);
+        self
+    }
+
+    /// Sets the body.
+    pub fn with_body(mut self, body: impl Into<Bytes>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    // ---- Setters (by reference, for building step by step) ----
+
+    /// Sets the status.
     pub fn status(&mut self, status: u16) -> &mut Self {
         self.status = status;
         self
     }
 
-    // Generic body setter: accepts `String`, `&str`, `Vec<u8>`, `&[u8]`, ...
+    /// Sets the body: accepts `String`, `&str`, `Vec<u8>`, `&[u8]`, ...
     pub fn body<T: Into<Vec<u8>>>(&mut self, body: T) -> &mut Self {
         self.body = Bytes::from(body.into());
         self
@@ -135,7 +250,7 @@ impl Response {
     }
 
     /// Sets a header, replacing any existing values (names are case-insensitive).
-    /// Invalid names or values (e.g. containing CR/LF) are ignored.
+    /// Invalid names or values (e.g. containing CR/LF) are ignored and logged.
     pub fn header<K: AsRef<str>, V: AsRef<str>>(&mut self, name: K, value: V) -> &mut Self {
         if let Some((name, value)) = parse_header(name.as_ref(), value.as_ref()) {
             self.headers.insert(name, value);
@@ -147,6 +262,19 @@ impl Response {
     pub fn append_header<K: AsRef<str>, V: AsRef<str>>(&mut self, name: K, value: V) -> &mut Self {
         if let Some((name, value)) = parse_header(name.as_ref(), value.as_ref()) {
             self.headers.append(name, value);
+        }
+        self
+    }
+
+    /// Sets several headers, e.g. from a `HashMap<String, String>`.
+    pub fn headers<I, K, V>(&mut self, headers: I) -> &mut Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        for (name, value) in headers {
+            self.header(name, value);
         }
         self
     }
@@ -174,249 +302,32 @@ impl Response {
         }
     }
 
-    // Set multiple headers at once, e.g. from a `HashMap<String, String>`
-    pub fn headers<I, K, V>(&mut self, headers: I) -> &mut Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        for (name, value) in headers {
-            self.header(name, value);
-        }
-        self
-    }
-
-    // Enhanced JSON response handling
-    pub(crate) fn json<T: Serialize>(&mut self, value: &T) -> Result<&mut Self, ServerError> {
-        let json_string = serde_json::to_string(value)
-            .map_err(|e| ServerError::InternalError(format!("JSON serialization error: {}", e)))?;
-        self.header("Content-Type", "application/json");
-        self.body(json_string);
-        Ok(self)
-    }
-
-    // Static constructors for common responses
-    pub fn ok<T: Serialize>(data: &T) -> Result<Response, ServerError> {
-        let mut response = Response::new(200);
-        response.json(data)?;
-        Ok(response)
-    }
-
-    pub fn created<T: Serialize>(data: &T) -> Result<Response, ServerError> {
-        let mut response = Response::new(201);
-        response.json(data)?;
-        Ok(response)
-    }
-
-    pub fn accepted<T: Serialize>(data: &T) -> Result<Response, ServerError> {
-        let mut response = Response::new(202);
-        response.json(data)?;
-        Ok(response)
-    }
-
-    pub fn no_content() -> Response {
-        Response::new(204)
-    }
-
-    pub fn bad_request<T: Serialize>(data: &T) -> Result<Response, ServerError> {
-        let mut response = Response::new(400);
-        response.json(data)?;
-        Ok(response)
-    }
-
-    pub fn unauthorized<T: Serialize>(data: &T) -> Result<Response, ServerError> {
-        let mut response = Response::new(401);
-        response.json(data)?;
-        Ok(response)
-    }
-
-    pub fn forbidden<T: Serialize>(data: &T) -> Result<Response, ServerError> {
-        let mut response = Response::new(403);
-        response.json(data)?;
-        Ok(response)
-    }
-
-    pub fn not_found<T: Serialize>(data: &T) -> Result<Response, ServerError> {
-        let mut response = Response::new(404);
-        response.json(data)?;
-        Ok(response)
-    }
-
-    // Enhanced error response
-    pub fn error(err: ServerError) -> Response {
-        let status = err.status_code();
-        let error_message = err.public_message();
-        let mut response = Response::new(status);
-        if let ServerError::MethodNotAllowed(allow) = &err {
-            response.header("Allow", allow);
-        }
-        response.json(&serde_json::json!({
-            "error": {
-                "message": error_message,
-                "status": status
-            }
-        })).expect("Error creating JSON response");
-        response
-    }
-
-    // Helper for CORS headers
-    pub fn with_cors(&mut self, origin: &str) -> &mut Self {
-        self.header("Access-Control-Allow-Origin", origin)
-            .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-            .header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-    }
-
-    pub fn send(&self) {
-        println!("HTTP/1.1 {} OK", self.status);
-        for (name, value) in &self.headers {
-            println!("{}: {}", name, String::from_utf8_lossy(value.as_bytes()));
-        }
-        println!("\r\n{}", self.body_text());
-    }
-
-    // New convenience methods
-    pub fn text<T: AsRef<str>>(content: T) -> Result<Response, ServerError> {
-        let mut response = Response::new(200);
-        response
-            .header("Content-Type", "text/plain")
-            .body(content.as_ref());
-        Ok(response)
-    }
-
-    pub fn html<T: AsRef<str>>(content: T) -> Result<Response, ServerError> {
-        let mut response = Response::new(200);
-        response
-            .header("Content-Type", "text/html")
-            .body(content.as_ref());
-        Ok(response)
-    }
-
-    pub fn xml<T: AsRef<str>>(content: T) -> Result<Response, ServerError> {
-        let mut response = Response::new(200);
-        response
-            .header("Content-Type", "application/xml")
-            .body(content.as_ref());
-        Ok(response)
-    }
-
-    /// A 200 response with raw bytes, e.g. an image or a generated file.
-    pub fn binary<T: Into<Vec<u8>>>(content_type: &str, data: T) -> Result<Response, ServerError> {
-        let mut response = Response::new(200);
-        response.header("Content-Type", content_type).body(data);
-        Ok(response)
-    }
-
-    pub fn redirect(location: &str) -> Result<Response, ServerError> {
-        let mut response = Response::new(302);
-        response.header("Location", location);
-        Ok(response)
-    }
-
-    pub fn permanent_redirect(location: &str) -> Result<Response, ServerError> {
-        let mut response = Response::new(301);
-        response.header("Location", location);
-        Ok(response)
-    }
-
-    pub fn method_not_allowed(allowed_methods: &[&str]) -> Result<Response, ServerError> {
-        let mut response = Response::new(405);
-        response
-            .header("Allow", allowed_methods.join(", "))
-            .json(&serde_json::json!({
-                "error": {
-                    "message": "Method not allowed",
-                    "allowed_methods": allowed_methods
-                }
-            })).expect("Error creating JSON response");
-        Ok(response)
-    }
-
-    pub fn with_cache_control(&mut self, directive: &str) -> &mut Self {
+    /// Sets `Cache-Control`, e.g. `public, max-age=3600`.
+    pub fn cache_control(&mut self, directive: &str) -> &mut Self {
         self.header("Cache-Control", directive)
     }
 
+    /// Tells browsers and proxies not to store the response.
     pub fn no_cache(&mut self) -> &mut Self {
-        self.with_cache_control("no-cache, no-store, must-revalidate")
-            .header("Pragma", "no-cache")
-            .header("Expires", "0")
+        self.cache_control("no-store")
     }
 
-    // Security headers
-    pub fn with_security_headers(&mut self) -> &mut Self {
-        self.header("X-Content-Type-Options", "nosniff")
-            .header("X-Frame-Options", "DENY")
-            .header("X-XSS-Protection", "1; mode=block")
-            .header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-            .header("Referrer-Policy", "strict-origin-when-cross-origin")
-    }
-
-    pub fn conflict<T: Serialize>(data: &T) -> Result<Response, ServerError> {
-        let mut response = Response::new(409);
-        response.json(data)?;
-        Ok(response)
-    }
-
-    pub fn unprocessable_entity<T: Serialize>(data: &T) -> Result<Response, ServerError> {
-        let mut response = Response::new(422);
-        response.json(data)?;
-        Ok(response)
-    }
-
-    pub fn too_many_requests<T: Serialize>(data: &T) -> Result<Response, ServerError> {
-        let mut response = Response::new(429);
-        response.json(data)?;
-        Ok(response)
-    }
-
-    pub fn service_unavailable<T: Serialize>(data: &T) -> Result<Response, ServerError> {
-        let mut response = Response::new(503);
-        response.json(data)?;
-        Ok(response)
-    }
-
-    pub fn file_download(&mut self, filename: &str, content_type: &str) -> &mut Self {
-        self.header("Content-Type", content_type)
-            .header("Content-Disposition", format!("attachment; filename=\"{}\"", filename))
-    }
-
-    pub fn vary(&mut self, headers: &[&str]) -> &mut Self {
-        self.header("Vary", headers.join(", "))
-    }
-
-    pub fn with_gzip(&mut self) -> &mut Self {
-        self.header("Content-Encoding", "gzip")
-            .vary(&["Accept-Encoding"])
-    }
-
-    pub fn with_brotli(&mut self) -> &mut Self {
-        self.header("Content-Encoding", "br")
-            .vary(&["Accept-Encoding"])
-    }
-
-    pub fn with_language(&mut self, lang: &str) -> &mut Self {
-        self.header("Content-Language", lang)
-            .vary(&["Accept-Language"])
-    }
-
-    pub fn with_api_version(&mut self, version: &str) -> &mut Self {
-        self.header("X-API-Version", version)
+    /// Makes browsers download the body as a file named `filename`
+    /// (`Content-Disposition: attachment`). Non-ASCII names are supported.
+    pub fn attachment(&mut self, filename: &str) -> &mut Self {
+        // An ASCII fallback, plus the exact name per RFC 6266 / RFC 5987.
+        let fallback: String = filename
+            .chars()
+            .map(|c| if c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' ' { c } else { '_' })
+            .collect();
+        let encoded = urlencoding::encode(filename);
+        self.header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"; filename*=UTF-8''{}", fallback, encoded),
+        )
     }
 }
 
-#[macro_export]
-macro_rules! ok_json {
-    ($($json:tt)+) => {{
-        Response::ok(&axeon::json!($($json)+))
-    }};
-}
-
-#[macro_export]
-macro_rules! created_json {
-   ($($json:tt)+) => {{
-         Response::created(&axeon::json!($($json)+))
-    }};
-}
 /// Kept on an `http::Response` so a streamed response survives a round trip
 /// through tower layers.
 #[derive(Clone, Copy, Debug)]

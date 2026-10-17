@@ -1,74 +1,59 @@
 //! Middleware example for Axeon
 //!
-//! This example demonstrates how to create and use middleware for:
-//! - Logging requests
-//! - Authentication
-//! - CORS handling
+//! This example demonstrates:
+//! - Closure middleware with `from_fn` (logging)
+//! - Middleware as a type (an API key check)
+//! - Scoping middleware to a router, and passing data to handlers
+//!
+//! Try it:
+//!   curl http://127.0.0.1:3000/public
+//!   curl http://127.0.0.1:3000/api/profile -H 'x-api-key: secret'
 
+use axeon::middleware::{from_fn, Middleware, MiddlewareResult, Next};
+use axeon::{json, Json, Request, Router, Server, ServerError};
 use std::time::Instant;
-use axeon::{Server, Request, Response, Router, ServerError, ok_json};
-use axeon::middleware::{Middleware, MiddlewareResult, Next};
 
-// Logger middleware that tracks request duration
-struct Logger;
+/// The caller identified by the API key check.
+#[derive(Clone)]
+struct Caller(String);
 
-impl Middleware for Logger {
-    fn call(&self, req: Request, next: Next) -> MiddlewareResult {
-        Box::pin(async move {
-            let start = Instant::now();
-            let url = req.path.clone();
-            let method = req.method;
-            let res = next.handle(req).await;
-            let status = match &res {
-                Ok(res) => res.status,
-                Err(err) => err.status_code(),
-            };
-            let duration = start.elapsed().as_millis();
-            println!("[{}] {:?} {} - {}ms", status, method, url, duration);
-            res
-        })
-    }
+/// Rejects requests without the right `X-Api-Key`.
+struct ApiKey {
+    key: String,
 }
 
-// Simple auth middleware
-struct AuthMiddleware;
-
-impl Middleware for AuthMiddleware {
-    fn call(&self, req: Request, next: Next) -> MiddlewareResult {
-        Box::pin(async move {
-            // Check for token in Authorization header
-            match req.get_header("Authorization") {
-                Some(token) if token.starts_with("Bearer ") => next.handle(req).await,
-                _ => Err(ServerError::Unauthorized("Authentication required".to_string())),
-            }
-        })
+impl Middleware for ApiKey {
+    fn call(&self, mut req: Request, next: Next) -> MiddlewareResult {
+        if req.get_header("x-api-key") != Some(self.key.as_str()) {
+            return Box::pin(async { Err(ServerError::Unauthorized("missing or wrong API key".into())) });
+        }
+        req.insert_extension(Caller("demo-user".into()));
+        next.handle(req)
     }
 }
 
 fn main() {
     let mut app = Server::new();
 
-    // Apply logger middleware globally
-    app.middleware(Logger);
+    // Logs every request, including 404s.
+    app.middleware(from_fn(|req, next| async move {
+        let start = Instant::now();
+        let (method, path) = (req.method(), req.path().to_string());
+        let res = next.handle(req).await?;
+        println!("[{}] {} {} - {:?}", res.status, method, path, start.elapsed());
+        Ok(res)
+    }));
 
-    // Public route - no auth required
-    app.get("/public", |_req| async  {
-        Response::text("This is a public endpoint")
+    app.get("/public", |_req| async { "This is a public endpoint" });
+
+    // Everything under /api needs the API key.
+    let mut api = Router::new();
+    api.middleware(ApiKey { key: "secret".into() });
+    api.get("/profile", |req| async move {
+        let caller = req.extension::<Caller>().map(|c| c.0.clone());
+        Json(json!({ "user": caller }))
     });
+    app.mount("/api", api);
 
-    // Protected routes with auth middleware
-    let mut protected = Router::new();
-    protected.middleware(AuthMiddleware);
-
-    protected.get("/profile", |_req| async  {
-        ok_json!({
-            "name": "User",
-            "email": "user@example.com"
-        })
-    });
-
-    app.mount("/api", protected);
-
-    app.listen("127.0.0.1:3000")
-        .expect("Server failed to start");
+    app.listen("127.0.0.1:3000").expect("server failed to start");
 }

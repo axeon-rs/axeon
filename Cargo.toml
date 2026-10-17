@@ -1,6 +1,6 @@
 [package]
 name = "axeon"
-version = "0.5.0"
+version = "1.0.0-rc.1"
 edition = "2021"
 description = "A fast, Express-style web framework for Rust, built on hyper"
 license = "MIT"
@@ -8,6 +8,7 @@ authors = ["sketch"]
 repository = "https://github.com/axeon-rs/axeon"
 documentation = "https://docs.rs/axeon"
 readme = "README.md"
+exclude = ["examples/todo-api", "benchmarks", ".github"]
 keywords = ["web", "framework", "server", "http", "async"]
 categories = ["web-programming::http-server", "asynchronous"]
 
@@ -19,10 +20,8 @@ futures = { version = "0.3.31", default-features = false, features = ["std", "as
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 urlencoding = "2.1.3"
-base64 = "0.22.1"
 httpdate = "1.0.3"
 tokio = { version = "1.0", features = ["rt-multi-thread", "net", "time", "sync", "fs", "io-util", "signal", "macros"] }
-moka = { version = "0.12", features = ["future"], optional = true }
 flate2 = { version = "1.0", optional = true }
 rustls = { version = "0.23", optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
@@ -36,12 +35,16 @@ matchit = "0.9"
 serde_urlencoded = "0.7"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"], optional = true }
 tracing = "0.1"
-memchr = "2"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 tower-service = "0.3"
 tower-layer = "0.3"
 http-body = "1"
 multer = { version = "3", default-features = false, optional = true }
+cookie = { version = "0.18", features = ["percent-encode", "signed", "private", "key-expansion"], optional = true }
+getrandom = { version = "0.3", optional = true }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"], optional = true }
+base64 = "0.22"
+minijinja = { version = "2", default-features = false, features = ["serde", "loader", "builtins", "macros", "multi_template", "adjacent_loop_items", "std_collections", "debug"], optional = true }
 
 [[example]]
 name = "hello_world"
@@ -78,16 +81,21 @@ tracing-subscriber = "0.3"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "timeout", "compression-gzip", "set-header", "decompression-gzip"] }
 flate2 = "1"
+proptest = "1"
 
 [features]
-default = ["tls", "compression", "ws", "cache", "multipart"]
+default = ["tls", "compression", "ws", "multipart", "cookies", "jwt", "templates"]
 # HTTPS with rustls (`Server::with_tls`), including HTTP/2 over ALPN.
 tls = ["dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls"]
 # gzip/deflate response compression (`middleware::CompressionMiddleware`).
 compression = ["dep:flate2"]
 # WebSocket support (`Request::upgrade_websocket`, `axeon::ws`).
 ws = ["dep:tokio-tungstenite"]
-# In-memory cache helpers (`axeon::cache`, backed by moka).
-cache = ["dep:moka"]
 # Streaming multipart/form-data uploads (`Request::multipart`), via multer.
 multipart = ["dep:multer"]
+# Cookies (plain, signed, encrypted) and sessions (`axeon::cookies`, `axeon::session`).
+cookies = ["dep:cookie", "dep:getrandom"]
+# JSON Web Token authentication (`axeon::auth::jwt`).
+jwt = ["dep:jsonwebtoken"]
+# HTML templates (`axeon::templates`), rendered with minijinja.
+templates = ["dep:minijinja"]

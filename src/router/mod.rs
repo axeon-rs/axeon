@@ -1,5 +1,6 @@
 use crate::handler::{ErrorHandler, Handler, IntoResponse};
-use crate::http::{Method, Request};
+use crate::message::request::Params;
+use crate::message::{Method, Request};
 use crate::middleware::{Chain, Middleware, MiddlewareManager, MiddlewareResult, Next};
 use std::collections::HashMap;
 use std::future::Future;
@@ -49,10 +50,12 @@ pub struct Router {
 }
 
 impl Router {
+    /// An empty router.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Registers a GET handler for `path`.
     pub fn get<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
@@ -63,6 +66,7 @@ impl Router {
         self
     }
 
+    /// Registers a POST handler for `path`.
     pub fn post<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
@@ -73,6 +77,7 @@ impl Router {
         self
     }
 
+    /// Registers a PUT handler for `path`.
     pub fn put<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
@@ -83,6 +88,7 @@ impl Router {
         self
     }
 
+    /// Registers a PATCH handler for `path`.
     pub fn patch<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
@@ -93,6 +99,7 @@ impl Router {
         self
     }
 
+    /// Registers a DELETE handler for `path`.
     pub fn delete<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
@@ -103,6 +110,7 @@ impl Router {
         self
     }
 
+    /// Registers a HEAD handler for `path`.
     pub fn head<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
@@ -113,6 +121,7 @@ impl Router {
         self
     }
 
+    /// Registers a CONNECT handler for `path`.
     pub fn connect<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
@@ -123,6 +132,7 @@ impl Router {
         self
     }
 
+    /// Registers a OPTIONS handler for `path`.
     pub fn options<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
@@ -133,6 +143,7 @@ impl Router {
         self
     }
 
+    /// Registers a TRACE handler for `path`.
     pub fn trace<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
@@ -193,21 +204,23 @@ impl Router {
 
     /// Adds a tower [`Layer`](tower_layer::Layer) as middleware for every
     /// route of this router.
-    pub fn layer<L>(&mut self, layer: L)
+    pub fn layer<L>(&mut self, layer: L) -> &mut Self
     where
         crate::tower::TowerMiddleware<L>: Middleware,
     {
-        self.middleware(crate::tower::TowerMiddleware::new(layer));
+        self.middleware(crate::tower::TowerMiddleware::new(layer))
     }
 
     /// Adds middleware for every route of this router.
-    pub fn middleware(&mut self, middleware: impl Middleware + 'static) {
+    pub fn middleware(&mut self, middleware: impl Middleware + 'static) -> &mut Self {
         self.middlewares.add(middleware);
+        self
     }
 
     /// Adds every route of `router` under the `path` prefix. This router's
     /// middleware runs before the mounted router's own.
-    pub fn mount(&mut self, path: &str, router: Router) {
+    pub fn mount(&mut self, path: &str, router: Router) -> &mut Self {
+        self.middlewares.errors.extend(router.middlewares.errors.iter().cloned());
         let prefix = path.trim_end_matches('/');
         for (key, methods) in router.routes {
             let full = normalize(&format!("{}{}", prefix, key));
@@ -223,13 +236,19 @@ impl Router {
                 entry.insert(method, Endpoint { handler: endpoint.handler, middlewares, body: endpoint.body });
             }
         }
+        self
     }
 
     /// Builds the radix-tree matcher and the route chains used to serve
     /// requests.
     pub(crate) fn compile(&self, on_error: Option<ErrorHandler>) -> Result<CompiledRouter, String> {
+        if !self.middlewares.errors.is_empty() {
+            return Err(format!("invalid middleware configuration: {}", self.middlewares.errors.join("; ")));
+        }
         let mut matcher = matchit::Router::new();
         let mut routes = Vec::with_capacity(self.routes.len());
+        let mut patterns = Vec::with_capacity(self.routes.len());
+        let mut param_names = Vec::with_capacity(self.routes.len());
         // Sorted so conflicts are reported the same way on every run.
         let mut paths: Vec<_> = self.routes.keys().collect();
         paths.sort();
@@ -256,8 +275,16 @@ impl Router {
                 })
                 .collect();
             routes.push(methods);
+            patterns.push(Arc::from(path.as_str()));
+            param_names.push(
+                path.split('/')
+                    .filter_map(|segment| segment.strip_prefix(':').or_else(|| segment.strip_prefix('*')))
+                    .filter(|name| !name.is_empty())
+                    .map(Arc::from)
+                    .collect(),
+            );
         }
-        Ok(CompiledRouter { matcher, routes })
+        Ok(CompiledRouter { matcher, routes, patterns, param_names })
     }
 }
 
@@ -325,6 +352,9 @@ impl RouteBuilder<'_> {
 
     /// Adds middleware for this builder's handlers.
     pub fn middleware(&mut self, middleware: impl Middleware + 'static) -> &mut Self {
+        if let Err(error) = middleware.validate() {
+            self.router.middlewares.errors.push(error);
+        }
         let middleware: Arc<dyn Middleware> = Arc::new(middleware);
         self.middlewares.push(Arc::clone(&middleware));
         self.update(|endpoint| endpoint.middlewares.push(Arc::clone(&middleware)));
@@ -359,13 +389,21 @@ impl RouteBuilder<'_> {
 }
 
 /// The routes for a matched path and its decoded parameters.
-pub(crate) type RouteMatch<'a> = (&'a HashMap<Method, Route>, HashMap<String, String>);
+pub(crate) type RouteMatch<'a> = (&'a HashMap<Method, Route>, Params, Arc<str>);
 
 /// Routes compiled for lookup, built once when the server starts.
 pub(crate) struct CompiledRouter {
     matcher: matchit::Router<usize>,
     routes: Vec<HashMap<Method, Route>>,
+    /// The registered path of each route, e.g. `/users/:id`.
+    patterns: Vec<Arc<str>>,
+    /// Each route's parameter names, in path order (shared, not allocated per request).
+    param_names: Vec<Vec<Arc<str>>>,
 }
+
+/// A slot global middleware can read after routing: the matched pattern.
+#[derive(Clone, Default)]
+pub(crate) struct RouteSlot(pub(crate) Arc<std::sync::OnceLock<Arc<str>>>);
 
 impl CompiledRouter {
     /// The body settings of the route that will handle this request.
@@ -382,17 +420,26 @@ impl CompiledRouter {
     /// The routes for `path` and its percent-decoded parameters.
     pub(crate) fn lookup(&self, path: &str) -> Option<RouteMatch<'_>> {
         let matched = self.matcher.at(path).ok()?;
-        let params = matched
+        let index = *matched.value;
+        let names = &self.param_names[index];
+        let entries = matched
             .params
             .iter()
-            .map(|(name, value)| {
-                let value = urlencoding::decode(value)
-                    .map(|v| v.into_owned())
-                    .unwrap_or_else(|_| value.to_string());
-                (name.to_string(), value)
+            .enumerate()
+            .map(|(i, (key, value))| {
+                let name = match names.get(i) {
+                    Some(name) if &**name == key => Arc::clone(name),
+                    _ => Arc::from(key),
+                };
+                let value = if value.contains('%') {
+                    urlencoding::decode(value).map(|v| v.into_owned()).unwrap_or_else(|_| value.to_string())
+                } else {
+                    value.to_string()
+                };
+                (name, value)
             })
             .collect();
-        Some((&self.routes[*matched.value], params))
+        Some((&self.routes[index], Params::from_entries(entries), Arc::clone(&self.patterns[index])))
     }
 }
 
@@ -443,10 +490,12 @@ mod tests {
         router.get("/users/:id", |_req| async { crate::Response::text("param") });
         router.get("/users/new", |_req| async { crate::Response::text("static") });
         let compiled = router.compile(None).unwrap();
-        let (_, params) = compiled.lookup("/users/new").unwrap();
+        let (_, params, pattern) = compiled.lookup("/users/new").unwrap();
+        assert_eq!(&*pattern, "/users/new");
         assert!(params.is_empty());
-        let (_, params) = compiled.lookup("/users/a%20b").unwrap();
-        assert_eq!(params.get("id").map(String::as_str), Some("a b"));
+        let (_, params, pattern) = compiled.lookup("/users/a%20b").unwrap();
+        assert_eq!(&*pattern, "/users/:id");
+        assert_eq!(params.get("id"), Some("a b"));
         assert!(compiled.lookup("/users/1/extra").is_none());
     }
 
@@ -456,5 +505,33 @@ mod tests {
         router.get("/users/:id", |_req| async { crate::Response::text("a") });
         router.get("/users/:name", |_req| async { crate::Response::text("b") });
         assert!(router.compile(None).is_err());
+    }
+
+    mod properties {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+
+            /// Arbitrary route patterns either compile or report an error,
+            /// and arbitrary request paths never panic during lookup.
+            #[test]
+            fn compile_and_lookup_never_panic(
+                patterns in proptest::collection::vec(r"(/[:*]?[a-z{}.]{0,5}){1,4}", 1..8),
+                paths in proptest::collection::vec(r"(/[a-z%0-9.{}]{0,6}){0,5}", 1..16),
+            ) {
+                let mut router = Router::new();
+                for pattern in &patterns {
+                    router.get(pattern, |_req| async { "ok" });
+                }
+                if let Ok(compiled) = router.compile(None) {
+                    for path in &paths {
+                        let _ = compiled.lookup(path);
+                        let _ = compiled.body_config(path, Method::GET);
+                    }
+                }
+            }
+        }
     }
 }

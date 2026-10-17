@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Default, Debug, Clone)]
-pub struct Plugins {
+pub(crate) struct State {
     data: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
 }
 
-impl Plugins {
+impl State {
     pub fn new() -> Self {
         Self {
             data: Arc::new(HashMap::new()),

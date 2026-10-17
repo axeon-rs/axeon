@@ -68,8 +68,8 @@ async fn route_middleware_runs_innermost_and_in_any_order() {
 async fn body_limits_are_per_route() {
     let mut server = Server::new();
     server.max_body_size(1024);
-    server.post("/small", |req| async move { format!("{}", req.body.as_bytes().len()) });
-    server.route("/big").body_limit(512 * 1024).post(|req| async move { format!("{}", req.body.as_bytes().len()) });
+    server.post("/small", |req| async move { format!("{}", req.body().len()) });
+    server.route("/big").body_limit(512 * 1024).post(|req| async move { format!("{}", req.body().len()) });
     let addr = start(server).await;
 
     let body = vec![b'x'; 100 * 1024];

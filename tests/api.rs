@@ -5,7 +5,7 @@ mod common;
 
 use axeon::middleware::from_fn;
 #[cfg(feature = "compression")]
-use axeon::middleware::{CompressionConfig, CompressionMiddleware};
+use axeon::middleware::Compression;
 use axeon::sse::{self, Event};
 use axeon::{json, Html, Json, Response, Server, ServerError};
 use common::{start, Client};
@@ -41,7 +41,7 @@ async fn handlers_can_return_many_types() {
     let r = c.get("/json").await;
     assert_eq!(r.header("content-type"), Some("application/json"));
     assert_eq!(r.text(), r#"{"ok":true}"#);
-    assert_eq!(c.get("/html").await.header("content-type"), Some("text/html"));
+    assert_eq!(c.get("/html").await.header("content-type"), Some("text/html; charset=utf-8"));
     c.send(b"POST /created HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n").await;
     assert_eq!(c.read().await.unwrap().status, 201);
     assert_eq!(c.get("/none").await.status, 404);
@@ -105,7 +105,7 @@ struct Config {
 #[tokio::test]
 async fn typed_request_helpers() {
     let mut app = Server::new();
-    app.plugins(Config { greeting: "hey" });
+    app.state(Config { greeting: "hey" });
     app.get("/users/:id", |req| async move {
         let id: u32 = req.param("id")?;
         Ok::<_, ServerError>(format!("user {}", id + 1))
@@ -154,7 +154,7 @@ async fn typed_request_helpers() {
 async fn streamed_responses_are_sent_incrementally() {
     let mut app = Server::new();
     #[cfg(feature = "compression")]
-    app.middleware(CompressionMiddleware::new(CompressionConfig { min_size: 0, ..CompressionConfig::default() }));
+    app.middleware(Compression::new().min_size(0));
     app.get("/stream", |_req| async {
         let chunks = stream::unfold(0, |n| async move {
             match n {
@@ -289,4 +289,115 @@ async fn websocket_echo() {
 
     // A plain GET to the WebSocket route is rejected.
     assert_eq!(Client::connect(addr).await.get("/ws").await.status, 400);
+}
+
+#[tokio::test]
+async fn response_builders_and_helpers() {
+    let mut app = Server::new();
+    app.get("/made", |_req| async { Response::text("made").with_status(201).with_header("X-Id", "7") });
+    app.get("/json", |_req| async { Response::json(&json!({ "a": 1 })) });
+    app.get("/moved", |_req| async { Response::permanent_redirect("/new") });
+    app.get("/see", |_req| async { Response::redirect_with_status(303, "/done") });
+    app.get("/file", |_req| async {
+        let mut res = Response::binary("text/csv", "a,b\n");
+        res.attachment("report \"q1\" ✓.csv");
+        res
+    });
+    let app = app.into_app().await.unwrap();
+    let call = |path| app.call(axeon::Request::new(axeon::Method::GET, path));
+
+    let res = call("/made").await;
+    assert_eq!((res.status, res.get_header("x-id"), res.body_text().as_ref()), (201, Some("7"), "made"));
+    assert_eq!(call("/json").await.body_text(), r#"{"a":1}"#);
+    let res = call("/moved").await;
+    assert_eq!((res.status, res.get_header("location")), (301, Some("/new")));
+    assert_eq!(call("/see").await.status, 303);
+    let disposition = call("/file").await.get_header("content-disposition").unwrap().to_string();
+    assert_eq!(
+        disposition,
+        "attachment; filename=\"report _q1_ _.csv\"; filename*=UTF-8''report%20%22q1%22%20%E2%9C%93.csv"
+    );
+}
+
+#[tokio::test]
+async fn request_accessors() {
+    let mut app = Server::new();
+    app.post("/items/:id", |req| async move {
+        Json(json!({
+            "method": req.method().to_string(),
+            "path": req.path(),
+            "id": req.params()["id"],
+            "page": req.query_param("page"),
+            "type": req.content_type(),
+            "text": req.text().ok(),
+            "form": req.form_value().ok(),
+        }))
+    });
+    let app = app.into_app().await.unwrap();
+    let res = app
+        .call(
+            axeon::Request::new(axeon::Method::POST, "/items/5?page=2")
+                .with_body("application/x-www-form-urlencoded", "user[name]=Ada&tags[]=a"),
+        )
+        .await;
+    let v: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "method": "POST", "path": "/items/5", "id": "5", "page": "2",
+            "type": "application/x-www-form-urlencoded",
+            "text": "user[name]=Ada&tags[]=a",
+            "form": { "user": { "name": "Ada" }, "tags": ["a"] },
+        })
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_responses_say_when_to_retry() {
+    use axeon::middleware::RateLimiter;
+    let mut app = Server::new();
+    app.middleware(RateLimiter::per_minute(6).burst(1).key_by(|req| req.get_header("x-api-key").map(String::from)));
+    app.get("/", |_req| async { "ok" });
+    let app = app.into_app().await.unwrap();
+    let call = |key: &'static str| app.call(axeon::Request::new(axeon::Method::GET, "/").with_header("x-api-key", key));
+
+    assert_eq!(call("a").await.status, 200);
+    let limited = call("a").await;
+    assert_eq!(limited.status, 429);
+    // One token every 10 seconds.
+    let retry: u64 = limited.get_header("retry-after").unwrap().parse().unwrap();
+    assert!((9..=10).contains(&retry), "{}", retry);
+    // A different key has its own bucket.
+    assert_eq!(call("b").await.status, 200);
+}
+
+#[tokio::test]
+async fn security_headers_defaults_and_overrides() {
+    use axeon::middleware::SecurityHeaders;
+    let mut app = Server::new();
+    app.middleware(SecurityHeaders::new().content_security_policy("default-src 'self'").no_hsts());
+    app.get("/", |_req| async { "ok" });
+    app.get("/embeddable", |_req| async { Response::text("ok").with_header("X-Frame-Options", "SAMEORIGIN") });
+    let app = app.into_app().await.unwrap();
+
+    let res = app.call(axeon::Request::new(axeon::Method::GET, "/")).await;
+    assert_eq!(res.get_header("x-content-type-options"), Some("nosniff"));
+    assert_eq!(res.get_header("x-frame-options"), Some("DENY"));
+    assert_eq!(res.get_header("x-xss-protection"), Some("0"));
+    assert_eq!(res.get_header("content-security-policy"), Some("default-src 'self'"));
+    assert_eq!(res.get_header("strict-transport-security"), None);
+    // A header set by the handler wins.
+    let res = app.call(axeon::Request::new(axeon::Method::GET, "/embeddable")).await;
+    assert_eq!(res.get_header("x-frame-options"), Some("SAMEORIGIN"));
+}
+
+#[tokio::test]
+async fn builders_chain() {
+    let mut app = Server::new();
+    app.state(5u32)
+        .max_body_size(1024)
+        .get("/a", |_req| async { "a" })
+        .get("/b", |req| async move { req.state::<u32>().map(|n| n.to_string()) });
+    let app = app.into_app().await.unwrap();
+    assert_eq!(app.call(axeon::Request::new(axeon::Method::GET, "/b")).await.body_text(), "5");
 }

@@ -25,7 +25,7 @@
 //! ```
 
 use crate::error::{ServerError, ServerResult};
-use crate::http::Request;
+use crate::message::Request;
 use bytes::Bytes;
 use http::HeaderMap;
 use std::path::Path;

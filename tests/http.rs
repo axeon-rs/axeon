@@ -2,8 +2,8 @@
 //! format itself is checked.
 
 #[cfg(feature = "compression")]
-use axeon::middleware::{CompressionConfig, CompressionMiddleware};
-use axeon::middleware::{Cors, CorsConfig, RateLimitConfig, RateLimiter};
+use axeon::middleware::Compression;
+use axeon::middleware::{Cors, RateLimiter};
 use axeon::{Response, Server, ServerError};
 mod common;
 
@@ -122,7 +122,7 @@ fn echo_app() -> Server {
     let mut app = Server::new();
     app.max_body_size(1024);
     app.post("/echo", |req| async move {
-        Response::binary("application/octet-stream", req.body.as_bytes().to_vec())
+        Response::binary("application/octet-stream", req.body().to_vec())
     });
     app
 }
@@ -312,7 +312,7 @@ async fn static_files_are_binary_safe_and_contained() {
 #[cfg(feature = "compression")]
 fn compressed_app() -> Server {
     let mut app = Server::new();
-    app.middleware(CompressionMiddleware::new(CompressionConfig::default()));
+    app.middleware(Compression::new());
     app.get("/big", |_req| async { Response::text("axeon ".repeat(1000)) });
     app.get("/small", |_req| async { Response::text("tiny") });
     app
@@ -352,7 +352,7 @@ async fn compression_uses_request_accept_encoding() {
 #[tokio::test]
 async fn rate_limiter_uses_peer_address_by_default() {
     let mut app = Server::new();
-    app.middleware(RateLimiter::new(RateLimitConfig { requests_per_minute: 60, burst_size: 3, trust_proxy: false }));
+    app.middleware(RateLimiter::per_minute(60).burst(3));
     app.get("/", |_req| async { Response::text("ok") });
     let addr = start(app).await;
     let mut c = Client::connect(addr).await;
@@ -369,7 +369,7 @@ async fn rate_limiter_uses_peer_address_by_default() {
 #[tokio::test]
 async fn rate_limiter_can_trust_proxy_headers() {
     let mut app = Server::new();
-    app.middleware(RateLimiter::new(RateLimitConfig { requests_per_minute: 60, burst_size: 1, trust_proxy: true }));
+    app.middleware(RateLimiter::per_minute(60).burst(1).trust_proxy(true));
     app.get("/", |_req| async { Response::text("ok") });
     let addr = start(app).await;
     let mut c = Client::connect(addr).await;
@@ -385,12 +385,12 @@ async fn rate_limiter_can_trust_proxy_headers() {
 
 #[tokio::test]
 async fn rate_limiters_do_not_share_state() {
-    let config = RateLimitConfig { requests_per_minute: 60, burst_size: 1, trust_proxy: false };
+
     let mut a = Server::new();
-    a.middleware(RateLimiter::new(config.clone()));
+    a.middleware(RateLimiter::per_minute(60).burst(1));
     a.get("/", |_req| async { Response::text("a") });
     let mut b = Server::new();
-    b.middleware(RateLimiter::new(config));
+    b.middleware(RateLimiter::per_minute(60).burst(1));
     b.get("/", |_req| async { Response::text("b") });
     let (a, b) = (start(a).await, start(b).await);
     assert_eq!(Client::connect(a).await.get("/").await.status, 200);
@@ -406,7 +406,7 @@ async fn request_with_origin(addr: SocketAddr, method: &str, origin: &str, extra
 #[tokio::test]
 async fn cors_wildcard_does_not_reflect_origin() {
     let mut app = Server::new();
-    app.middleware(Cors::new(CorsConfig::default()));
+    app.middleware(Cors::new());
     app.get("/", |_req| async { Response::text("ok") });
     let addr = start(app).await;
     let r = request_with_origin(addr, "GET", "https://evil.example", "").await;
@@ -417,11 +417,7 @@ async fn cors_wildcard_does_not_reflect_origin() {
 #[tokio::test]
 async fn cors_origin_list_with_credentials() {
     let mut app = Server::new();
-    app.middleware(Cors::new(CorsConfig {
-        allow_origins: vec!["https://app.example".to_string()],
-        allow_credentials: true,
-        ..CorsConfig::default()
-    }));
+    app.middleware(Cors::new().allow_origin("https://app.example").allow_credentials(true));
     app.post("/", |_req| async { Response::text("ok") });
     let addr = start(app).await;
 
@@ -441,19 +437,21 @@ async fn cors_origin_list_with_credentials() {
     assert!(r.header("access-control-allow-methods").unwrap().contains("POST"));
 }
 
-#[test]
-#[should_panic(expected = "allow_credentials")]
-fn cors_wildcard_with_credentials_panics() {
-    Cors::new(CorsConfig { allow_credentials: true, ..CorsConfig::default() });
+#[tokio::test]
+async fn cors_wildcard_with_credentials_fails_at_startup() {
+    let mut app = Server::new();
+    app.middleware(Cors::new().allow_credentials(true));
+    let error = app.into_app().await.err().expect("invalid CORS config was accepted");
+    assert!(error.to_string().contains("allow_credentials"), "{}", error);
 }
 
 #[tokio::test]
 async fn params_query_and_headers_are_decoded() {
     let mut app = Server::new();
     app.get("/users/:name", |req| async move {
-        Response::ok(&serde_json::json!({
-            "name": req.params.get("name"),
-            "q": req.query.get("q"),
+        Response::json(&serde_json::json!({
+            "name": req.params().get("name"),
+            "q": req.query().get("q"),
             "auth": req.get_header("Authorization"),
         }))
     });
@@ -469,10 +467,8 @@ async fn params_query_and_headers_are_decoded() {
 async fn json_body_accepts_charset_parameter() {
     let mut app = Server::new();
     app.post("/", |req| async move {
-        match req.body.json::<serde_json::Value>() {
-            Some(v) => Response::ok(&v),
-            None => Err(ServerError::BadRequest("no json".to_string())),
-        }
+        let value: serde_json::Value = req.json()?;
+        Ok::<_, ServerError>(Response::json(&value))
     });
     let addr = start(app).await;
     let mut c = Client::connect(addr).await;
@@ -530,7 +526,7 @@ async fn slow_body_times_out_with_408() {
 #[tokio::test]
 async fn http2_prior_knowledge_is_served() {
     let mut app = Server::new();
-    app.post("/echo", |req| async move { Response::binary("text/plain", req.body.as_bytes().to_vec()) });
+    app.post("/echo", |req| async move { Response::binary("text/plain", req.body().to_vec()) });
     let addr = start(app).await;
 
     let tcp = TcpStream::connect(addr).await.unwrap();
@@ -565,7 +561,7 @@ async fn http2_prior_knowledge_is_served() {
 async fn catch_all_and_static_priority() {
     let mut app = Server::new();
     app.get("/files/*path", |req| async move {
-        Response::text(format!("file:{}", req.params.get("path").unwrap()))
+        Response::text(format!("file:{}", req.params().get("path").unwrap()))
     });
     app.get("/files/index", |_req| async { Response::text("index") });
     let addr = start(app).await;

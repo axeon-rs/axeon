@@ -34,8 +34,10 @@ jobs:
           - --no-default-features --features tls
           - --no-default-features --features compression
           - --no-default-features --features ws
-          - --no-default-features --features cache
           - --no-default-features --features multipart
+          - --no-default-features --features cookies
+          - --no-default-features --features jwt
+          - --no-default-features --features templates
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -59,3 +61,26 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - run: cargo bench --no-run
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  example-app:
+    name: Example app (todo-api)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/todo-api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/todo-api
+      - run: cargo test

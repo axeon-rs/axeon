@@ -247,10 +247,7 @@ async fn write_timeout_closes_clients_that_stop_reading() {
 async fn hostile_form_bodies_are_rejected_without_crashing() {
     let mut server = Server::new();
     server.post("/form", |req| async move {
-        match req.body.x_www_form_urlencoded::<serde_json::Value>() {
-            Some(value) => Ok(Json(value)),
-            None => Err(ServerError::BadRequest("invalid form".into())),
-        }
+        req.form_value().map(Json)
     });
     let app = server.into_app().await.unwrap();
     let post = |body: String| Request::new(Method::POST, "/form").with_body("application/x-www-form-urlencoded", body);

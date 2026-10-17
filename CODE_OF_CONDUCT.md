@@ -35,7 +35,7 @@ and other channels) and when someone represents the project elsewhere.
 ## Reporting
 
 If you experience or witness unacceptable behaviour, report it privately to the
-maintainers at **[INSERT CONTACT EMAIL]**. Reports are handled confidentially,
+maintainers at md.a.razzak.17@gmail.com. Reports are handled confidentially,
 and maintainers will not retaliate against anyone who reports in good faith.
 
 ## Enforcement

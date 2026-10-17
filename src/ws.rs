@@ -47,8 +47,7 @@
 //! });
 //! ```
 use crate::error::{ServerError, ServerResult};
-use crate::http::{Method, Request, Response};
-use crate::lifecycle::UpgradeContext;
+use crate::message::{Method, Request, Response};
 use http::header::{CONNECTION, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE};
 use hyper::upgrade::{OnUpgrade, Upgraded};
 use hyper_util::rt::TokioIo;
@@ -122,7 +121,7 @@ impl Request {
             }
         };
         // Keep the connection's slot and stay tracked for shutdown.
-        match self.extensions.get::<UpgradeContext>() {
+        match self.conn.as_ref().and_then(|conn| conn.upgrade.as_ref()) {
             Some(context) => context.spawn(session),
             None => {
                 tokio::spawn(session);

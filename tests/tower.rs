@@ -31,7 +31,7 @@ async fn tower_layers_run_as_middleware_at_every_level() {
     api.layer(header_layer("x-router", "1"));
     api.route("/item").layer(header_layer("x-route", "1")).get(|req| async move {
         // Path params and the body survive the trip through tower.
-        format!("item {}", req.path)
+        format!("item {}", req.path())
     });
     server.mount("/api", api);
     let app = server.into_app().await.unwrap();
@@ -159,8 +159,8 @@ async fn streaming_routes_keep_streaming_through_layers() {
 async fn app_runs_as_a_tower_service() {
     let mut server = Server::new();
     server.max_body_size(16);
-    server.get("/users/:id", |req| async move { format!("user {}", req.params["id"]) });
-    server.post("/echo", |req| async move { req.body.as_bytes().to_vec() });
+    server.get("/users/:id", |req| async move { format!("user {}", req.params()["id"]) });
+    server.post("/echo", |req| async move { req.body().to_vec() });
     let service = server.into_app().await.unwrap().into_service();
 
     let res = service.clone().oneshot(http::Request::get("/users/7").body(String::new()).unwrap()).await.unwrap();

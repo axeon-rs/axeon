@@ -1,4 +1,4 @@
-use crate::http::Request;
+use crate::message::Request;
 use crate::middleware::{Middleware, MiddlewareResult, Next};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -28,6 +28,7 @@ pub struct SetRequestId {
 }
 
 impl SetRequestId {
+    /// Reuses valid incoming IDs and generates the rest.
     pub fn new() -> Self {
         Self { trust_incoming: true }
     }
@@ -90,6 +91,7 @@ impl Middleware for SetRequestId {
 pub struct RequestLogger;
 
 impl RequestLogger {
+    /// Logs every request at `info` (5xx at `error`).
     pub fn new() -> Self {
         Self
     }

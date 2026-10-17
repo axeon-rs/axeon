@@ -1,8 +1,118 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 1.0.0-rc.1 (unreleased)
+
+The first release candidate for 1.0: a stable, consistent API (one
+breaking cleanup now, then no breaking changes in 1.x), a complete backend
+toolkit, and production hardening. Upgrading from 0.4? See
+[Migrating from 0.4](#migrating-from-04).
+
+### Added: backend toolkit
+
+- **Validation** (`axeon::validate`): a `Validate` trait, `ValidationErrors`,
+  `req.valid_json()`, `valid_query()`, `valid_form()`; invalid input gets 422
+  with messages per field (`ServerError::Invalid`).
+- **Authentication** (`axeon::auth`): `req.bearer_token()`,
+  `req.basic_auth()`, `BearerAuth` (async token check), `BasicAuth`,
+  `constant_time_eq`, and JWT issuing and verification with middleware
+  (`auth::jwt`, feature `jwt`).
+- **Cookies** (`axeon::cookies`, feature `cookies`): `req.cookies()` with
+  plain, signed and encrypted cookies through `CookieManager`;
+  `res.set_cookie()` and `remove_cookie()`. Safe defaults: `HttpOnly`,
+  `SameSite=Lax`, `Path=/`.
+- **Sessions** (`axeon::session`): `Sessions` middleware with a
+  `SessionStore` trait and `MemoryStore`; `req.session()` with typed values,
+  `regenerate()` against session fixation, and `destroy()`.
+- **CSRF protection** (`axeon::csrf`): double-submit tokens via header or
+  form field; `req.csrf_token()`.
+- **Configuration** (`axeon::config`): typed `from_env()` /
+  `from_env_prefixed()` reporting every problem at once, and `.env` loading.
+- **Health checks** (`axeon::health`): `/health` and `/ready` with
+  concurrent, time-limited checks; readiness fails during shutdown.
+- **Metrics** (`axeon::metrics`): Prometheus request counts, latency
+  histograms and in-flight requests, labelled by route pattern.
+- **Templates** (`axeon::templates`, feature `templates`): Jinja templates
+  with auto-escaping; `req.render()`.
+- **Static files**: directories serve `index.html`; `Server::spa_fallback`
+  serves a single-page app for client-side routes.
+- `Server::shutdown_delay`: keep serving (and report not-ready) for a while
+  after the shutdown signal, so load balancers can drain traffic first.
+- `req.matched_path()` (the route pattern), `Response::redirect_with_status`.
+- A complete example API (`examples/todo-api`) and a benchmark suite against
+  axum, actix-web and Express (`benchmarks/`).
+
+### Performance
+
+- Per-connection data is shared instead of allocated per request, requests
+  without a body skip body collection, and path parameters use a compact
+  `Params` type: about 10% more throughput than 0.4.
+
+### Hardening
+
+- Property-based tests (thousands of generated inputs) for the form,
+  range, query and config parsers and the router; wire-level tests with
+  malformed input and slowloris connections.
+- All public items are documented; CI adds a RustSec audit and builds the
+  example app.
+
+### Changed (breaking)
+
+- `Request` fields are private; use accessors: `method()`, `path()`,
+  `params()`, `query()`, `query_param()`, `headers()`, `get_header()`,
+  `content_type()`, `body()`, `text()`, `remote_addr()`, `extensions()`.
+- `Response` constructors return `Response` instead of `Result`:
+  `text`, `html`, `json`, `binary`, `no_content`, `redirect`,
+  `permanent_redirect`, `redirect_with_status`. New consuming builders
+  `with_status`, `with_header`, `with_body`. `Response::html` sends
+  `text/html; charset=utf-8`.
+- All `Server` and `Router` builder methods return `&mut Self` and chain.
+- `Server::plugins` is renamed `Server::state`.
+- Middleware is configured with builder methods: `Cors::new().allow_origin(..)`,
+  `RateLimiter::per_minute(n).burst(..).trust_proxy(..)`,
+  `SecurityHeaders::new().content_security_policy(..)`,
+  `Compression::new().min_size(..)` (was `CompressionMiddleware`).
+- `SecurityHeaders` defaults follow current guidance (helmet): adds
+  `Referrer-Policy`, `Cross-Origin-Opener-Policy`,
+  `Cross-Origin-Resource-Policy`, `X-DNS-Prefetch-Control`,
+  `X-Permitted-Cross-Domain-Policies`; sets `X-XSS-Protection: 0`; keeps
+  headers the handler set.
+- Invalid middleware configuration (e.g. CORS credentials with any origin)
+  makes `serve`/`into_app` return an error instead of panicking.
+- `ServerError::TooManyRequests` carries `retry_after`; rate-limited
+  responses include `Retry-After`.
+- `Method` is `#[non_exhaustive]`.
+- `req.params()` returns `&Params` (was `&HashMap<String, String>`):
+  `params()["id"]` still works; `get` returns `Option<&str>`.
+- `ServerError::ParseError` is removed (use `ValidationError`); new
+  `ServerError::Status(code, message)` for any other status and
+  `ServerError::Invalid(ValidationErrors)` for validation failures.
+
+### Removed
+
+- `Body` and its `Option`-returning parsers (`json`, `x_www_form_urlencoded`,
+  `form_data`); use `req.json()`, `req.form()`, `req.form_value()` and
+  `req.multipart()`.
+- `req.data`, `set_data`, `get_data`, `get_typed_data`, `get_method`; use
+  typed extensions.
+- `Response::ok`, `created`, `accepted`, `bad_request`, `unauthorized`,
+  `forbidden`, `not_found`, `conflict`, `unprocessable_entity`,
+  `too_many_requests`, `service_unavailable`, `method_not_allowed`.
+- `Response::with_gzip` and `with_brotli` (set `Content-Encoding` without
+  compressing, breaking clients), `send` (printed to stdout), `with_cors`,
+  `with_security_headers`, `with_language`, `with_api_version`, `vary`;
+  `with_cache_control` and `file_download` are now `cache_control` and
+  `attachment` (which escapes the file name correctly).
+- The `ok_json!`, `created_json!` and `middlewares!` macros.
+- `Method::from_string`, `ParseError`, `CorsConfig`, `RateLimitConfig`,
+  `SecurityConfig`, `CompressionConfig`.
+- The `buffer` module (unused) and the `database` module: keep your
+  database pool (e.g. sqlx's) in app state with `Server::state`.
+- The `cache` module and feature: use [moka](https://docs.rs/moka) directly,
+  shared through `Server::state`.
 
 ### Added
+
+- `axeon::http` re-exports the `http` crate.
 
 - **Route builder**: `app.route(path)` (also on `Router`) configures one path.
   Its `.middleware(..)`, `.layer(..)`, `.body_limit(..)` and `.stream_body()`
@@ -33,7 +143,7 @@
 - New dependencies: `tower-service`, `tower-layer` and `http-body` (small,
   trait-only crates), and `multer` behind the `multipart` feature.
 
-## 0.4.1 (unreleased)
+## 0.4.1 (2026-10-17)
 
 ### Fixed
 
@@ -74,7 +184,7 @@
   the price of rendering errors into responses between layers. Requests with
   no global middleware are unaffected.
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-10-17)
 
 A rewrite of the server internals on [hyper](https://hyper.rs), with HTTP/2,
 an Express-style handler API, realtime features and production tooling.
@@ -159,6 +269,36 @@ Version 0.3.0 was never published; everything since 0.2.0 is in this release.
 - `Middleware::clone_box` (middleware is now shared, not cloned per request).
 - The `Response::stream(&mut self, content_type)` setter; use
   `Response::stream(content_type, stream)`.
+
+## Migrating from 0.4
+
+| 0.4 | 1.0 |
+|---|---|
+| `req.params["id"]`, `req.params.get("id")` | `req.params()["id"]`, or typed `req.param::<u64>("id")?` |
+| `req.query.get("q")` | `req.query_param("q")`, or typed `req.query_as::<T>()?` |
+| `req.path`, `req.method`, `req.headers` | `req.path()`, `req.method()`, `req.headers()` |
+| `req.body.as_bytes()` | `req.body()` |
+| `req.body.json::<T>()` (returned `Option`) | `req.json::<T>()?` (415/400/422 errors) |
+| `req.body.x_www_form_urlencoded::<T>()` | `req.form::<T>()?`, or `req.form_value()?` for nested keys |
+| `req.body.form_data::<T>()` | `req.multipart()?` (streaming) |
+| `req.set_data(..)` / `req.get_data(..)` | `req.insert_extension(value)` / `req.extension::<T>()` |
+| `app.plugins(value)` | `app.state(value)` |
+| `Response::ok(&value)` | `Json(value)` or `Response::json(&value)` |
+| `Response::created(&value)` | `(201, Json(value))` |
+| `Response::not_found(..)` etc. | `Err(ServerError::NotFound)` or `(404, Json(..))` |
+| `Response::text(..)` inside `Ok(..)` | `Response::text(..)` (no longer a `Result`) |
+| `ok_json!({..})` | `Json(json!({..}))` |
+| `res.with_gzip()` | `Compression::new()` middleware |
+| `res.file_download(name, type)` | `res.attachment(name)` plus a `Content-Type` |
+| `Cors::new(CorsConfig { allow_origins: vec![..], .. })` | `Cors::new().allow_origin(..)` |
+| `RateLimiter::new(RateLimitConfig { requests_per_minute: 60, burst_size: 10, .. })` | `RateLimiter::per_minute(60).burst(10)` |
+| `SecurityHeaders::new(SecurityConfig::default())` | `SecurityHeaders::new()` |
+| `CompressionMiddleware::new(CompressionConfig::default())` | `Compression::new()` |
+| `ServerError::TooManyRequests` | `ServerError::TooManyRequests { retry_after: None }` |
+| `axeon::database::ConnectionPool` | your database crate's pool (e.g. `sqlx::PgPool`) in `app.state(..)` |
+| `axeon::cache::CacheManager` | `moka::future::Cache` in `app.state(..)` |
+| `req.params().get("id")` returning `Option<&String>` | returns `Option<&str>` |
+| `ServerError::ParseError(..)` | `ServerError::ValidationError(..)` |
 
 ## Migrating from 0.2
 

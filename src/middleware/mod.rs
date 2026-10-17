@@ -1,12 +1,27 @@
+//! Middleware: code that runs around handlers, for logging, security,
+//! authentication, compression and more.
+//!
+//! Write middleware as a closure with [`from_fn`] or as a type implementing
+//! [`Middleware`], and add it with [`Server::middleware`](crate::Server::middleware)
+//! (every request), [`Router::middleware`](crate::Router::middleware) (that
+//! router's routes) or [`RouteBuilder::middleware`](crate::RouteBuilder::middleware)
+//! (one route). Tower layers work too, via `layer`.
+//!
+//! Built in: [`SecurityHeaders`], [`Cors`], [`RateLimiter`], [`Compression`]
+//! (feature `compression`), [`SetRequestId`] and [`RequestLogger`]. More live
+//! in [`auth`](crate::auth), [`cookies`](crate::cookies),
+//! [`session`](crate::session), [`csrf`](crate::csrf) and
+//! [`metrics`](crate::metrics).
+
 mod security;
 #[cfg(feature = "compression")]
 mod compression;
 mod observe;
 
-use crate::http::Request;
-pub use security::{RateLimitConfig, RateLimiter, SecurityConfig, SecurityHeaders, CorsConfig, Cors};
+use crate::message::Request;
+pub use security::{Cors, RateLimiter, SecurityHeaders};
 #[cfg(feature = "compression")]
-pub use compression::{CompressionConfig, CompressionMiddleware};
+pub use compression::Compression;
 pub use observe::{RequestId, RequestLogger, SetRequestId};
 
 use crate::handler::{error_response, panic_error, ErrorHandler, Handler, HttpResponse, IntoResponse};
@@ -57,6 +72,7 @@ impl Next {
         Self { chain, index: 0 }
     }
 
+    /// Runs the rest of the chain and returns its response.
     pub fn handle(&self, req: Request) -> MiddlewareResult {
         let started = std::panic::catch_unwind(AssertUnwindSafe(|| match self.chain.middlewares.get(self.index) {
             Some(middleware) => middleware.call(
@@ -93,12 +109,23 @@ impl Next {
     }
 }
 
+/// The future a middleware returns: the response, or an error.
 pub type MiddlewareResult = BoxFuture<'static, HttpResponse>;
 
 /// Request/response middleware. One instance is shared by all requests, so
 /// any state it keeps (counters, caches) is shared too.
 pub trait Middleware: Send + Sync + 'static {
+    /// Handles a request, usually by calling `next.handle(req)` and
+    /// adjusting the request before or the response after.
     fn call(&self, req: Request, next: Next) -> MiddlewareResult;
+
+    /// Checks the configuration. Called when the middleware is added; an
+    /// error makes [`Server::serve`](crate::Server::serve) and
+    /// [`Server::into_app`](crate::Server::into_app) fail before accepting
+    /// requests. The default accepts everything.
+    fn validate(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Builds middleware from an async closure, Express style.
@@ -144,34 +171,15 @@ where
 #[derive(Clone, Default)]
 pub(crate) struct MiddlewareManager {
     pub(crate) middlewares: Vec<Arc<dyn Middleware>>,
+    /// Configuration errors, reported when the server is built.
+    pub(crate) errors: Vec<String>,
 }
 
 impl MiddlewareManager {
     pub fn add<M: Middleware + 'static>(&mut self, middleware: M) {
+        if let Err(error) = middleware.validate() {
+            self.errors.push(error);
+        }
         self.middlewares.push(Arc::new(middleware));
     }
-}
-
-
-#[macro_export]
-macro_rules! middlewares {
-    ($handler:expr) => {
-       $handler
-    };
-
-    ($middleware:expr, $handler:expr) => {
-        |req| {
-            $middleware.call(req, axeon::middleware::Next::new($handler))
-        }
-    };
-
-    ($middleware:expr, $($rest:tt)*) => {
-        |req| {
-            $middleware.call(req, axeon::middleware::Next::new(middlewares!($($rest)*)))
-        }
-    };
-
-    () => {
-        compile_error!("The middlewares! macro requires at least one handler")
-    };
 }

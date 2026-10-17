@@ -3,7 +3,7 @@
 
 mod common;
 
-use axeon::middleware::{from_fn, Cors, CorsConfig, RateLimitConfig, RateLimiter, RequestId, SetRequestId};
+use axeon::middleware::{from_fn, Cors, RateLimiter, RequestId, SetRequestId};
 use axeon::{App, Method, Request, Response, Router, Server, ServerError};
 use common::TempDir;
 
@@ -93,8 +93,8 @@ async fn errors_and_panics_reach_middleware_as_responses() {
     server.middleware(tag("outer"));
     server.middleware(from_fn(|req, next| async move {
         // Errors returned by middleware are rendered too.
-        if req.path == "/blocked" {
-            return Err(ServerError::TooManyRequests);
+        if req.path() == "/blocked" {
+            return Err(ServerError::TooManyRequests { retry_after: None });
         }
         next.handle(req).await
     }));
@@ -121,10 +121,7 @@ async fn errors_and_panics_reach_middleware_as_responses() {
 async fn cors_and_request_ids_cover_error_responses() {
     let mut server = Server::new();
     server.middleware(SetRequestId::new());
-    server.middleware(Cors::new(CorsConfig {
-        allow_origins: vec!["https://app.example".into()],
-        ..CorsConfig::default()
-    }));
+    server.middleware(Cors::new().allow_origin("https://app.example"));
     server.get("/", |req| async move { req.extension::<RequestId>().map(|id| id.to_string()) });
     let app = build(server).await;
 
@@ -148,7 +145,7 @@ async fn cors_and_request_ids_cover_error_responses() {
 #[tokio::test]
 async fn rate_limiter_counts_unmatched_requests() {
     let mut server = Server::new();
-    server.middleware(RateLimiter::new(RateLimitConfig { requests_per_minute: 60, burst_size: 2, trust_proxy: false }));
+    server.middleware(RateLimiter::per_minute(60).burst(2));
     server.get("/", |_req| async { "ok" });
     let (addr, _guard) = {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -47,6 +47,24 @@
 //! - [`Server::into_app`] builds an [`App`] that handles requests in-process,
 //!   for tests.
 //!
+//! # Backend toolkit
+//!
+//! | Module | For |
+//! |---|---|
+//! | [`validate`] | Validated JSON, query and form input with per-field 422 errors |
+//! | [`auth`] | Bearer, Basic and JWT (feature `jwt`) authentication |
+//! | `cookies`, `session`, `csrf` | Signed/encrypted cookies, sessions, CSRF protection (feature `cookies`) |
+//! | [`config`] | Typed configuration from environment variables and `.env` |
+//! | `templates` | HTML templates (feature `templates`) |
+//! | [`health`] | Liveness and readiness endpoints |
+//! | [`metrics`] | Prometheus metrics |
+//! | [`body`], `multipart` | Streaming request bodies and multipart uploads |
+//!
+//! Static files ([`Server::static_dir`]) are streamed with range and
+//! conditional request support, with an optional SPA fallback
+//! ([`Server::spa_fallback`]). Graceful shutdown, request limits, timeouts
+//! and backpressure are built in; see [`Server`].
+//!
 //! # Example: an API with middleware
 //!
 //! ```rust
@@ -81,30 +99,42 @@
 //! # Cargo features
 //!
 //! All on by default: `tls` (HTTPS via rustls), `compression` (gzip/deflate
-//! middleware), `ws` (WebSockets), `cache` (moka-backed cache helpers) and
-//! `multipart` (streaming multipart uploads).
+//! middleware), `ws` (WebSockets), `multipart` (streaming uploads),
+//! `cookies` (cookies, sessions, CSRF), `jwt` (JSON Web Tokens) and
+//! `templates` (HTML templates).
 //!
 //! See the [README](https://github.com/axeon-rs/axeon#readme) for a full
 //! guide and the [changelog](https://github.com/axeon-rs/axeon/blob/master/CHANGELOG.md)
-//! for upgrading from 0.2.
+//! for upgrading from 0.x.
+
+#![warn(missing_docs)]
 
 pub extern crate serde_json;
 pub(crate) mod app;
+pub mod auth;
 pub mod body;
-pub mod buffer;
-#[cfg(feature = "cache")]
-pub mod cache;
-pub mod database;
+pub mod config;
+#[cfg(feature = "cookies")]
+pub mod cookies;
+#[cfg(feature = "cookies")]
+pub mod csrf;
 pub(crate) mod error;
 pub(crate) mod handler;
 mod lifecycle;
 mod static_files;
-pub(crate) mod http;
+pub(crate) mod message;
+pub mod health;
+pub mod metrics;
 pub mod middleware;
+#[cfg(feature = "cookies")]
+pub mod session;
 #[cfg(feature = "multipart")]
 pub mod multipart;
 pub mod sse;
+#[cfg(feature = "templates")]
+pub mod templates;
 pub mod tower;
+pub mod validate;
 #[cfg(feature = "ws")]
 pub mod ws;
 pub(crate) mod plugins;
@@ -119,14 +149,27 @@ pub use router::{RouteBuilder, Router};
 
 pub use crate::error::{ServerError, ServerResult};
 pub use crate::handler::{Html, IntoResponse, Json};
-pub use crate::http::request::{Body, Method, ParseError, Request};
-pub use crate::http::response::Response;
+pub use crate::message::request::{Method, Params, Request};
+
+/// The [`http`](https://docs.rs/http) crate, re-exported so tower layers and
+/// `http` types use the same version as Axeon.
+pub use ::http;
+pub use crate::message::response::Response;
 
 // Reexport serde_json
 pub use serde_json::{json, Value};
 
 // Compile the README's examples as doctests so they stay correct. The README
 // documents the default build, so this needs every default feature.
-#[cfg(all(doctest, feature = "tls", feature = "compression", feature = "ws", feature = "cache", feature = "multipart"))]
+#[cfg(all(
+    doctest,
+    feature = "tls",
+    feature = "compression",
+    feature = "ws",
+    feature = "multipart",
+    feature = "cookies",
+    feature = "jwt",
+    feature = "templates"
+))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;

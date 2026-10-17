@@ -1,6 +1,6 @@
 use crate::error::{ServerError, ServerResult};
-use crate::http::Request;
-use crate::http::Response;
+use crate::message::Request;
+use crate::message::Response;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use serde::Serialize;
@@ -53,6 +53,7 @@ pub(crate) fn panic_error(payload: Box<dyn Any + Send>) -> ServerError {
 /// });
 /// ```
 pub trait IntoResponse {
+    /// Converts into a response, or an error for the error handler.
     fn into_response(self) -> ServerResult<Response>;
 }
 
@@ -95,15 +96,13 @@ impl IntoResponse for () {
 
 impl IntoResponse for &'static str {
     fn into_response(self) -> ServerResult<Response> {
-        Response::text(self)
+        Ok(Response::text(self))
     }
 }
 
 impl IntoResponse for String {
     fn into_response(self) -> ServerResult<Response> {
-        let mut response = Response::new(200);
-        response.header("Content-Type", "text/plain; charset=utf-8").body(self);
-        Ok(response)
+        Ok(Response::text(self))
     }
 }
 
@@ -115,21 +114,19 @@ impl IntoResponse for Cow<'static, str> {
 
 impl IntoResponse for Vec<u8> {
     fn into_response(self) -> ServerResult<Response> {
-        Response::binary("application/octet-stream", self)
+        Ok(Response::binary("application/octet-stream", self))
     }
 }
 
 impl IntoResponse for Bytes {
     fn into_response(self) -> ServerResult<Response> {
-        let mut response = Response::new(200);
-        response.header("Content-Type", "application/octet-stream").body_bytes(self);
-        Ok(response)
+        Ok(Response::binary("application/octet-stream", self))
     }
 }
 
 impl IntoResponse for serde_json::Value {
     fn into_response(self) -> ServerResult<Response> {
-        Response::ok(&self)
+        Json(self).into_response()
     }
 }
 
@@ -147,9 +144,12 @@ impl<T: IntoResponse> IntoResponse for (u16, T) {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Json<T>(pub T);
 
+/// Serialization failures go to the error handler as a 500.
 impl<T: Serialize> IntoResponse for Json<T> {
     fn into_response(self) -> ServerResult<Response> {
-        Response::ok(&self.0)
+        let json = serde_json::to_vec(&self.0)
+            .map_err(|e| ServerError::InternalError(format!("failed to serialize response: {}", e)))?;
+        Ok(Response::new(200).with_header("Content-Type", "application/json").with_body(json))
     }
 }
 
@@ -159,7 +159,7 @@ pub struct Html<T>(pub T);
 
 impl<T: AsRef<str>> IntoResponse for Html<T> {
     fn into_response(self) -> ServerResult<Response> {
-        Response::html(self.0)
+        Ok(Response::html(self.0.as_ref()))
     }
 }
 

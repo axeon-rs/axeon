@@ -1,7 +1,7 @@
 //! Connection lifecycle: the shutdown notice handed to handlers, the context
 //! that lets upgraded connections stay tracked, and the write timeout.
 
-use crate::http::Request;
+use crate::message::Request;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -71,7 +71,23 @@ impl Request {
     /// A handle that reports when the server starts shutting down, for
     /// handlers that run long (WebSockets, streams, background work).
     pub fn shutdown(&self) -> Shutdown {
-        self.extensions.get::<Shutdown>().cloned().unwrap_or(Shutdown { rx: None })
+        match &self.conn {
+            Some(conn) => Shutdown::new(conn.draining.clone()),
+            None => Shutdown { rx: None },
+        }
+    }
+}
+
+/// Per-connection context, shared (one `Arc`) by the connection's requests.
+pub(crate) struct ConnContext {
+    pub(crate) draining: watch::Receiver<bool>,
+    #[cfg(feature = "ws")]
+    pub(crate) upgrade: Option<UpgradeContext>,
+}
+
+impl std::fmt::Debug for ConnContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnContext").finish_non_exhaustive()
     }
 }
 

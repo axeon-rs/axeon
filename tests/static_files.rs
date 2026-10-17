@@ -142,9 +142,9 @@ async fn cache_control_defaults_to_revalidation_and_is_configurable() {
 #[cfg(feature = "compression")]
 #[tokio::test]
 async fn compressed_static_files_get_weak_etags() {
-    use axeon::middleware::{CompressionConfig, CompressionMiddleware};
+    use axeon::middleware::Compression;
     let (addr, _dir) = serve_dir(|app| {
-        app.middleware(CompressionMiddleware::new(CompressionConfig::default()));
+        app.middleware(Compression::new());
     })
     .await;
     let r = get(addr, "/page.html", "Accept-Encoding: gzip\r\n").await;
@@ -155,4 +155,72 @@ async fn compressed_static_files_get_weak_etags() {
     let etag = r.header("etag").unwrap().to_string();
     let again = get(addr, "/page.html", &format!("Accept-Encoding: gzip\r\nIf-None-Match: {}\r\n", etag)).await;
     assert_eq!(again.status, 304);
+}
+
+#[tokio::test]
+async fn directories_serve_index_and_spa_fallback_covers_client_routes() {
+    let dir = TempDir::new("spa");
+    std::fs::write(dir.0.join("index.html"), "<div id=app></div>").unwrap();
+    std::fs::create_dir_all(dir.0.join("docs")).unwrap();
+    std::fs::write(dir.0.join("docs/index.html"), "docs home").unwrap();
+    std::fs::write(dir.0.join("app.js"), "console.log(1)").unwrap();
+
+    let mut app = Server::new();
+    app.static_dir(dir.0.to_str().unwrap()).spa_fallback("index.html");
+    app.get("/api/users", |_req| async { "users" });
+    let addr = start(app).await;
+    let html = "Accept: text/html,application/xhtml+xml\r\n";
+
+    assert_eq!(get(addr, "/", "").await.text(), "<div id=app></div>");
+    assert_eq!(get(addr, "/docs", "").await.text(), "docs home");
+    assert_eq!(get(addr, "/app.js", "").await.text(), "console.log(1)");
+    assert_eq!(get(addr, "/api/users", html).await.text(), "users");
+
+    // A deep link in the browser gets the app shell, revalidated on each load.
+    let r = get(addr, "/settings/profile", html).await;
+    assert_eq!((r.status, r.text().as_str()), (200, "<div id=app></div>"));
+    assert_eq!(r.header("cache-control"), Some("no-cache"));
+
+    // Missing assets and non-browser requests still 404.
+    assert_eq!(get(addr, "/missing.js", html).await.status, 404);
+    assert_eq!(get(addr, "/settings/profile", "Accept: application/json\r\n").await.status, 404);
+    assert_eq!(get(addr, "/settings/profile", "").await.status, 404);
+}
+
+#[cfg(feature = "templates")]
+#[tokio::test]
+async fn templates_render_with_escaping() {
+    use axeon::templates::Templates;
+    use axeon::{json, Method, Request};
+
+    let dir = TempDir::new("templates");
+    std::fs::create_dir_all(dir.0.join("partials")).unwrap();
+    std::fs::write(dir.0.join("page.html"), "<h1>{{ title }}</h1>{% include 'partials/footer.html' %}").unwrap();
+    std::fs::write(dir.0.join("partials/footer.html"), "<footer>{{ year }}</footer>").unwrap();
+    std::fs::write(dir.0.join("secret.txt"), "top secret").unwrap();
+
+    let mut server = Server::new();
+    server.templates(Templates::from_dir(dir.0.join("partials").parent().unwrap()));
+    server.get("/page", |req| async move {
+        let title = req.query_param("title").unwrap_or("Home").to_string();
+        req.render("page.html", json!({ "title": title, "year": 2026 }))
+    });
+    server.get("/missing", |req| async move { req.render("nope.html", json!({})) });
+    server.get("/escape", |req| async move { req.render("../secret.txt", json!({})) });
+    let app = server.into_app().await.unwrap();
+
+    let res = app.call(Request::new(Method::GET, "/page?title=%3Cscript%3Ealert(1)%3C%2Fscript%3E")).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.get_header("content-type"), Some("text/html; charset=utf-8"));
+    assert_eq!(res.body_text(), "<h1>&lt;script&gt;alert(1)&lt;&#x2f;script&gt;</h1><footer>2026</footer>");
+
+    let res = app.call(Request::new(Method::GET, "/missing")).await;
+    assert_eq!(res.status, 500);
+    assert!(!res.body_text().contains("nope.html"), "template details leaked: {}", res.body_text());
+    assert_eq!(app.call(Request::new(Method::GET, "/escape")).await.status, 500);
+
+    // Templates can also be added from strings.
+    let inline = Templates::new().add("hi.html", "Hi {{ name }}").unwrap();
+    assert_eq!(inline.render("hi.html", json!({ "name": "<b>" })).unwrap(), "Hi &lt;b&gt;");
+    assert!(Templates::new().add("bad.html", "{% if %}").is_err());
 }

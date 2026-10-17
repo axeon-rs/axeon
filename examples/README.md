@@ -16,7 +16,8 @@ cargo run --example <example_name>
 - **routing**: Demonstrates different routing techniques and HTTP methods
 - **middleware**: How to use and create middleware for request/response processing
 - **realtime**: Plain-value handlers, closure middleware, server-sent events and WebSockets
-- **production**: Logging with request IDs, security middleware, limits and graceful shutdown
+- **production**: Logging with request IDs, security middleware, health checks, metrics and graceful shutdown
+- **[todo-api](todo-api)**: A complete REST API (its own crate): SQLite via sqlx, JWT login, validation, tests. Run it with `cd todo-api && cargo run`.
 
 ## Example Structure
 

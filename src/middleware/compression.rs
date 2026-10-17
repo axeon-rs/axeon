@@ -1,17 +1,17 @@
-use crate::http::Request;
+use crate::message::Request;
 use crate::middleware::{Middleware, MiddlewareResult, Next};
 use flate2::write::{GzEncoder, ZlibEncoder};
-use flate2::Compression;
+use flate2::Compression as FlateLevel;
 use std::io::Write;
 
 #[derive(Clone)]
-pub struct CompressionConfig {
-    pub level: Compression,
-    pub min_size: usize,
-    pub skip_types: Vec<String>,
+struct Settings {
+    level: FlateLevel,
+    min_size: usize,
+    skip_types: Vec<String>,
 }
 
-impl CompressionConfig {
+impl Settings {
     fn should_compress(&self, content_type: Option<&str>, content_length: usize) -> bool {
         // Don't compress if content is too small
         if content_length < self.min_size {
@@ -29,24 +29,6 @@ impl CompressionConfig {
         }
 
         true
-    }
-}
-
-impl Default for CompressionConfig {
-    fn default() -> Self {
-        Self {
-            level: Compression::default(),
-            min_size: 1024, // Only compress responses larger than 1KB
-            skip_types: vec![
-                "image/".to_string(),
-                "video/".to_string(),
-                "audio/".to_string(),
-                "application/pdf".to_string(),
-                "application/zip".to_string(),
-                "application/gzip".to_string(),
-                "font/woff".to_string(),
-            ],
-        }
     }
 }
 
@@ -99,7 +81,7 @@ fn negotiate(accept_encoding: &str) -> Option<Encoding> {
     }
 }
 
-fn compress(encoding: Encoding, level: Compression, data: &[u8]) -> std::io::Result<Vec<u8>> {
+fn compress(encoding: Encoding, level: FlateLevel, data: &[u8]) -> std::io::Result<Vec<u8>> {
     match encoding {
         Encoding::Gzip => {
             let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 2), level);
@@ -115,19 +97,69 @@ fn compress(encoding: Encoding, level: Compression, data: &[u8]) -> std::io::Res
     }
 }
 
-pub struct CompressionMiddleware {
-    config: CompressionConfig,
+/// Compresses responses with gzip or deflate, negotiated from the request's
+/// `Accept-Encoding`. Skips small bodies, already-compressed media types,
+/// streamed responses and partial content.
+///
+/// ```rust
+/// use axeon::Server;
+/// use axeon::middleware::Compression;
+///
+/// let mut app = Server::new();
+/// app.middleware(Compression::new().min_size(2048));
+/// ```
+///
+/// For brotli or zstd, use `tower_http::compression::CompressionLayer` with
+/// [`Server::layer`](crate::Server::layer).
+#[derive(Clone)]
+pub struct Compression {
+    settings: Settings,
 }
 
-impl CompressionMiddleware {
-    pub fn new(config: CompressionConfig) -> Self {
-        Self { config }
+impl Default for Compression {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl Middleware for CompressionMiddleware {
+impl Compression {
+    /// Level 6, bodies of 1 KiB and up, skipping images, video, audio, PDF,
+    /// archives and fonts.
+    pub fn new() -> Self {
+        Self {
+            settings: Settings {
+                level: FlateLevel::default(),
+                min_size: 1024,
+                skip_types: ["image/", "video/", "audio/", "application/pdf", "application/zip", "application/gzip", "font/woff"]
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect(),
+            },
+        }
+    }
+
+    /// Compression level from 0 (none) to 9 (smallest, slowest). Default: 6.
+    pub fn level(mut self, level: u32) -> Self {
+        self.settings.level = FlateLevel::new(level.min(9));
+        self
+    }
+
+    /// Only compress bodies at least this large. Default: 1024 bytes.
+    pub fn min_size(mut self, bytes: usize) -> Self {
+        self.settings.min_size = bytes;
+        self
+    }
+
+    /// Also skip content types starting with `prefix`, e.g. `application/x-protobuf`.
+    pub fn skip_type(mut self, prefix: &str) -> Self {
+        self.settings.skip_types.push(prefix.to_ascii_lowercase());
+        self
+    }
+}
+
+impl Middleware for Compression {
     fn call(&self, req: Request, next: Next) -> MiddlewareResult {
-        let config = self.config.clone();
+        let config = self.settings.clone();
         Box::pin(async move {
             // Negotiate from the *request* before handing it to the handler.
             let encoding = req.get_header("accept-encoding").and_then(negotiate);
@@ -135,7 +167,7 @@ impl Middleware for CompressionMiddleware {
             let mut response = next.handle(req).await?;
 
             let compressible = !response.is_streaming()
-                && crate::http::response::status_has_body(response.status)
+                && crate::message::response::status_has_body(response.status)
                 && response.status != 206
                 && response.get_header("content-encoding").is_none()
                 && config.should_compress(response.get_header("content-type"), response.body.len());

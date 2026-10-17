@@ -6,12 +6,12 @@
 //! # Examples
 //!
 //! ```rust,no_run
-//! use axeon::{Server, Response, ok_json};
+//! use axeon::{json, Json, Server};
 //!
 //! fn main() {
 //!     let mut app = Server::new();
 //!     app.get("/", |_req| async {
-//!         ok_json!({ "message": "Hello!" })
+//!         Json(json!({ "message": "Hello!" }))
 //!     });
 //!    app.listen("127.0.0.1:3000").unwrap();
 //! }
@@ -19,19 +19,19 @@
 
 use crate::error::ServerError;
 use crate::handler::{error_response, panic_error, ErrorHandler, HttpResponse, IntoResponse};
-use crate::http::request::parse_query;
-use crate::http::{Body, Method, Request};
-use crate::http::Response;
+use crate::message::request::parse_query;
+use crate::message::{Method, Request};
+use crate::message::Response;
 use crate::middleware::{Chain, Middleware, MiddlewareManager, Next};
-use crate::plugins::Plugins;
-use crate::router::{CompiledRouter, Route, Router};
+use crate::plugins::State;
+use crate::router::{CompiledRouter, Route, RouteSlot, Router};
 use crate::static_files::StaticFiles;
 use crate::body::{body_error, RequestBody, ResponseBody};
-use crate::http::convert::{normalize_path, BodyLimit, OriginalUri, PendingBody};
-use crate::http::response::StreamMeta;
+use crate::message::convert::{normalize_path, PendingBody};
+use crate::message::response::StreamMeta;
 use bytes::Bytes;
 use futures::FutureExt;
-use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE};
+use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -54,7 +54,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{watch, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use crate::lifecycle::{Shutdown, Slot, WriteTimeout};
+use crate::lifecycle::{ConnContext, Slot, WriteTimeout};
 #[cfg(feature = "ws")]
 use crate::lifecycle::UpgradeContext;
 use tracing::{debug, error, info, warn};
@@ -86,7 +86,7 @@ struct Limits {
 /// # Example
 ///
 /// ```rust,no_run
-/// use axeon::{ok_json, Response, Server};
+/// use axeon::{json, Json, Server};
 ///
 ///
 /// fn main() {
@@ -94,7 +94,7 @@ struct Limits {
 ///
 ///     // Add a route
 ///     app.get("/", |_req| async {
-///     ok_json!({ "message": "Hello" })
+///     Json(json!({ "message": "Hello" }))
 ///     });
 ///
 ///     // Start the server
@@ -106,19 +106,20 @@ struct Limits {
 
 #[derive(Clone)]
 pub struct Server {
-    pub max_connections: usize,
-    /// How long an idle keep-alive connection waits for the next request.
-    pub keep_alive: Duration,
+    max_connections: usize,
+    keep_alive: Duration,
     request_timeout: Duration,
     write_timeout: Duration,
     shutdown_timeout: Duration,
+    shutdown_delay: Duration,
     limits: Limits,
     router: Router,
     /// Middleware that wraps every request.
     global: MiddlewareManager,
     static_dir: Option<PathBuf>,
     static_cache_control: String,
-    plugins: Plugins,
+    spa_fallback: Option<PathBuf>,
+    state: State,
     on_error: Option<ErrorHandler>,
     #[cfg(feature = "tls")]
     tls_config: Option<Arc<TlsConfig>>,
@@ -139,6 +140,7 @@ impl Server {
             request_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(30),
+            shutdown_delay: Duration::ZERO,
             limits: Limits {
                 max_header_size: 16 * 1024,
                 max_headers: 100,
@@ -148,7 +150,8 @@ impl Server {
             global: MiddlewareManager::default(),
             static_dir: None,
             static_cache_control: "no-cache".to_string(),
-            plugins: Plugins::new(),
+            spa_fallback: None,
+            state: State::new(),
             on_error: None,
             #[cfg(feature = "tls")]
             tls_config: None,
@@ -183,6 +186,17 @@ impl Server {
         self
     }
 
+    /// How long to keep serving after the shutdown signal before stopping.
+    /// During the delay [`Request::shutdown`] reports shutting down (and the
+    /// [`health`](crate::health) readiness check fails), so a load balancer
+    /// can stop routing traffic here first. Behind Kubernetes or a cloud
+    /// load balancer, a few seconds (e.g. 5s) avoids failed requests while
+    /// the instance is being removed. Default: 0.
+    pub fn shutdown_delay(&mut self, delay: Duration) -> &mut Self {
+        self.shutdown_delay = delay;
+        self
+    }
+
     /// How long a graceful shutdown waits for in-flight requests before
     /// closing the remaining connections. Default: 30 seconds.
     pub fn shutdown_timeout(&mut self, timeout: Duration) -> &mut Self {
@@ -209,14 +223,19 @@ impl Server {
         self
     }
 
-    pub fn plugins<T>(&mut self, plugin: T) -> &mut Self
+    /// Registers shared application state (a database pool, configuration,
+    /// clients), available in every handler as [`Request::state`]. One value
+    /// per type; wrap shared mutable data in `Mutex`/`RwLock` or use atomics.
+    pub fn state<T>(&mut self, value: T) -> &mut Self
     where
         T: Send + Sync + 'static,
     {
-        self.plugins.insert(plugin);
+        self.state.insert(value);
         self
     }
 
+    /// Renders every error response, replacing the default JSON body:
+    /// `app.on_error(|err| Response::text(err.to_string()).with_status(err.status_code()))`.
     pub fn on_error<F>(&mut self, handler: F) -> &mut Self
     where
         F: Fn(ServerError) -> Response + Send + Sync + 'static,
@@ -230,13 +249,14 @@ impl Server {
     /// # Arguments
     /// * `path` - The URL path to match, e.g. `/users/:id` or `/files/*path`
     /// * `handler` - The async handler function
-    pub fn get<F, R>(&mut self, path: &str, handler: F)
+    pub fn get<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
         self.router.get(path, handler);
+        self
     }
 
     /// Registers a POST route handler
@@ -244,13 +264,14 @@ impl Server {
     /// # Arguments
     /// * `path` - The URL path to match
     /// * `handler` - The async handler function
-    pub fn post<F, R>(&mut self, path: &str, handler: F)
+    pub fn post<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
         self.router.post(path, handler);
+        self
     }
 
     /// Registers a PUT route handler
@@ -258,13 +279,14 @@ impl Server {
     /// # Arguments
     /// * `path` - The URL path to match
     /// * `handler` - The async handler function
-    pub fn put<F, R>(&mut self, path: &str, handler: F)
+    pub fn put<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
         self.router.put(path, handler);
+        self
     }
 
     /// Registers a PATCH route handler
@@ -272,13 +294,14 @@ impl Server {
     /// # Arguments
     /// * `path` - The URL path to match
     /// * `handler` - The async handler function
-    pub fn patch<F, R>(&mut self, path: &str, handler: F)
+    pub fn patch<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
         self.router.patch(path, handler);
+        self
     }
 
     /// Registers a DELETE route handler
@@ -286,13 +309,14 @@ impl Server {
     /// # Arguments
     /// * `path` - The URL path to match
     /// * `handler` - The async handler function
-    pub fn delete<F, R>(&mut self, path: &str, handler: F)
+    pub fn delete<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
         self.router.delete(path, handler);
+        self
     }
 
     /// Registers a HEAD route handler
@@ -300,13 +324,14 @@ impl Server {
     /// # Arguments
     /// * `path` - The URL path to match
     /// * `handler` - The async handler function
-    pub fn head<F, R>(&mut self, path: &str, handler: F)
+    pub fn head<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
         self.router.head(path, handler);
+        self
     }
 
     /// Registers a CONNECT route handler
@@ -314,13 +339,14 @@ impl Server {
     /// # Arguments
     /// * `path` - The URL path to match
     /// * `handler` - The async handler function
-    pub fn connect<F, R>(&mut self, path: &str, handler: F)
+    pub fn connect<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
         self.router.connect(path, handler);
+        self
     }
 
     /// Registers an OPTIONS route handler
@@ -328,13 +354,14 @@ impl Server {
     /// # Arguments
     /// * `path` - The URL path to match
     /// * `handler` - The async handler function
-    pub fn options<F, R>(&mut self, path: &str, handler: F)
+    pub fn options<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
         self.router.options(path, handler);
+        self
     }
 
     /// Registers a TRACE route handler
@@ -342,13 +369,14 @@ impl Server {
     /// # Arguments
     /// * `path` - The URL path to match
     /// * `handler` - The async handler function
-    pub fn trace<F, R>(&mut self, path: &str, handler: F)
+    pub fn trace<F, R>(&mut self, path: &str, handler: F) -> &mut Self
     where
         F: Fn(Request) -> R + Send + Sync + 'static,
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
         self.router.trace(path, handler);
+        self
     }
 
     /// Adds middleware that wraps every request: all routes (registered
@@ -358,8 +386,9 @@ impl Server {
     ///
     /// # Arguments
     /// * `middleware` - The middleware to add
-    pub fn middleware(&mut self, middleware: impl Middleware + 'static) {
+    pub fn middleware(&mut self, middleware: impl Middleware + 'static) -> &mut Self {
         self.global.add(middleware);
+        self
     }
 
     /// Starts configuring one path: per-route middleware, body limit and
@@ -370,11 +399,11 @@ impl Server {
 
     /// Adds a tower [`Layer`](tower_layer::Layer) as global middleware, e.g.
     /// from `tower-http`. See the [`tower`](crate::tower) module.
-    pub fn layer<L>(&mut self, layer: L)
+    pub fn layer<L>(&mut self, layer: L) -> &mut Self
     where
         crate::tower::TowerMiddleware<L>: Middleware,
     {
-        self.middleware(crate::tower::TowerMiddleware::new(layer));
+        self.middleware(crate::tower::TowerMiddleware::new(layer))
     }
 
     /// Mounts a router at a specific path
@@ -382,8 +411,9 @@ impl Server {
     /// # Arguments
     /// * `path` - The URL path to mount the router
     /// * `router` - The router to mount
-    pub fn mount(&mut self, path: &str, router: Router) {
+    pub fn mount(&mut self, path: &str, router: Router) -> &mut Self {
         self.router.mount(path, router);
+        self
     }
 
     /// Serve HTTPS with a PEM certificate chain and private key. HTTP/2 and
@@ -414,6 +444,16 @@ impl Server {
     /// files such as `.env` are never served, except under `/.well-known/`.
     pub fn static_dir(&mut self, dir: &str) -> &mut Self {
         self.static_dir = Some(PathBuf::from(dir));
+        self
+    }
+
+    /// Serves `file` (relative to [`static_dir`](Server::static_dir), e.g.
+    /// `index.html`) for browser navigations that match no route or file:
+    /// GET requests accepting HTML for paths without a file extension. This
+    /// lets a single-page app handle deep links like `/settings/profile`,
+    /// while missing assets and API calls still get 404.
+    pub fn spa_fallback(&mut self, file: &str) -> &mut Self {
+        self.spa_fallback = Some(PathBuf::from(file));
         self
     }
 
@@ -498,10 +538,22 @@ impl Server {
         };
         let max_connections = self.max_connections.max(1);
         let shutdown_timeout = self.shutdown_timeout;
+        let shutdown_delay = self.shutdown_delay;
         let app = Arc::new(App::build(self).await?);
         // A permit is taken before each accept, so at the limit we simply stop
         // accepting (no busy loop) and resume when a connection finishes.
         let slots = Arc::new(Semaphore::new(max_connections));
+        // Completes when the server should stop accepting: after the signal
+        // and the drain delay, during which requests see `shutdown()` set.
+        let draining_app = Arc::clone(&app);
+        let signal = async move {
+            signal.await;
+            draining_app.draining_tx.send_replace(true);
+            if !shutdown_delay.is_zero() {
+                info!(delay = ?shutdown_delay, "shutdown signal received; draining before stopping");
+                tokio::time::sleep(shutdown_delay).await;
+            }
+        };
         tokio::pin!(signal);
         if let Ok(addr) = listener.local_addr() {
             info!(%addr, "listening");
@@ -559,6 +611,7 @@ impl Server {
 
         drop(listener);
         info!(open_connections = app.tasks.len(), "shutting down");
+        app.draining_tx.send_replace(true);
         app.shutdown_tx.send_replace(true);
         app.tasks.close();
         if timeout(shutdown_timeout, app.tasks.wait()).await.is_err() {
@@ -606,7 +659,7 @@ pub async fn shutdown_signal() {
 ///
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let mut app = Server::new();
-/// app.get("/users/:id", |req| async move { format!("user {}", req.params["id"]) });
+/// app.get("/users/:id", |req| async move { format!("user {}", req.params()["id"]) });
 /// let app = app.into_app().await.unwrap();
 ///
 /// let response = app.call(Request::new(Method::GET, "/users/7")).await;
@@ -618,15 +671,20 @@ pub struct App {
     routing: Arc<Routing>,
     /// Global middleware around routing, if any; requests start here.
     entry: Option<Arc<Chain>>,
-    plugins: Plugins,
+    state: State,
     on_error: Option<ErrorHandler>,
     limits: Limits,
     request_timeout: Duration,
     write_timeout: Duration,
     keep_alive: Duration,
     http: auto::Builder<TokioExecutor>,
-    /// Set to true when shutdown starts.
+    /// Set to true when connections should close (after any drain delay).
     shutdown_tx: watch::Sender<bool>,
+    /// Set to true as soon as the shutdown signal arrives; seen by handlers.
+    draining_tx: watch::Sender<bool>,
+    /// The context for requests that don't arrive on a connection
+    /// (`App::call`, tower services).
+    local: Arc<ConnContext>,
     /// Every connection task, including upgraded WebSockets.
     tasks: TaskTracker,
     /// Cancelled when shutdown times out, closing what is left.
@@ -645,13 +703,16 @@ impl App {
     /// Handles one request through routing and middleware and returns the
     /// response, with errors already converted by the error handler.
     pub async fn call(&self, mut request: Request) -> Response {
-        request.plugins = self.plugins.clone();
-        request.extensions.insert(Shutdown::new(self.shutdown_tx.subscribe()));
+        request.state = self.state.clone();
+        request.conn = Some(Arc::clone(&self.local));
         self.dispatch(request).await
     }
 
     async fn build(server: Server) -> Result<Self, BoxError> {
         let on_error = server.on_error;
+        if !server.global.errors.is_empty() {
+            return Err(format!("invalid middleware configuration: {}", server.global.errors.join("; ")).into());
+        }
         let router = server.router.compile(on_error.clone())?;
         if HeaderValue::from_str(&server.static_cache_control).is_err() {
             return Err(format!("invalid static Cache-Control value {:?}", server.static_cache_control).into());
@@ -660,7 +721,7 @@ impl App {
         // Resolve the static root once instead of on every request.
         let static_files = match server.static_dir {
             Some(dir) => match tokio::fs::canonicalize(&dir).await {
-                Ok(root) => Some(StaticFiles::new(root, server.static_cache_control)),
+                Ok(root) => Some(StaticFiles::new(root, server.static_cache_control, server.spa_fallback)),
                 Err(e) => {
                     warn!(dir = %dir.display(), error = %e, "static directory is unavailable");
                     None
@@ -695,10 +756,11 @@ impl App {
             .max_header_list_size(limits.max_header_size.min(u32::MAX as usize) as u32)
             .max_concurrent_streams(256);
 
+        let draining_tx = watch::channel(false).0;
         Ok(Self {
             routing,
             entry,
-            plugins: server.plugins,
+            state: server.state,
             on_error,
             limits,
             request_timeout: server.request_timeout,
@@ -706,6 +768,12 @@ impl App {
             keep_alive: server.keep_alive,
             http,
             shutdown_tx: watch::channel(false).0,
+            local: Arc::new(ConnContext {
+                draining: draining_tx.subscribe(),
+                #[cfg(feature = "ws")]
+                upgrade: None,
+            }),
+            draining_tx,
             tasks: TaskTracker::new(),
             hard_stop: CancellationToken::new(),
         })
@@ -719,21 +787,23 @@ impl App {
     {
         let mut shutdown = self.shutdown_tx.subscribe();
         let activity = Arc::new(Activity::new());
-        #[cfg(feature = "ws")]
-        let upgrade = UpgradeContext { tasks: self.tasks.clone(), hard_stop: self.hard_stop.clone(), slot };
         #[cfg(not(feature = "ws"))]
         let _slot = slot; // held until the connection ends
+        // One context per connection, shared by its requests.
+        let conn = Arc::new(ConnContext {
+            draining: self.draining_tx.subscribe(),
+            #[cfg(feature = "ws")]
+            upgrade: Some(UpgradeContext { tasks: self.tasks.clone(), hard_stop: self.hard_stop.clone(), slot }),
+        });
         let service = {
             let app = Arc::clone(&self);
             let activity = Arc::clone(&activity);
-            service_fn(move |mut req: hyper::Request<Incoming>| {
+            service_fn(move |req: hyper::Request<Incoming>| {
                 let app = Arc::clone(&app);
+                let conn = Arc::clone(&conn);
                 let busy = activity.begin();
-                req.extensions_mut().insert(Shutdown::new(app.shutdown_tx.subscribe()));
-                #[cfg(feature = "ws")]
-                req.extensions_mut().insert(upgrade.clone());
                 async move {
-                    let response = app.respond(req, Some(peer)).await;
+                    let response = app.respond(req, Some(peer), Some(conn)).await;
                     drop(busy);
                     Ok::<_, Infallible>(response)
                 }
@@ -776,7 +846,12 @@ impl App {
     /// Reads the body under the limits, then routes the request.
     /// Reads the body under the route's limits (or leaves it unread for
     /// streaming routes), then runs middleware and routing.
-    pub(crate) async fn respond<B>(&self, req: http::Request<B>, peer: Option<SocketAddr>) -> HyperResponse
+    pub(crate) async fn respond<B>(
+        &self,
+        req: http::Request<B>,
+        peer: Option<SocketAddr>,
+        conn: Option<Arc<ConnContext>>,
+    ) -> HyperResponse
     where
         B: http_body::Body<Data = Bytes> + Send + 'static,
         B::Error: Into<BoxError>,
@@ -804,6 +879,9 @@ impl App {
             let body = RequestBody::limited(body, limit, self.request_timeout);
             parts.extensions.insert(PendingBody::new(body));
             Bytes::new()
+        } else if http_body::Body::is_end_stream(&body) {
+            // No body (most GETs): skip the collection machinery.
+            Bytes::new()
         } else {
             let deadline = Instant::now() + self.request_timeout;
             match timeout_at(deadline, Limited::new(body, limit).collect()).await {
@@ -814,26 +892,21 @@ impl App {
         };
 
         let query = parts.uri.query().map(parse_query).unwrap_or_default();
-        let content_type = parts
-            .headers
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("none")
-            .to_string();
-        parts.extensions.insert(OriginalUri(parts.uri));
-        parts.extensions.insert(BodyLimit(limit));
 
         let request = Request {
             method,
             path,
             query,
             headers: parts.headers,
-            body: Body { content_type, data },
-            params: HashMap::new(),
-            data: HashMap::new(),
-            plugins: self.plugins.clone(),
+            body: data,
+            params: Default::default(),
+            state: self.state.clone(),
             remote_addr: peer,
             extensions: parts.extensions,
+            conn: conn.or_else(|| Some(Arc::clone(&self.local))),
+            uri: Some(parts.uri),
+            body_limit: limit,
+            matched: None,
         };
         let response = self.dispatch(request).await;
         self.to_hyper(response)
@@ -888,10 +961,13 @@ struct Routing {
 impl Routing {
     async fn handle(&self, mut req: Request) -> HttpResponse {
         let method = req.method;
-        let Some((routes, params)) = self.router.lookup(&req.path) else {
+        let Some((routes, params, pattern)) = self.router.lookup(&req.path) else {
             if method == Method::GET || method == Method::HEAD {
                 if let Some(static_files) = &self.static_files {
                     if let Some(response) = static_files.serve(&req).await {
+                        return Ok(response);
+                    }
+                    if let Some(response) = static_files.fallback(&req).await {
                         return Ok(response);
                     }
                 }
@@ -899,6 +975,10 @@ impl Routing {
             return Err(ServerError::NotFound);
         };
         req.params = params;
+        if let Some(slot) = req.extensions.get::<RouteSlot>() {
+            let _ = slot.0.set(Arc::clone(&pattern));
+        }
+        req.matched = Some(pattern);
 
         if let Some((route, as_get)) = select(routes, method) {
             if as_get {

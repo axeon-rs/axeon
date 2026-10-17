@@ -17,7 +17,7 @@
 use crate::app::App;
 use crate::body::{BoxError, RequestBody, ResponseBody};
 use crate::error::ServerError;
-use crate::http::{Request, Response};
+use crate::message::{Request, Response};
 use crate::middleware::{Middleware, MiddlewareResult, Next};
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -68,6 +68,7 @@ pub struct TowerMiddleware<L> {
 }
 
 impl<L> TowerMiddleware<L> {
+    /// Wraps a tower layer.
     pub fn new(layer: L) -> Self {
         Self { layer }
     }
@@ -150,6 +151,6 @@ where
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
         let app = Arc::clone(&self.app);
-        Box::pin(async move { Ok(app.respond(request, None).await) })
+        Box::pin(async move { Ok(app.respond(request, None, None).await) })
     }
 }

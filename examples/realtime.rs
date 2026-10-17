@@ -22,7 +22,7 @@ fn main() {
     // Log every request with its duration.
     app.middleware(from_fn(|req, next| async move {
         let start = Instant::now();
-        let (method, path) = (req.method, req.path.clone());
+        let (method, path) = (req.method(), req.path().to_string());
         let res = next.handle(req).await;
         let status = res.as_ref().map(|r| r.status).unwrap_or_else(|e| e.status_code());
         println!("[{}] {} {} - {:?}", status, method, path, start.elapsed());

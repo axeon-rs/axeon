@@ -3,13 +3,11 @@
 
 use crate::body::{body_error, downcast, BoxError, RequestBody};
 use crate::error::{ServerError, ServerResult};
-use crate::http::request::parse_query;
-use crate::http::{Body, Method, Request};
-use crate::plugins::Plugins;
+use crate::message::request::parse_query;
+use crate::message::{Method, Request};
+use crate::plugins::State;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
-use serde_json::Value;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -27,22 +25,16 @@ impl PendingBody {
     }
 }
 
-/// The request URI as received, for rebuilding an `http::Request`.
-#[derive(Clone)]
-pub(crate) struct OriginalUri(pub(crate) http::Uri);
-
-/// The body size limit that applied to this request.
-#[derive(Clone, Copy)]
-pub(crate) struct BodyLimit(pub(crate) usize);
-
 /// Request fields with no place in `http::Request`, carried through tower.
 #[derive(Clone)]
 struct Carry {
-    params: HashMap<String, String>,
-    data: HashMap<String, Value>,
-    plugins: Plugins,
+    params: crate::message::request::Params,
+    state: State,
     remote_addr: Option<SocketAddr>,
     streaming: bool,
+    conn: Option<Arc<crate::lifecycle::ConnContext>>,
+    body_limit: usize,
+    matched: Option<Arc<str>>,
 }
 
 /// Normalizes a request path: no trailing slash, `/` for the root.
@@ -58,8 +50,8 @@ pub(crate) fn normalize_path(path: &str) -> String {
 impl Request {
     pub(crate) fn into_http(mut self) -> http::Request<RequestBody> {
         let pending = self.extensions.remove::<PendingBody>().and_then(|p| p.take());
-        let uri = match self.extensions.remove::<OriginalUri>() {
-            Some(OriginalUri(uri)) if normalize_path(uri.path()) == self.path => uri,
+        let uri = match self.uri.take() {
+            Some(uri) if normalize_path(uri.path()) == self.path => uri,
             _ => {
                 let query = serde_urlencoded::to_string(&self.query).unwrap_or_default();
                 let target = if query.is_empty() { self.path.clone() } else { format!("{}?{}", self.path, query) };
@@ -67,13 +59,15 @@ impl Request {
             }
         };
         let streaming = pending.is_some();
-        let body = pending.unwrap_or_else(|| RequestBody::from(self.body.data.clone()));
+        let body = pending.unwrap_or_else(|| RequestBody::from(self.body.clone()));
         self.extensions.insert(Carry {
             params: self.params,
-            data: self.data,
-            plugins: self.plugins,
+            state: self.state,
             remote_addr: self.remote_addr,
             streaming,
+            conn: self.conn,
+            body_limit: self.body_limit,
+            matched: self.matched,
         });
         let mut request = http::Request::new(body);
         *request.method_mut() = http::Method::from_bytes(self.method.as_str().as_bytes()).expect("valid method");
@@ -92,13 +86,6 @@ impl Request {
         let method = Method::parse(parts.method.as_str())
             .ok_or_else(|| ServerError::NotImplemented(format!("method {}", parts.method)))?;
         let carry = parts.extensions.remove::<Carry>();
-        let content_type = parts
-            .headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("none")
-            .to_string();
-
         let streaming = carry.as_ref().is_some_and(|c| c.streaming);
         let data = if streaming {
             // Our own stream if no layer replaced it; otherwise wrap the new body.
@@ -113,15 +100,15 @@ impl Request {
                 Ok(ours) => ours.bytes().await?,
                 Err(other) => {
                     // A layer replaced the body (e.g. decompression): buffer it again.
-                    let limit = parts.extensions.get::<BodyLimit>().map_or(usize::MAX, |l| l.0);
+                    let limit = carry.as_ref().map_or(usize::MAX, |c| c.body_limit);
                     Limited::new(other, limit).collect().await.map_err(body_error)?.to_bytes()
                 }
             }
         };
 
-        let (params, request_data, plugins, remote_addr) = match carry {
-            Some(c) => (c.params, c.data, c.plugins, c.remote_addr),
-            None => (HashMap::new(), HashMap::new(), Plugins::default(), None),
+        let (params, state, remote_addr, conn, body_limit, matched) = match carry {
+            Some(c) => (c.params, c.state, c.remote_addr, c.conn, c.body_limit, c.matched),
+            None => (Default::default(), State::default(), None, None, usize::MAX, None),
         };
         Ok(Request {
             method,
@@ -129,11 +116,14 @@ impl Request {
             query: parts.uri.query().map(parse_query).unwrap_or_default(),
             params,
             headers: parts.headers,
-            data: request_data,
-            body: Body { content_type, data },
-            plugins,
+            body: data,
+            state,
             remote_addr,
+            uri: Some(parts.uri),
             extensions: parts.extensions,
+            conn,
+            body_limit,
+            matched,
         })
     }
 }
