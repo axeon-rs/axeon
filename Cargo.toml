@@ -1,6 +1,6 @@
 [package]
 name = "axeon"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 description = "A fast, Express-style web framework for Rust, built on hyper"
 license = "MIT"
@@ -38,6 +38,10 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 tracing = "0.1"
 memchr = "2"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
+tower-service = "0.3"
+tower-layer = "0.3"
+http-body = "1"
+multer = { version = "3", default-features = false, optional = true }
 
 [[example]]
 name = "hello_world"
@@ -71,9 +75,12 @@ h2 = "0.4"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 tracing-subscriber = "0.3"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "timeout", "compression-gzip", "set-header", "decompression-gzip"] }
+flate2 = "1"
 
 [features]
-default = ["tls", "compression", "ws", "cache"]
+default = ["tls", "compression", "ws", "cache", "multipart"]
 # HTTPS with rustls (`Server::with_tls`), including HTTP/2 over ALPN.
 tls = ["dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls"]
 # gzip/deflate response compression (`middleware::CompressionMiddleware`).
@@ -82,3 +89,5 @@ compression = ["dep:flate2"]
 ws = ["dep:tokio-tungstenite"]
 # In-memory cache helpers (`axeon::cache`, backed by moka).
 cache = ["dep:moka"]
+# Streaming multipart/form-data uploads (`Request::multipart`), via multer.
+multipart = ["dep:multer"]

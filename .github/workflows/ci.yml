@@ -35,6 +35,7 @@ jobs:
           - --no-default-features --features compression
           - --no-default-features --features ws
           - --no-default-features --features cache
+          - --no-default-features --features multipart
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

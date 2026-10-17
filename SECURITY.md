@@ -9,8 +9,8 @@ Security fixes are released for the latest minor version only.
 
 | Version | Supported |
 |---|---|
-| 0.4.x | Yes |
-| < 0.4 | No: please upgrade |
+| 0.5.x | Yes |
+| < 0.5 | No: please upgrade |
 
 Versions before 0.4 have known issues fixed in 0.4.0, including a form body
 that could crash the server process and missing request size limits and

@@ -284,6 +284,20 @@ impl Request {
             .map_err(|e| ServerError::ValidationError(e.to_string()))
     }
 
+    /// The request body as a stream of chunks, for reading large uploads
+    /// without buffering them. On routes configured with
+    /// [`stream_body`](crate::RouteBuilder::stream_body) the data
+    /// arrives as the client sends it and can be taken only once; elsewhere
+    /// this streams the already-buffered `req.body`.
+    pub fn body_stream(&self) -> ServerResult<crate::body::RequestBody> {
+        match self.extensions.get::<crate::http::convert::PendingBody>() {
+            Some(pending) => pending
+                .take()
+                .ok_or_else(|| ServerError::InternalError("request body already taken".to_string())),
+            None => Ok(crate::body::RequestBody::from(self.body.data.clone())),
+        }
+    }
+
     /// Application state registered with [`Server::plugins`](crate::Server::plugins).
     pub fn state<T: 'static>(&self) -> Option<&T> {
         self.plugins.get::<T>()

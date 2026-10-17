@@ -19,7 +19,6 @@
 
 use crate::error::ServerError;
 use crate::handler::{error_response, panic_error, ErrorHandler, HttpResponse, IntoResponse};
-use crate::http::response::status_has_body;
 use crate::http::request::parse_query;
 use crate::http::{Body, Method, Request};
 use crate::http::Response;
@@ -27,14 +26,14 @@ use crate::middleware::{Chain, Middleware, MiddlewareManager, Next};
 use crate::plugins::Plugins;
 use crate::router::{CompiledRouter, Route, Router};
 use crate::static_files::StaticFiles;
+use crate::body::{body_error, RequestBody, ResponseBody};
+use crate::http::convert::{normalize_path, BodyLimit, OriginalUri, PendingBody};
+use crate::http::response::StreamMeta;
 use bytes::Bytes;
 use futures::FutureExt;
-use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
-use http::StatusCode;
-use futures::{StreamExt, TryStreamExt};
-use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited, StreamBody};
-use hyper::body::{Frame, Incoming};
+use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE};
+use http_body_util::{BodyExt, Limited};
+use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
@@ -64,7 +63,7 @@ use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use crate::tls::TlsConfig;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
-type HyperResponse = hyper::Response<UnsyncBoxBody<Bytes, BoxError>>;
+type HyperResponse = http::Response<ResponseBody>;
 
 /// hyper's HTTP/1 read buffer cannot be smaller than this, so it is also the
 /// smallest header limit we can enforce.
@@ -361,6 +360,21 @@ impl Server {
     /// * `middleware` - The middleware to add
     pub fn middleware(&mut self, middleware: impl Middleware + 'static) {
         self.global.add(middleware);
+    }
+
+    /// Starts configuring one path: per-route middleware, body limit and
+    /// streaming. See [`Router::route`].
+    pub fn route(&mut self, path: &str) -> crate::RouteBuilder<'_> {
+        self.router.route(path)
+    }
+
+    /// Adds a tower [`Layer`](tower_layer::Layer) as global middleware, e.g.
+    /// from `tower-http`. See the [`tower`](crate::tower) module.
+    pub fn layer<L>(&mut self, layer: L)
+    where
+        crate::tower::TowerMiddleware<L>: Middleware,
+    {
+        self.middleware(crate::tower::TowerMiddleware::new(layer));
     }
 
     /// Mounts a router at a specific path
@@ -719,7 +733,7 @@ impl App {
                 #[cfg(feature = "ws")]
                 req.extensions_mut().insert(upgrade.clone());
                 async move {
-                    let response = app.respond(req, peer).await;
+                    let response = app.respond(req, Some(peer)).await;
                     drop(busy);
                     Ok::<_, Infallible>(response)
                 }
@@ -760,12 +774,21 @@ impl App {
     }
 
     /// Reads the body under the limits, then routes the request.
-    async fn respond(&self, req: hyper::Request<Incoming>, peer: SocketAddr) -> HyperResponse {
+    /// Reads the body under the route's limits (or leaves it unread for
+    /// streaming routes), then runs middleware and routing.
+    pub(crate) async fn respond<B>(&self, req: http::Request<B>, peer: Option<SocketAddr>) -> HyperResponse
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
+    {
         let Some(method) = Method::parse(req.method().as_str()) else {
             let err = ServerError::NotImplemented(format!("method {}", req.method()));
             return self.to_hyper(self.handle_error(err));
         };
-        let (parts, body) = req.into_parts();
+        let (mut parts, body) = req.into_parts();
+        let path = normalize_path(parts.uri.path());
+        let config = self.routing.router.body_config(&path, method);
+        let limit = config.limit.unwrap_or(self.limits.max_body_size);
 
         // Refuse a declared oversized body before reading any of it.
         let declared = parts
@@ -773,22 +796,23 @@ impl App {
             .get(CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
-        if declared.is_some_and(|len| len > self.limits.max_body_size as u64) {
+        if declared.is_some_and(|len| len > limit as u64) {
             return self.reject(ServerError::PayloadTooLarge);
         }
 
-        let deadline = Instant::now() + self.request_timeout;
-        let body = match timeout_at(deadline, Limited::new(body, self.limits.max_body_size).collect()).await {
-            Err(_) => return self.reject(ServerError::RequestTimeout),
-            Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
-                return self.reject(ServerError::PayloadTooLarge)
+        let data = if config.stream {
+            let body = RequestBody::limited(body, limit, self.request_timeout);
+            parts.extensions.insert(PendingBody::new(body));
+            Bytes::new()
+        } else {
+            let deadline = Instant::now() + self.request_timeout;
+            match timeout_at(deadline, Limited::new(body, limit).collect()).await {
+                Err(_) => return self.reject(ServerError::RequestTimeout),
+                Ok(Err(e)) => return self.reject(body_error(e)),
+                Ok(Ok(collected)) => collected.to_bytes(),
             }
-            Ok(Err(_)) => return self.reject(ServerError::BadRequest("Invalid request body".to_string())),
-            Ok(Ok(collected)) => collected.to_bytes(),
         };
 
-        let path = parts.uri.path().trim_end_matches('/');
-        let path = if path.is_empty() { "/".to_string() } else { path.to_string() };
         let query = parts.uri.query().map(parse_query).unwrap_or_default();
         let content_type = parts
             .headers
@@ -796,17 +820,19 @@ impl App {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("none")
             .to_string();
+        parts.extensions.insert(OriginalUri(parts.uri));
+        parts.extensions.insert(BodyLimit(limit));
 
         let request = Request {
             method,
             path,
             query,
             headers: parts.headers,
-            body: Body { content_type, data: body },
+            body: Body { content_type, data },
             params: HashMap::new(),
             data: HashMap::new(),
             plugins: self.plugins.clone(),
-            remote_addr: Some(peer),
+            remote_addr: peer,
             extensions: parts.extensions,
         };
         let response = self.dispatch(request).await;
@@ -821,40 +847,17 @@ impl App {
         response
     }
 
-    fn to_hyper(&self, mut response: Response) -> HyperResponse {
-        let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let has_body = status_has_body(status.as_u16());
-        let stream = response.take_stream();
-        let stream_length = response.stream_length();
-        let mut headers = response.headers;
-        // Framing is ours to decide.
-        headers.remove(TRANSFER_ENCODING);
-        headers.remove(CONTENT_LENGTH);
-        if let (true, Some(_), Some(length)) = (has_body, &stream, stream_length) {
-            headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
+    fn to_hyper(&self, response: Response) -> HyperResponse {
+        let response = response.into_http();
+        if !response.extensions().get::<StreamMeta>().is_some_and(|m| m.end_on_shutdown) {
+            return response;
         }
-        let body = match stream {
-            Some(stream) if has_body && response.end_on_shutdown => {
-                // Event streams end cleanly at shutdown so clients reconnect elsewhere.
-                let mut shutdown = self.shutdown_tx.subscribe();
-                let stopping = async move {
-                    let _ = shutdown.wait_for(|stopping| *stopping).await;
-                };
-                StreamBody::new(stream.take_until(stopping).map_ok(Frame::data)).boxed_unsync()
-            }
-            Some(stream) if has_body => StreamBody::new(stream.map_ok(Frame::data)).boxed_unsync(),
-            _ => {
-                let body = if has_body { response.body } else { Bytes::new() };
-                if has_body {
-                    headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
-                }
-                Full::new(body).map_err(|never| match never {}).boxed_unsync()
-            }
+        // Event streams end cleanly at shutdown so clients reconnect elsewhere.
+        let mut shutdown = self.shutdown_tx.subscribe();
+        let stopping = async move {
+            let _ = shutdown.wait_for(|stopping| *stopping).await;
         };
-        let mut out = hyper::Response::new(body);
-        *out.status_mut() = status;
-        *out.headers_mut() = headers;
-        out
+        response.map(|body| body.take_until(stopping))
     }
 
     /// Runs global middleware, routing and handlers. Errors and panics are
@@ -984,6 +987,7 @@ async fn handle_options(routes: &HashMap<Method, Route>, allow: String, req: Req
     let middlewares = template.map(|route| Arc::clone(&route.chain.middlewares)).unwrap_or_else(|| Arc::new([]));
     let on_error = template.and_then(|route| route.chain.on_error.clone());
     let route = Route {
+        body: Default::default(),
         chain: Arc::new(Chain {
             middlewares,
             on_error,

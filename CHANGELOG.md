@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+### Added
+
+- **Route builder**: `app.route(path)` (also on `Router`) configures one path.
+  Its `.middleware(..)`, `.layer(..)`, `.body_limit(..)` and `.stream_body()`
+  apply to the handlers registered through that builder only, so a `POST` can
+  require auth while `GET` on the same path stays public. Route middleware
+  runs after global and router middleware.
+- **Streaming request bodies**: on `stream_body()` routes the body isn't
+  buffered; read it as it arrives with `req.body_stream()`, a `RequestBody`
+  that is a `Stream` of chunks, with `bytes()` and `save_to(path)`. It fails
+  with 413 past the route's limit and 408 if the client stops sending.
+- **Multipart uploads** (new default feature `multipart`, via multer):
+  `req.multipart()` reads `multipart/form-data` field by field; files can be
+  written to disk as they arrive with `field.save_to(path)`.
+- **Per-route body limits** with `.body_limit(bytes)`, overriding
+  `max_body_size`.
+- **Tower layers as middleware**: `Server::layer`, `Router::layer` and
+  `RouteBuilder::layer` accept any tower `Layer`, including all of
+  `tower-http` (compression, timeouts, CORS, decompression, tracing...).
+  Streamed bodies stay streamed through layers.
+- **Apps as tower services**: `App::into_service()` returns an `AppService`
+  implementing tower `Service`, for mounting in other frameworks or custom
+  hyper servers.
+- `axeon::body::{RequestBody, ResponseBody}`: the body types, implementing
+  `http_body::Body`.
+
+### Changed
+
+- New dependencies: `tower-service`, `tower-layer` and `http-body` (small,
+  trait-only crates), and `multer` behind the `multipart` feature.
+
 ## 0.4.1 (unreleased)
 
 ### Fixed

@@ -19,12 +19,15 @@ fn main() {
   time doesn't depend on the number of routes.
 - **Handlers return what they mean**: text, `Json(..)`, `Html(..)`, bytes,
   `(status, body)`, `Option` (404 on `None`) or `Result`.
-- **Middleware as closures or types**, with typed per-request data and shared
-  app state.
+- **Middleware as closures or types**, globally, per router or per route,
+  with typed per-request data and shared app state.
+- **Works with tower**: use any [tower](https://docs.rs/tower) layer (all of
+  `tower-http`) as middleware, and run an Axeon app as a tower `Service`.
 - **Typed requests**: `req.param::<u64>("id")`, `req.json::<T>()`,
   `req.query_as::<T>()`, `req.form::<T>()`, with the right 4xx errors.
-- **HTTP/1.1 and HTTP/2**, HTTPS via rustls, streaming responses, server-sent
-  events and WebSockets.
+- **HTTP/1.1 and HTTP/2**, HTTPS via rustls, streaming requests and
+  responses, multipart uploads straight to disk, server-sent events and
+  WebSockets.
 - **Production ready**: graceful shutdown, request limits and timeouts,
   backpressure, structured logging with request IDs, security headers, CORS,
   rate limiting and compression.
@@ -34,7 +37,7 @@ fn main() {
 
 ```toml
 [dependencies]
-axeon = "0.4"
+axeon = "0.5"
 tokio = { version = "1", features = ["full"] } # for #[tokio::main], tokio::spawn, etc.
 ```
 
@@ -63,6 +66,28 @@ routes that can never be told apart (`/users/:id` and `/users/:name`) are
 reported when the server starts. `HEAD` and `OPTIONS` are answered
 automatically, and a known path with the wrong method gets `405` with an
 `Allow` header.
+
+To configure one path, use `route`. Its middleware and settings apply only to
+the handlers registered through it:
+
+```rust
+use axeon::{Server, ServerError};
+use axeon::middleware::from_fn;
+
+let mut app = Server::new();
+let require_admin = from_fn(|req, next| async move {
+    if req.get_header("x-admin").is_none() {
+        return Err(ServerError::Forbidden("admins only".into()));
+    }
+    next.handle(req).await
+});
+
+app.route("/posts").get(|_req| async { "all posts" });   // public
+app.route("/posts")
+    .middleware(require_admin)                             // only for POST
+    .body_limit(64 * 1024)                                 // 64 KiB for this route
+    .post(|_req| async { (201, "created") });
+```
 
 ## Requests
 
@@ -106,6 +131,49 @@ app.get("/search", |req| async move {
 Headers are available through `req.get_header("authorization")` (names are
 case-insensitive) and `req.headers`; the peer address through
 `req.remote_addr`.
+
+### Large uploads
+
+Bodies are buffered up to `max_body_size` (2 MiB by default) so handlers can
+read them synchronously. For large uploads, give the route its own limit and
+`stream_body()`, then read the body as it arrives: as a stream, saved straight
+to disk, or as multipart form fields:
+
+```rust
+use axeon::{Server, ServerError};
+
+let mut app = Server::new();
+
+// Raw body, written to disk as it arrives.
+app.route("/backup")
+    .body_limit(10 << 30) // 10 GiB
+    .stream_body()
+    .put(|req| async move {
+        let size = req.body_stream()?.save_to("/tmp/backup.tar").await?;
+        Ok::<_, ServerError>(format!("stored {} bytes", size))
+    });
+
+// multipart/form-data: text fields and files, one at a time.
+app.route("/photos")
+    .body_limit(50 << 20) // 50 MiB
+    .stream_body()
+    .post(|req| async move {
+        let mut form = req.multipart()?;
+        let mut count = 0;
+        while let Some(field) = form.next_field().await? {
+            if field.file_name().is_some() {
+                count += 1;
+                // Never build paths from the client's file name.
+                field.save_to(std::env::temp_dir().join(format!("photo-{}", count))).await?;
+            }
+        }
+        Ok::<_, ServerError>(format!("{} photos", count))
+    });
+```
+
+A streamed body fails with `413` past the route's limit and `408` if the
+client stops sending for `request_timeout`. `req.body` stays empty on these
+routes, including for middleware.
 
 ## Responses
 
@@ -244,6 +312,25 @@ struct Config {
 let mut app = Server::new();
 app.plugins(Config { greeting: "hello" });
 app.get("/", |req| async move { req.state::<Config>().map(|config| config.greeting) });
+```
+
+### Tower layers
+
+Any [tower](https://docs.rs/tower) layer works as middleware, including
+everything in [`tower-http`](https://docs.rs/tower-http), with `layer`
+on the server, a `Router`, or a single `route`:
+
+```rust
+use axeon::Server;
+use std::time::Duration;
+use tower_http::compression::CompressionLayer;
+use tower_http::timeout::TimeoutLayer;
+
+let mut app = Server::new();
+app.layer(CompressionLayer::new()); // gzip, brotli, zstd...
+app.route("/report")
+    .layer(TimeoutLayer::with_status_code(http::StatusCode::REQUEST_TIMEOUT, Duration::from_secs(5)))
+    .get(|_req| async { "report" });
 ```
 
 ### Built-in middleware
@@ -394,6 +481,28 @@ app.get("/", |_req| async {
 });
 ```
 
+### Embedding in other servers
+
+`App::into_service()` turns an app into a tower `Service`, so it can be
+mounted inside another framework (for example axum's `Router::nest_service`)
+or served by your own hyper setup:
+
+```rust
+use axeon::Server;
+use tower::ServiceExt;
+
+#[tokio::test]
+async fn serves_through_tower() {
+    let mut app = Server::new();
+    app.get("/", |_req| async { "hello" });
+    let service = app.into_app().await.unwrap().into_service();
+
+    let request = http::Request::get("/").body(String::new()).unwrap();
+    let response = service.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 200);
+}
+```
+
 ### Testing
 
 `Server::into_app()` builds an `App` that handles requests in-process, through
@@ -427,7 +536,7 @@ to cut dependencies and build time (a minimal build compiles about half as
 many crates):
 
 ```toml
-axeon = { version = "0.4", default-features = false, features = ["tls"] }
+axeon = { version = "0.5", default-features = false, features = ["tls"] }
 ```
 
 | Feature | Enables |
@@ -436,6 +545,7 @@ axeon = { version = "0.4", default-features = false, features = ["tls"] }
 | `compression` | gzip/deflate `CompressionMiddleware` |
 | `ws` | WebSockets (`Request::upgrade_websocket`, `axeon::ws`) |
 | `cache` | `axeon::cache` helpers backed by moka |
+| `multipart` | Streaming `multipart/form-data` uploads (`Request::multipart`) |
 
 ### Performance
 

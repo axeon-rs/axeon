@@ -23,6 +23,9 @@
 //!   [`Server::serve_with_shutdown`].
 //! - [`Router`] groups routes to [`mount`](Server::mount) under a prefix.
 //!   Paths use `:name` parameters and `*name` catch-alls.
+//!   [`Server::route`] configures one path: per-route middleware, body limit,
+//!   and streaming uploads read with [`Request::body_stream`] or
+//!   `Request::multipart`.
 //! - Handlers are async closures taking a [`Request`] and returning anything
 //!   that implements [`IntoResponse`]: text, [`Json`], [`Html`], bytes,
 //!   `(status, body)`, `Option`, `Result` or a [`Response`].
@@ -38,6 +41,9 @@
 //!   and compression.
 //! - [`sse`] streams server-sent events, [`Response::stream`] streams any
 //!   body, and [`ws`] (feature `ws`) accepts WebSockets.
+//! - [`tower`] interop: [`Server::layer`] adds any tower layer (such as
+//!   `tower-http`) as middleware, and [`App::into_service`] runs the app as a
+//!   tower `Service`.
 //! - [`Server::into_app`] builds an [`App`] that handles requests in-process,
 //!   for tests.
 //!
@@ -75,7 +81,8 @@
 //! # Cargo features
 //!
 //! All on by default: `tls` (HTTPS via rustls), `compression` (gzip/deflate
-//! middleware), `ws` (WebSockets) and `cache` (moka-backed cache helpers).
+//! middleware), `ws` (WebSockets), `cache` (moka-backed cache helpers) and
+//! `multipart` (streaming multipart uploads).
 //!
 //! See the [README](https://github.com/axeon-rs/axeon#readme) for a full
 //! guide and the [changelog](https://github.com/axeon-rs/axeon/blob/master/CHANGELOG.md)
@@ -83,6 +90,7 @@
 
 pub extern crate serde_json;
 pub(crate) mod app;
+pub mod body;
 pub mod buffer;
 #[cfg(feature = "cache")]
 pub mod cache;
@@ -93,7 +101,10 @@ mod lifecycle;
 mod static_files;
 pub(crate) mod http;
 pub mod middleware;
+#[cfg(feature = "multipart")]
+pub mod multipart;
 pub mod sse;
+pub mod tower;
 #[cfg(feature = "ws")]
 pub mod ws;
 pub(crate) mod plugins;
@@ -102,8 +113,9 @@ pub(crate) mod router;
 mod tls;
 
 pub use app::{shutdown_signal, App, Server};
+pub use crate::tower::AppService;
 pub use lifecycle::Shutdown;
-pub use router::Router;
+pub use router::{RouteBuilder, Router};
 
 pub use crate::error::{ServerError, ServerResult};
 pub use crate::handler::{Html, IntoResponse, Json};
@@ -115,6 +127,6 @@ pub use serde_json::{json, Value};
 
 // Compile the README's examples as doctests so they stay correct. The README
 // documents the default build, so this needs every default feature.
-#[cfg(all(doctest, feature = "tls", feature = "compression", feature = "ws", feature = "cache"))]
+#[cfg(all(doctest, feature = "tls", feature = "compression", feature = "ws", feature = "cache", feature = "multipart"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;

@@ -8,6 +8,16 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct Route {
     pub(crate) chain: Arc<Chain>,
+    pub(crate) body: BodyConfig,
+}
+
+/// How a route reads its request body.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BodyConfig {
+    /// Overrides the server's `max_body_size`.
+    pub(crate) limit: Option<usize>,
+    /// Leave the body unread for `Request::body_stream`.
+    pub(crate) stream: bool,
 }
 
 impl Route {
@@ -20,7 +30,9 @@ impl Route {
 #[derive(Clone)]
 pub(crate) struct Endpoint {
     handler: Arc<dyn Handler>,
+    /// Outermost first: mounted routers' middleware, then the route's own.
     middlewares: Vec<Arc<dyn Middleware>>,
+    body: BodyConfig,
 }
 
 /// A group of routes with shared middleware. Paths use `:name` for a
@@ -137,8 +149,55 @@ impl Router {
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
-        let endpoint = Endpoint { handler: Arc::new(handler), middlewares: Vec::new() };
+        let endpoint = Endpoint { handler: Arc::new(handler), middlewares: Vec::new(), body: BodyConfig::default() };
         self.routes.entry(normalize(path)).or_default().insert(method, endpoint);
+    }
+
+    /// Starts configuring one path: middleware and body settings for the
+    /// handlers registered through the returned builder.
+    ///
+    /// ```rust
+    /// use axeon::{Server, ServerError};
+    /// use axeon::middleware::from_fn;
+    ///
+    /// let mut app = Server::new();
+    /// let require_admin = from_fn(|req, next| async move {
+    ///     if req.get_header("x-admin").is_none() {
+    ///         return Err(ServerError::Forbidden("admins only".into()));
+    ///     }
+    ///     next.handle(req).await
+    /// });
+    ///
+    /// // GET /posts is public; only POST needs the middleware.
+    /// app.route("/posts").get(|_req| async { "all posts" });
+    /// app.route("/posts").middleware(require_admin).post(|_req| async { (201, "created") });
+    ///
+    /// // Uploads: up to 1 GiB, read as a stream instead of buffered.
+    /// app.route("/upload")
+    ///     .body_limit(1 << 30)
+    ///     .stream_body()
+    ///     .post(|req| async move {
+    ///         let size = req.body_stream()?.save_to("/tmp/upload.bin").await?;
+    ///         Ok::<_, ServerError>(format!("saved {} bytes", size))
+    ///     });
+    /// ```
+    pub fn route(&mut self, path: &str) -> RouteBuilder<'_> {
+        RouteBuilder {
+            router: self,
+            path: normalize(path),
+            methods: Vec::new(),
+            middlewares: Vec::new(),
+            body: BodyConfig::default(),
+        }
+    }
+
+    /// Adds a tower [`Layer`](tower_layer::Layer) as middleware for every
+    /// route of this router.
+    pub fn layer<L>(&mut self, layer: L)
+    where
+        crate::tower::TowerMiddleware<L>: Middleware,
+    {
+        self.middleware(crate::tower::TowerMiddleware::new(layer));
     }
 
     /// Adds middleware for every route of this router.
@@ -161,7 +220,7 @@ impl Router {
                     .chain(endpoint.middlewares.iter())
                     .cloned()
                     .collect();
-                entry.insert(method, Endpoint { handler: endpoint.handler, middlewares });
+                entry.insert(method, Endpoint { handler: endpoint.handler, middlewares, body: endpoint.body });
             }
         }
     }
@@ -193,12 +252,109 @@ impl Router {
                         handler: Arc::clone(&endpoint.handler),
                         on_error: on_error.clone(),
                     };
-                    (*method, Route { chain: Arc::new(chain) })
+                    (*method, Route { chain: Arc::new(chain), body: endpoint.body })
                 })
                 .collect();
             routes.push(methods);
         }
         Ok(CompiledRouter { matcher, routes })
+    }
+}
+
+/// Configures the handlers of one path; see [`Router::route`].
+///
+/// Middleware and body settings apply to every handler registered through
+/// this builder, whether added before or after them, and to no other route.
+/// Route middleware runs after global and router middleware.
+pub struct RouteBuilder<'a> {
+    router: &'a mut Router,
+    path: String,
+    methods: Vec<Method>,
+    middlewares: Vec<Arc<dyn Middleware>>,
+    body: BodyConfig,
+}
+
+macro_rules! route_methods {
+    ($($name:ident => $method:ident),* $(,)?) => {
+        $(
+            #[doc = concat!("Registers a ", stringify!($method), " handler for this path.")]
+            pub fn $name<F, R>(&mut self, handler: F) -> &mut Self
+            where
+                F: Fn(Request) -> R + Send + Sync + 'static,
+                R: Future + Send + 'static,
+                R::Output: IntoResponse,
+            {
+                self.add(Method::$method, Arc::new(handler))
+            }
+        )*
+    };
+}
+
+impl RouteBuilder<'_> {
+    route_methods! {
+        get => GET,
+        post => POST,
+        put => PUT,
+        patch => PATCH,
+        delete => DELETE,
+        head => HEAD,
+        options => OPTIONS,
+        connect => CONNECT,
+        trace => TRACE,
+    }
+
+    fn add(&mut self, method: Method, handler: Arc<dyn Handler>) -> &mut Self {
+        let endpoint = Endpoint { handler, middlewares: self.middlewares.clone(), body: self.body };
+        self.router.routes.entry(self.path.clone()).or_default().insert(method, endpoint);
+        if !self.methods.contains(&method) {
+            self.methods.push(method);
+        }
+        self
+    }
+
+    /// Applies `f` to the endpoints already registered through this builder.
+    fn update(&mut self, f: impl Fn(&mut Endpoint)) {
+        if let Some(endpoints) = self.router.routes.get_mut(&self.path) {
+            for method in &self.methods {
+                if let Some(endpoint) = endpoints.get_mut(method) {
+                    f(endpoint);
+                }
+            }
+        }
+    }
+
+    /// Adds middleware for this builder's handlers.
+    pub fn middleware(&mut self, middleware: impl Middleware + 'static) -> &mut Self {
+        let middleware: Arc<dyn Middleware> = Arc::new(middleware);
+        self.middlewares.push(Arc::clone(&middleware));
+        self.update(|endpoint| endpoint.middlewares.push(Arc::clone(&middleware)));
+        self
+    }
+
+    /// Adds a tower [`Layer`](tower_layer::Layer) as middleware for this
+    /// builder's handlers.
+    pub fn layer<L>(&mut self, layer: L) -> &mut Self
+    where
+        crate::tower::TowerMiddleware<L>: Middleware,
+    {
+        self.middleware(crate::tower::TowerMiddleware::new(layer))
+    }
+
+    /// The maximum request body size for these handlers, overriding
+    /// `Server::max_body_size`. Larger requests get 413.
+    pub fn body_limit(&mut self, bytes: usize) -> &mut Self {
+        self.body.limit = Some(bytes);
+        self.update(|endpoint| endpoint.body.limit = Some(bytes));
+        self
+    }
+
+    /// Don't buffer the request body: read it in the handler with
+    /// [`Request::body_stream`] or [`Request::multipart`] as it arrives.
+    /// `req.body` stays empty, also for middleware.
+    pub fn stream_body(&mut self) -> &mut Self {
+        self.body.stream = true;
+        self.update(|endpoint| endpoint.body.stream = true);
+        self
     }
 }
 
@@ -212,6 +368,17 @@ pub(crate) struct CompiledRouter {
 }
 
 impl CompiledRouter {
+    /// The body settings of the route that will handle this request.
+    pub(crate) fn body_config(&self, path: &str, method: Method) -> BodyConfig {
+        let Ok(matched) = self.matcher.at(path) else { return BodyConfig::default() };
+        let routes = &self.routes[*matched.value];
+        routes
+            .get(&method)
+            .or_else(|| (method == Method::HEAD).then(|| routes.get(&Method::GET)).flatten())
+            .map(|route| route.body)
+            .unwrap_or_default()
+    }
+
     /// The routes for `path` and its percent-decoded parameters.
     pub(crate) fn lookup(&self, path: &str) -> Option<RouteMatch<'_>> {
         let matched = self.matcher.at(path).ok()?;

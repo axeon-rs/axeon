@@ -105,18 +105,11 @@ impl Response {
         response
     }
 
-    pub(crate) fn stream_length(&self) -> Option<u64> {
-        self.stream_length
-    }
-
     /// True if the body is a stream rather than `body`.
     pub fn is_streaming(&self) -> bool {
         self.stream.is_some()
     }
 
-    pub(crate) fn take_stream(&mut self) -> Option<BodyStream> {
-        self.stream.take()
-    }
 
     // Chainable status setter
     pub fn status(&mut self, status: u16) -> &mut Self {
@@ -423,4 +416,85 @@ macro_rules! created_json {
    ($($json:tt)+) => {{
          Response::created(&axeon::json!($($json)+))
     }};
+}
+/// Kept on an `http::Response` so a streamed response survives a round trip
+/// through tower layers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StreamMeta {
+    pub(crate) end_on_shutdown: bool,
+    pub(crate) length: Option<u64>,
+}
+
+impl Response {
+    /// Converts to an `http::Response`, deciding the body framing.
+    pub(crate) fn into_http(self) -> http::Response<crate::body::ResponseBody> {
+        use crate::body::ResponseBody;
+        use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+        use http_body_util::StreamBody;
+
+        let Response { status, body, mut headers, stream, end_on_shutdown, stream_length } = self;
+        let status = http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+        let has_body = status_has_body(status.as_u16());
+        // Framing is ours to decide.
+        headers.remove(TRANSFER_ENCODING);
+        headers.remove(CONTENT_LENGTH);
+        let mut meta = None;
+        let body = match stream {
+            Some(stream) if has_body => {
+                if let Some(length) = stream_length {
+                    headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
+                }
+                meta = Some(StreamMeta { end_on_shutdown, length: stream_length });
+                let frames = stream.map(|chunk| chunk.map(http_body::Frame::data));
+                ResponseBody::new(StreamBody::new(frames))
+            }
+            _ => {
+                let body = if has_body { body } else { Bytes::new() };
+                if has_body {
+                    headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+                }
+                ResponseBody::full(body)
+            }
+        };
+        let mut out = http::Response::new(body);
+        *out.status_mut() = status;
+        *out.headers_mut() = headers;
+        if let Some(meta) = meta {
+            out.extensions_mut().insert(meta);
+        }
+        out
+    }
+
+    /// Converts from an `http::Response` with any body type.
+    pub(crate) fn from_http<B>(response: http::Response<B>) -> Response
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
+    {
+        use crate::body::{downcast, ResponseBody};
+        use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+        use http_body_util::BodyExt;
+
+        let (parts, body) = response.into_parts();
+        let meta = parts.extensions.get::<StreamMeta>().copied();
+        let mut out = Response::new(parts.status.as_u16());
+        out.headers = parts.headers;
+        out.headers.remove(CONTENT_LENGTH);
+        out.headers.remove(TRANSFER_ENCODING);
+        match downcast::<B, ResponseBody>(body) {
+            Ok(ours) => match ours.into_parts() {
+                Ok(bytes) => out.body = bytes,
+                Err(stream) => {
+                    out.stream = Some(Box::pin(stream.into_data_stream()));
+                    out.stream_length = meta.and_then(|m| m.length);
+                    out.end_on_shutdown = meta.is_some_and(|m| m.end_on_shutdown);
+                }
+            },
+            Err(other) => {
+                out.stream_length = other.size_hint().exact();
+                out.stream = Some(Box::pin(other.into_data_stream().map(|chunk| chunk.map_err(Into::into))));
+            }
+        }
+        out
+    }
 }
