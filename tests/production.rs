@@ -216,31 +216,39 @@ async fn sse_streams_end_cleanly_on_shutdown() {
 
 #[tokio::test]
 async fn write_timeout_closes_clients_that_stop_reading() {
+    // An endless body: however much the OS buffers (Windows auto-tunes
+    // loopback buffers to tens of megabytes), writes eventually block.
+    static CHUNK: [u8; 64 * 1024] = [b'x'; 64 * 1024];
     let mut app = Server::new();
     app.max_connections(1).write_timeout(Duration::from_millis(200));
-    app.get("/big", |_req| async { vec![b'x'; 32 * 1024 * 1024] });
+    app.get("/endless", |_req| async {
+        let chunks = futures::stream::repeat_with(|| Ok::<_, std::io::Error>(bytes::Bytes::from_static(&CHUNK)));
+        axeon::Response::stream("application/octet-stream", chunks)
+    });
     app.get("/", |_req| async { "ok" });
     let (addr, _trigger, _server) = start_with_shutdown(app).await;
 
-    // This client requests a large body and never reads it.
+    // This client requests the body and never reads it.
     let mut stalled = Client::connect(addr).await;
-    stalled.send(b"GET /big HTTP/1.1\r\nHost: t\r\n\r\n").await;
+    stalled.send(b"GET /endless HTTP/1.1\r\nHost: t\r\n\r\n").await;
 
     // With one connection slot, the next client is served only once the
     // stalled connection is closed by the write timeout.
     let started = Instant::now();
     let mut next = Client::connect(addr).await;
     next.send(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
-    let r = next.read().await.unwrap();
+    let r = timeout(Duration::from_secs(10), next.read_inner(false))
+        .await
+        .expect("the write timeout never freed the slot")
+        .unwrap();
     assert_eq!(r.text(), "ok");
     assert!(started.elapsed() >= Duration::from_millis(150), "slot was free too early");
-    assert!(started.elapsed() < Duration::from_secs(3));
 
-    // The stalled client never gets the whole body.
+    // The stalled connection was closed: reading what was buffered ends.
     let mut raw = Vec::new();
     use tokio::io::AsyncReadExt;
-    let _ = timeout(Duration::from_secs(2), stalled.reader.read_to_end(&mut raw)).await;
-    assert!(raw.len() < 32 * 1024 * 1024);
+    let drained = timeout(Duration::from_secs(10), stalled.reader.read_to_end(&mut raw)).await;
+    assert!(drained.is_ok(), "the stalled connection was never closed");
 }
 
 #[tokio::test]
