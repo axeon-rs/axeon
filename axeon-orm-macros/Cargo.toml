@@ -1,0 +1,16 @@
+[package]
+name = "axeon-orm-macros"
+version = "0.1.0"
+edition = "2021"
+description = "Derive macros for axeon-orm"
+license = "MIT"
+repository = "https://github.com/axeon-rs/axeon"
+documentation = "https://docs.rs/axeon-orm"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

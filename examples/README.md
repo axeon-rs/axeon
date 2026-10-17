@@ -17,7 +17,7 @@ cargo run --example <example_name>
 - **middleware**: How to use and create middleware for request/response processing
 - **realtime**: Plain-value handlers, closure middleware, server-sent events and WebSockets
 - **production**: Logging with request IDs, security middleware, health checks, metrics and graceful shutdown
-- **[todo-api](todo-api)**: A complete REST API (its own crate): SQLite via sqlx, JWT login, validation, tests. Run it with `cd todo-api && cargo run`.
+- **[todo-api](todo-api)**: A complete REST API (its own crate): SQLite via axeon-orm with migrations, JWT login, validation, tests. Run it with `cd todo-api && cargo run`.
 
 ## Example Structure
 

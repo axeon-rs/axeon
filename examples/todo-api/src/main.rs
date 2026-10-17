@@ -20,10 +20,10 @@ async fn main() {
     });
     tracing_subscriber::fmt().with_target(false).init();
 
-    let pool = connect(&config.database_url).await.expect("database connection failed");
+    let db = connect(&config.database_url).await.expect("database setup failed");
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await.expect("can't bind port");
 
-    let mut server = app(pool, config);
+    let mut server = app(db, config);
     // On SIGTERM: report not-ready for 5s so load balancers move away, then
     // finish in-flight requests (up to 30s).
     server.shutdown_delay(Duration::from_secs(5)).shutdown_timeout(Duration::from_secs(30));

@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use todo_api::{app, connect, Config};
 
 async fn test_app() -> App {
-    let pool = connect("sqlite::memory:").await.unwrap();
+    let db = connect("sqlite::memory:").await.unwrap();
     let config = Config {
         database_url: "sqlite::memory:".into(),
         port: 0,
@@ -13,7 +13,7 @@ async fn test_app() -> App {
         admin_password: "s3cret".into(),
         allowed_origins: vec![],
     };
-    app(pool, config).into_app().await.unwrap()
+    app(db, config).into_app().await.unwrap()
 }
 
 fn body(res: &Response) -> Value {

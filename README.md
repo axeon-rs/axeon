@@ -372,6 +372,45 @@ config::load_dotenv().expect("invalid .env");
 let config: Config = config::from_env().expect("invalid configuration"); // lists every problem
 ```
 
+### Databases
+
+[axeon-orm](axeon-orm) is the companion ORM: models are plain structs, with
+typed queries, relations, migrations and pagination, for PostgreSQL and
+SQLite (built on sqlx). It plugs into Axeon: `?` turns "not found" into a
+404 and constraint violations into a 409, and `Transactional` wraps each
+request in a transaction.
+
+```rust,ignore
+use axeon::{Json, Server, ServerError};
+use axeon_orm::prelude::*;
+
+#[derive(Model, serde::Serialize)]
+struct Post {
+    id: i64,
+    title: String,
+    published: bool,
+}
+
+let db = Db::connect("postgres://localhost/blog").await?;
+axeon_orm::embed_migrations!().run(&db).await?;
+
+let mut app = Server::new();
+app.state(db);
+app.get("/posts", |req| async move {
+    let page = req.query_param("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+    let posts = Post::query()
+        .filter(Post::PUBLISHED.eq(true))
+        .order_by(Post::ID.desc())
+        .paginate(req.db()?, page, 20)
+        .await?;
+    Ok::<_, ServerError>(Json(posts))
+});
+```
+
+Prefer plain sqlx, SeaORM or Diesel? Put the pool in `app.state(pool)` and
+read it with `req.state::<PgPool>()`; Axeon doesn't depend on any database
+crate.
+
 ### Templates, static files and uploads
 
 ```rust
@@ -546,8 +585,8 @@ cargo run --example production  # logging, security middleware, graceful shutdow
 ```
 
 [`examples/todo-api`](examples/todo-api) is a complete REST API: SQLite via
-sqlx, JWT login, validation, health checks with a database ping, metrics,
-graceful shutdown, and tests.
+axeon-orm with migrations, JWT login, validation, health checks with a
+database ping, metrics, graceful shutdown, and tests.
 
 ## Documentation
 

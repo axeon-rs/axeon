@@ -1,0 +1,42 @@
+[package]
+name = "axeon-orm"
+version = "0.1.0"
+edition = "2021"
+description = "An Eloquent-style ORM for Rust on top of sqlx, with first-class Axeon integration"
+license = "MIT"
+repository = "https://github.com/axeon-rs/axeon"
+documentation = "https://docs.rs/axeon-orm"
+readme = "README.md"
+exclude = ["docker-compose.yml"]
+keywords = ["orm", "database", "sqlx", "postgres", "sqlite"]
+categories = ["database", "web-programming"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+axeon-orm-macros = { version = "0.1.0", path = "../axeon-orm-macros" }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
+futures = { version = "0.3.31", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["sync"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
+uuid = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+axeon = { version = "1.0.0-rc.1", path = "..", default-features = false, optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+
+[features]
+default = ["postgres", "sqlite", "chrono", "json", "axeon"]
+# Database backends; enable at least one.
+postgres = ["sqlx/postgres"]
+sqlite = ["sqlx/sqlite"]
+# Column types.
+chrono = ["dep:chrono", "sqlx/chrono"]
+uuid = ["dep:uuid", "sqlx/uuid"]
+json = ["dep:serde_json", "sqlx/json"]
+# `req.db()`, the `Transactional` middleware and error conversion for Axeon.
+axeon = ["dep:axeon"]

@@ -62,6 +62,34 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - run: cargo bench --no-run
 
+  orm:
+    name: axeon-orm (SQLite and PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      AXEON_ORM_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p axeon-orm -p axeon-orm-macros --all-features
+      - run: cargo check -p axeon-orm --no-default-features --features sqlite --all-targets
+      - run: cargo check -p axeon-orm --no-default-features --features postgres --all-targets
+      - run: cargo clippy -p axeon-orm -p axeon-orm-macros --all-targets --all-features
+      - run: cargo doc -p axeon-orm --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   audit:
     name: Security audit
     runs-on: ubuntu-latest

@@ -1,0 +1,5 @@
+CREATE TABLE accounts (
+    id BIGINT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    balance BIGINT NOT NULL DEFAULT 0
+);

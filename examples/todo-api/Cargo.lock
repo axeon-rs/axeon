@@ -129,6 +129,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "axeon-orm"
+version = "0.1.0"
+dependencies = [
+ "axeon",
+ "axeon-orm-macros",
+ "futures",
+ "serde",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
+name = "axeon-orm-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1793,9 +1814,9 @@ name = "todo-api"
 version = "0.1.0"
 dependencies = [
  "axeon",
+ "axeon-orm",
  "serde",
  "serde_json",
- "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",

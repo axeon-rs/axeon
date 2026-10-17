@@ -1,0 +1,14 @@
+# PostgreSQL for the axeon-orm tests:
+#   docker compose -f axeon-orm/docker-compose.yml up -d
+#   AXEON_ORM_POSTGRES_URL=postgres://postgres:postgres@localhost:55432/postgres cargo test -p axeon-orm
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 30

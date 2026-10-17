@@ -105,8 +105,9 @@ toolkit, and production hardening. Upgrading from 0.4? See
 - The `ok_json!`, `created_json!` and `middlewares!` macros.
 - `Method::from_string`, `ParseError`, `CorsConfig`, `RateLimitConfig`,
   `SecurityConfig`, `CompressionConfig`.
-- The `buffer` module (unused) and the `database` module: keep your
-  database pool (e.g. sqlx's) in app state with `Server::state`.
+- The `buffer` module (unused) and the `database` module: use the new
+  companion crate [axeon-orm](axeon-orm), or keep any database pool (e.g.
+  sqlx's) in app state with `Server::state`.
 - The `cache` module and feature: use [moka](https://docs.rs/moka) directly,
   shared through `Server::state`.
 
@@ -295,7 +296,7 @@ Version 0.3.0 was never published; everything since 0.2.0 is in this release.
 | `SecurityHeaders::new(SecurityConfig::default())` | `SecurityHeaders::new()` |
 | `CompressionMiddleware::new(CompressionConfig::default())` | `Compression::new()` |
 | `ServerError::TooManyRequests` | `ServerError::TooManyRequests { retry_after: None }` |
-| `axeon::database::ConnectionPool` | your database crate's pool (e.g. `sqlx::PgPool`) in `app.state(..)` |
+| `axeon::database::ConnectionPool` | `axeon_orm::Db`, or your database crate's pool (e.g. `sqlx::PgPool`), in `app.state(..)` |
 | `axeon::cache::CacheManager` | `moka::future::Cache` in `app.state(..)` |
 | `req.params().get("id")` returning `Option<&String>` | returns `Option<&str>` |
 | `ServerError::ParseError(..)` | `ServerError::ValidationError(..)` |

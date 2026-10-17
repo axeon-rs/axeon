@@ -7,9 +7,8 @@ use axeon::metrics::Metrics;
 use axeon::middleware::{Compression, Cors, RateLimiter, RequestLogger, SecurityHeaders, SetRequestId};
 use axeon::validate::{length_between, Validate, ValidationErrors};
 use axeon::{Json, Router, Server, ServerError, ServerResult};
+use axeon_orm::prelude::*;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use std::fmt::Display;
 
 /// Settings from environment variables (and `.env`).
 #[derive(Clone, Deserialize)]
@@ -35,33 +34,11 @@ fn default_port() -> u16 {
     3000
 }
 
-/// Opens the database and creates the table.
-pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
-    let options = if url.contains(":memory:") {
-        // An in-memory database lives in one connection: use exactly one
-        // and never close it.
-        SqlitePoolOptions::new().max_connections(1).min_connections(1).idle_timeout(None).max_lifetime(None)
-    } else {
-        SqlitePoolOptions::new().max_connections(8)
-    };
-    let pool = options.connect(url).await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS todos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner TEXT NOT NULL,
-            title TEXT NOT NULL,
-            done BOOLEAN NOT NULL DEFAULT FALSE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    Ok(pool)
-}
-
-/// Logs a database error and answers 500 without exposing details.
-fn internal(error: impl Display) -> ServerError {
-    tracing::error!(%error, "database error");
-    ServerError::InternalError("something went wrong".to_string())
+/// Opens the database and applies any pending migrations.
+pub async fn connect(url: &str) -> axeon_orm::Result<Db> {
+    let db = Db::connect(url).await?;
+    axeon_orm::embed_migrations!().run(&db).await?;
+    Ok(db)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -70,9 +47,11 @@ struct Claims {
     exp: u64,
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Model, Serialize)]
 struct Todo {
     id: i64,
+    #[serde(skip)]
+    owner: String,
     title: String,
     done: bool,
 }
@@ -116,15 +95,14 @@ impl Validate for UpdateTodo {
 #[derive(Deserialize)]
 struct ListQuery {
     done: Option<bool>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    limit: Option<u64>,
+    offset: Option<u64>,
 }
 
 impl Validate for ListQuery {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
         errors.check(self.limit.is_none_or(|l| (1..=100).contains(&l)), "limit", "must be 1 to 100");
-        errors.check(self.offset.is_none_or(|o| o >= 0), "offset", "must not be negative");
         errors.into_result()
     }
 }
@@ -136,17 +114,19 @@ fn owner(req: &axeon::Request) -> ServerResult<String> {
         .ok_or_else(|| ServerError::Unauthorized("sign in first".to_string()))
 }
 
-fn db(req: &axeon::Request) -> SqlitePool {
-    req.state::<SqlitePool>().expect("pool registered with app.state").clone()
+/// The signed-in user's to-do with this id, if any.
+fn mine(req: &axeon::Request) -> ServerResult<axeon_orm::Query<Todo>> {
+    let id: i64 = req.param("id")?;
+    Ok(Todo::query().filter(Todo::ID.eq(id) & Todo::OWNER.eq(owner(req)?)))
 }
 
 /// Builds the whole application.
-pub fn app(pool: SqlitePool, config: Config) -> Server {
+pub fn app(db: Db, config: Config) -> Server {
     let jwt = Jwt::hs256(config.jwt_secret.as_bytes()).issuer("todo-api");
     let metrics = Metrics::new();
 
     let mut app = Server::new();
-    app.state(pool.clone()).state(jwt.clone()).state(config.clone());
+    app.state(db.clone()).state(jwt.clone()).state(config.clone());
 
     // Every request: IDs, logs, metrics, security headers, compression, limits.
     let cors = config.allowed_origins.iter().fold(Cors::new(), |cors, origin| cors.allow_origin(origin.as_str()));
@@ -159,13 +139,7 @@ pub fn app(pool: SqlitePool, config: Config) -> Server {
         .middleware(RateLimiter::per_minute(600).burst(100));
 
     // Operations: /health, /ready (checks the database) and /metrics.
-    let check_pool = pool.clone();
-    app.mount("/", Health::new()
-        .check("database", move || {
-            let pool = check_pool.clone();
-            async move { sqlx::query("SELECT 1").execute(&pool).await.map(|_| ()) }
-        })
-        .router());
+    app.mount("/", Health::new().database(&db).router());
     app.mount("/", metrics.router());
 
     // POST /auth/token: exchange the demo credentials for a token.
@@ -187,72 +161,49 @@ pub fn app(pool: SqlitePool, config: Config) -> Server {
 
     todos.get("/", |req| async move {
         let query: ListQuery = req.valid_query()?;
-        let todos: Vec<Todo> = sqlx::query_as(
-            "SELECT id, title, done FROM todos WHERE owner = ? AND (? IS NULL OR done = ?)
-             ORDER BY id LIMIT ? OFFSET ?",
-        )
-        .bind(owner(&req)?)
-        .bind(query.done)
-        .bind(query.done)
-        .bind(query.limit.unwrap_or(20))
-        .bind(query.offset.unwrap_or(0))
-        .fetch_all(&db(&req))
-        .await
-        .map_err(internal)?;
+        let mut todos = Todo::query().filter(Todo::OWNER.eq(owner(&req)?));
+        if let Some(done) = query.done {
+            todos = todos.filter(Todo::DONE.eq(done));
+        }
+        let todos = todos
+            .order_by(Todo::ID.asc())
+            .limit(query.limit.unwrap_or(20))
+            .offset(query.offset.unwrap_or(0))
+            .all(req.db()?)
+            .await?;
         Ok::<_, ServerError>(Json(todos))
     });
 
     todos.post("/", |req| async move {
         let new: NewTodo = req.valid_json()?;
-        let todo: Todo = sqlx::query_as("INSERT INTO todos (owner, title) VALUES (?, ?) RETURNING id, title, done")
-            .bind(owner(&req)?)
-            .bind(new.title.trim())
-            .fetch_one(&db(&req))
-            .await
-            .map_err(internal)?;
+        let todo = Todo { id: 0, owner: owner(&req)?, title: new.title.trim().to_string(), done: false };
+        let todo = todo.insert(req.db()?).await?;
         Ok::<_, ServerError>((201, Json(todo)))
     });
 
     todos.get("/:id", |req| async move {
-        let id: i64 = req.param("id")?;
-        let todo: Option<Todo> = sqlx::query_as("SELECT id, title, done FROM todos WHERE id = ? AND owner = ?")
-            .bind(id)
-            .bind(owner(&req)?)
-            .fetch_optional(&db(&req))
-            .await
-            .map_err(internal)?;
+        let todo = mine(&req)?.first(req.db()?).await?;
         Ok::<_, ServerError>(todo.map(Json)) // None becomes 404
     });
 
     todos.patch("/:id", |req| async move {
-        let id: i64 = req.param("id")?;
         let update: UpdateTodo = req.valid_json()?;
-        let todo: Option<Todo> = sqlx::query_as(
-            "UPDATE todos SET title = COALESCE(?, title), done = COALESCE(?, done)
-             WHERE id = ? AND owner = ? RETURNING id, title, done",
-        )
-        .bind(update.title.as_deref().map(str::trim))
-        .bind(update.done)
-        .bind(id)
-        .bind(owner(&req)?)
-        .fetch_optional(&db(&req))
-        .await
-        .map_err(internal)?;
-        Ok::<_, ServerError>(todo.map(Json))
+        let mut todo = mine(&req)?.first_or_fail(req.db()?).await?;
+        if let Some(title) = update.title {
+            todo.title = title.trim().to_string();
+        }
+        if let Some(done) = update.done {
+            todo.done = done;
+        }
+        todo.update(req.db()?).await?;
+        Ok::<_, ServerError>(Json(todo))
     });
 
     todos.delete("/:id", |req| async move {
-        let id: i64 = req.param("id")?;
-        let result = sqlx::query("DELETE FROM todos WHERE id = ? AND owner = ?")
-            .bind(id)
-            .bind(owner(&req)?)
-            .execute(&db(&req))
-            .await
-            .map_err(internal)?;
-        if result.rows_affected() == 0 {
-            return Err(ServerError::NotFound);
+        match mine(&req)?.delete(req.db()?).await? {
+            0 => Err(ServerError::NotFound),
+            _ => Ok(()),
         }
-        Ok(())
     });
 
     app.mount("/todos", todos);
