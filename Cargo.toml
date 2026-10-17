@@ -1,8 +1,8 @@
 [package]
 name = "axeon"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "A modern and flexible backend server framework for Rust"
+description = "A fast, Express-style web framework for Rust, built on hyper"
 license = "MIT"
 authors = ["sketch"]
 repository = "https://github.com/axeon-rs/axeon"
@@ -10,6 +10,9 @@ documentation = "https://docs.rs/axeon"
 readme = "README.md"
 keywords = ["web", "framework", "server", "http", "async"]
 categories = ["web-programming::http-server", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 futures = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }

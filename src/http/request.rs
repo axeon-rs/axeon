@@ -51,7 +51,7 @@ impl Method {
         }
     }
 
-    #[deprecated(since = "0.3.0", note = "unknown methods silently became GET; use `Method::parse`")]
+    #[deprecated(since = "0.4.0", note = "unknown methods silently became GET; use `Method::parse`")]
     pub fn from_string(s: &str) -> Method {
         Method::parse(s).unwrap_or(Method::GET)
     }

@@ -1,122 +1,86 @@
-//! # Axeon
-//!
-//! A modern, flexible, and feature-rich web framework for Rust.
-//!
-//! ## Features
-//!
-//! - Express-style routing with support for path parameters and query parameters
-//! - Modular router system with mounting capabilities
-//! - Powerful middleware system for request/response processing
-//! - Built-in security features and authentication support
-//! - JSON request/response handling with type safety
-//! - Async/await support throughout the framework
-//!
-//! ## Quick Start
+//! A fast, Express-style web framework for Rust, built on
+//! [hyper](https://hyper.rs).
 //!
 //! ```rust,no_run
-//! use axeon::{Response, Server};
+//! use axeon::{Json, Server, ServerError, json};
 //!
 //! fn main() {
 //!     let mut app = Server::new();
-//!     app.get("/", |_req| async {
-//!         Response::text("Hello, World!")
+//!     app.get("/", |_req| async { "Hello, World!" });
+//!     app.get("/users/:id", |req| async move {
+//!         let id: u64 = req.param("id")?;
+//!         Ok::<_, ServerError>(Json(json!({ "id": id })))
 //!     });
-//!     app.listen("127.0.0.1:3000")
-//!         .expect("Server failed to start");
+//!     // Serves until Ctrl+C or SIGTERM, then shuts down gracefully.
+//!     app.listen("127.0.0.1:3000").expect("server failed to start");
 //! }
 //! ```
 //!
-//! ## Routing Examples
+//! # Overview
 //!
-//! ### Basic Routes
+//! - [`Server`] registers routes (`get`, `post`, ...), middleware and
+//!   settings, then serves with [`Server::listen`], [`Server::serve`] or
+//!   [`Server::serve_with_shutdown`].
+//! - [`Router`] groups routes to [`mount`](Server::mount) under a prefix.
+//!   Paths use `:name` parameters and `*name` catch-alls.
+//! - Handlers are async closures taking a [`Request`] and returning anything
+//!   that implements [`IntoResponse`]: text, [`Json`], [`Html`], bytes,
+//!   `(status, body)`, `Option`, `Result` or a [`Response`].
+//! - [`Request`] has typed helpers: [`param`](Request::param),
+//!   [`json`](Request::json), [`query_as`](Request::query_as),
+//!   [`form`](Request::form), [`state`](Request::state) and
+//!   [`extension`](Request::extension).
+//! - Errors are [`ServerError`]s, turned into responses by the status they
+//!   carry or by [`Server::on_error`].
+//! - [`middleware`] has [`from_fn`](middleware::from_fn) for closure
+//!   middleware, the [`Middleware`](middleware::Middleware) trait, and
+//!   built-ins for request IDs, logging, security headers, CORS, rate limiting
+//!   and compression.
+//! - [`sse`] streams server-sent events, [`Response::stream`] streams any
+//!   body, and [`ws`] (feature `ws`) accepts WebSockets.
+//! - [`Server::into_app`] builds an [`App`] that handles requests in-process,
+//!   for tests.
+//!
+//! # Example: an API with middleware
 //!
 //! ```rust
-//! use axeon::{Response, Server};
-//!
-//! let mut app = Server::new();
-//!
-//! // Basic route
-//! app.get("/", |_req| async {
-//!     Response::text("Welcome!")
-//! });
-//!
-//! // Route with path parameter
-//! app.get("/users/:id", |req| async move {
-//!     let user_id = req.params.get("id").unwrap();
-//!     Response::text(format!("User ID: {}", user_id))
-//! });
-//! ```
-//!
-//! ### JSON Handling
-//!
-//! ```rust
-//! use axeon::{Response, Server, ServerError};
+//! use axeon::{Json, Router, Server, ServerError};
+//! use axeon::middleware::{from_fn, RequestLogger, SetRequestId};
 //! use serde::{Deserialize, Serialize};
 //!
-//! #[derive(Serialize, Deserialize)]
-//! struct User {
-//!     name: String,
-//!     role: String,
+//! #[derive(Deserialize, Serialize)]
+//! struct Todo {
+//!     title: String,
+//!     done: bool,
 //! }
 //!
 //! let mut app = Server::new();
-//! app.post("/users", |req| async move {
-//!     match req.body.json::<User>() {
-//!         Some(user) => Response::ok(&user),
-//!         None => Err(ServerError::BadRequest("Invalid JSON body".to_string())),
-//!     }
-//! });
-//! ```
+//! app.middleware(SetRequestId::new());
+//! app.middleware(RequestLogger::new());
 //!
-//! ## Middleware System
-//!
-//! ```rust
-//! use axeon::{Request, Response, ServerError};
-//! use axeon::middleware::{Middleware, MiddlewareResult, Next};
-//! use std::time::Instant;
-//!
-//! // Example logging middleware
-//! struct Logger;
-//! impl Middleware for Logger {
-//!     fn call(&self, req: Request, next: Next) -> MiddlewareResult {
-//!         Box::pin(async move {
-//!             let start = Instant::now();
-//!             let method = req.method.clone();
-//!             let url = req.path.clone();
-//!             
-//!             let res = next.handle(req).await;
-//!             
-//!             let status = match &res {
-//!                 Ok(res) => res.status,
-//!                 Err(err) => err.status_code(),
-//!             };
-//!             println!("[{}] {:?} {} - {}ms", status, method, url, start.elapsed().as_millis());
-//!             res
-//!         })
-//!     }
-//! }
-//! ```
-//!
-//! ## Router Groups
-//!
-//! ```rust
-//! use axeon::{Router, Server, Response};
-//!
-//! let mut app = Server::new();
 //! let mut api = Router::new();
-//!
-//! // API routes
-//! api.get("/status", |_req| async {
-//!     Response::ok(&serde_json::json!({
-//!         "status": "operational",
-//!         "version": "1.0.0"
-//!     }))
+//! api.middleware(from_fn(|req, next| async move {
+//!     if req.get_header("authorization").is_none() {
+//!         return Err(ServerError::Unauthorized("login required".into()));
+//!     }
+//!     next.handle(req).await
+//! }));
+//! api.post("/todos", |req| async move {
+//!     let todo: Todo = req.json()?;
+//!     Ok::<_, ServerError>((201, Json(todo)))
 //! });
-//!
-//! // Mount API routes with prefix
 //! app.mount("/api", api);
 //! ```
 //!
+//! # Cargo features
+//!
+//! All on by default: `tls` (HTTPS via rustls), `compression` (gzip/deflate
+//! middleware), `ws` (WebSockets) and `cache` (moka-backed cache helpers).
+//!
+//! See the [README](https://github.com/axeon-rs/axeon#readme) for a full
+//! guide and the [changelog](https://github.com/axeon-rs/axeon/blob/master/CHANGELOG.md)
+//! for upgrading from 0.2.
+
 pub extern crate serde_json;
 pub(crate) mod app;
 pub mod buffer;

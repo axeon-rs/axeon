@@ -1,10 +1,12 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.4.0 (unreleased)
 
 A rewrite of the server internals on [hyper](https://hyper.rs), with HTTP/2,
 an Express-style handler API, realtime features and production tooling.
 See [Migrating from 0.2](#migrating-from-02) below.
+
+Version 0.3.0 was never published; everything since 0.2.0 is in this release.
 
 ### Added
 
@@ -97,6 +99,9 @@ See [Migrating from 0.2](#migrating-from-02) below.
   before.
 - **`Method::from_string`** is deprecated; use `Method::parse`, which returns
   `None` for unknown methods.
+- **`Cargo.toml`**: `axeon = "0.4"`. All optional features (`tls`,
+  `compression`, `ws`, `cache`) are on by default; with
+  `default-features = false`, list the ones you use.
 - **`RateLimitConfig`** has a `trust_proxy` field; **`ServerError`** is
   `#[non_exhaustive]`, so add a `_ =>` arm when matching it.
 - **Logs** go through `tracing`: install a subscriber
