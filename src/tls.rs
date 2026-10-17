@@ -1,9 +1,8 @@
 //! HTTPS support (the default `tls` feature).
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
-use std::fs::File;
-use std::io::BufReader as StdBufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
@@ -25,20 +24,15 @@ impl TlsConfig {
     }
 
     fn load_certs(&self) -> Result<Vec<CertificateDer<'static>>, BoxError> {
-        let cert_file = File::open(&self.cert_file)?;
-        let mut reader = StdBufReader::new(cert_file);
-        let certs = rustls_pemfile::certs(&mut reader)
-            .filter_map(|result| result.ok())
-            .collect();
+        let certs = CertificateDer::pem_file_iter(&self.cert_file)?.collect::<Result<Vec<_>, _>>()?;
+        if certs.is_empty() {
+            return Err(format!("no certificates found in {}", self.cert_file.display()).into());
+        }
         Ok(certs)
     }
 
     fn load_key(&self) -> Result<PrivateKeyDer<'static>, BoxError> {
-        let key_file = File::open(&self.key_file)?;
-        let mut reader = StdBufReader::new(key_file);
-        let key = rustls_pemfile::private_key(&mut reader)?
-            .ok_or("No private key found")?;
-        Ok(key)
+        Ok(PrivateKeyDer::from_pem_file(&self.key_file)?)
     }
 
     pub(crate) fn acceptor(&self) -> Result<TlsAcceptor, BoxError> {
