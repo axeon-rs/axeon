@@ -1,32 +1,68 @@
-//! PostgreSQL-specific behaviour: concurrency, locking, strict typing and
-//! large eager loads. Runs when `AXEON_ORM_POSTGRES_URL` is set, e.g.
-//! `docker run -d -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:17`
-//! and `AXEON_ORM_POSTGRES_URL=postgres://postgres:postgres@localhost:55432/postgres`.
+//! Server-database behaviour, against PostgreSQL and MySQL: concurrency,
+//! locking, strict typing and large eager loads. Each backend runs when its
+//! URL is set, e.g. with `docker compose -f axeon-orm/docker-compose.yml up -d`:
+//!
+//! - `AXEON_ORM_POSTGRES_URL=postgres://postgres:postgres@localhost:55432/postgres`
+//! - `AXEON_ORM_MYSQL_URL=mysql://root:mysql@localhost:53306/axeon`
 
-#![cfg(all(feature = "postgres", feature = "chrono", feature = "json"))]
+#![cfg(all(any(feature = "postgres", feature = "mysql"), feature = "chrono", feature = "json"))]
 
 use axeon_orm::migrate::{Migration, Migrator};
 use axeon_orm::sqlx::types::Json;
-use axeon_orm::{Db, DbOptions, Error, Model};
+use axeon_orm::{Backend, Db, DbOptions, Error, Model};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// A fresh schema per test, or `None` (skip) without a database URL.
-async fn db(name: &str) -> Option<Db> {
-    let Ok(url) = std::env::var("AXEON_ORM_POSTGRES_URL") else {
-        eprintln!("skipping: AXEON_ORM_POSTGRES_URL is not set");
-        return None;
-    };
-    let schema = format!("axeon_orm_pg_{}", name);
-    let admin = Db::connect(&url).await.unwrap();
-    admin.execute(&format!("DROP SCHEMA IF EXISTS {0} CASCADE; CREATE SCHEMA {0}", schema)).await.unwrap();
-    admin.close().await;
-    Some(connect(&url, &schema, DbOptions::new().max_connections(20)).await)
+/// One test's database: a fresh PostgreSQL schema or MySQL database.
+struct Target {
+    backend: Backend,
+    url: String,
+    scope: String,
 }
 
-async fn connect(url: &str, schema: &str, options: DbOptions) -> Db {
-    let separator = if url.contains('?') { '&' } else { '?' };
-    Db::connect_with(&format!("{}{}options=-c%20search_path%3D{}", url, separator, schema), options).await.unwrap()
+impl Target {
+    /// `None` (skip) when the backend's URL isn't set.
+    async fn new(backend: Backend, name: &str) -> Option<Target> {
+        let (var, prefix) = match backend {
+            Backend::Postgres => ("AXEON_ORM_POSTGRES_URL", "axeon_orm_pg_"),
+            _ => ("AXEON_ORM_MYSQL_URL", "axeon_orm_my_"),
+        };
+        let Ok(url) = std::env::var(var) else {
+            eprintln!("skipping: {} is not set", var);
+            return None;
+        };
+        let scope = format!("{}{}", prefix, name);
+        let admin = Db::connect(&url).await.unwrap();
+        let reset = match backend {
+            Backend::Postgres => format!("DROP SCHEMA IF EXISTS {0} CASCADE; CREATE SCHEMA {0}", scope),
+            _ => format!("DROP DATABASE IF EXISTS {0}; CREATE DATABASE {0}", scope),
+        };
+        admin.execute(&reset).await.unwrap();
+        admin.close().await;
+        Some(Target { backend, url, scope })
+    }
+
+    /// A new pool on this test's schema or database.
+    async fn connect(&self, options: DbOptions) -> Db {
+        let url = match self.backend {
+            Backend::Postgres => {
+                let separator = if self.url.contains('?') { '&' } else { '?' };
+                format!("{}{}options=-c%20search_path%3D{}", self.url, separator, self.scope)
+            }
+            _ => format!("{}/{}", self.url.rsplit_once('/').unwrap().0, self.scope),
+        };
+        let db = Db::connect_with(&url, options).await.unwrap();
+        assert_eq!(db.backend(), self.backend);
+        db
+    }
+
+    async fn db(&self) -> Db {
+        self.connect(DbOptions::new().max_connections(20)).await
+    }
+
+    fn mysql(&self) -> bool {
+        self.backend == Backend::MySql
+    }
 }
 
 #[derive(Model, Clone, Debug, PartialEq)]
@@ -67,9 +103,8 @@ struct Sample {
     settings: Option<Json<Settings>>,
 }
 
-#[tokio::test]
-async fn every_type_and_typed_nulls_round_trip() {
-    let Some(db) = db("types").await else { return };
+async fn every_type_and_typed_nulls_round_trip(t: &Target) {
+    let db = t.db().await;
     db.create_table::<Sample>().await.unwrap();
 
     // All NULL: each parameter must carry its column's type for PostgreSQL.
@@ -125,14 +160,13 @@ async fn every_type_and_typed_nulls_round_trip() {
 }
 
 #[cfg(feature = "uuid")]
-#[tokio::test]
-async fn uuid_primary_keys() {
+async fn uuid_primary_keys(t: &Target) {
     #[derive(Model, Clone, Debug, PartialEq)]
     struct Token {
         id: uuid::Uuid,
         owner: Option<uuid::Uuid>,
     }
-    let Some(db) = db("uuid").await else { return };
+    let db = t.db().await;
     db.create_table::<Token>().await.unwrap();
     let id = uuid::Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
     let token = Token { id, owner: None }.insert(&db).await.unwrap();
@@ -141,9 +175,8 @@ async fn uuid_primary_keys() {
     assert!(matches!(token.insert(&db).await, Err(Error::UniqueViolation(_))));
 }
 
-#[tokio::test]
-async fn concurrent_writes_through_the_pool() {
-    let Some(db) = db("concurrency").await else { return };
+async fn concurrent_writes_through_the_pool(t: &Target) {
+    let db = t.db().await;
     db.create_table::<Owner>().await.unwrap();
     db.create_table::<Item>().await.unwrap();
     let owner = Owner { id: 0, name: "pool".into() }.insert(&db).await.unwrap();
@@ -183,12 +216,11 @@ async fn concurrent_writes_through_the_pool() {
     assert_eq!(won, 1);
 }
 
-#[tokio::test]
-async fn concurrent_migrations_apply_once() {
-    let Some(db) = db("migrate_race").await else { return };
-    let url = std::env::var("AXEON_ORM_POSTGRES_URL").unwrap();
+async fn concurrent_migrations_apply_once(t: &Target) {
+    let db = t.db().await;
+    let sleep = if t.mysql() { "SELECT SLEEP(0.3);" } else { "SELECT pg_sleep(0.3);" };
     let migrator = Migrator::new(vec![
-        Migration::new(1, "slow", "CREATE TABLE ledger (id BIGINT PRIMARY KEY); SELECT pg_sleep(0.3);"),
+        Migration::new(1, "slow", format!("CREATE TABLE ledger (id BIGINT PRIMARY KEY); {}", sleep)),
         Migration::new(2, "seed", "INSERT INTO ledger (id) VALUES (1);"),
     ]);
 
@@ -196,7 +228,7 @@ async fn concurrent_migrations_apply_once() {
     let mut handles = Vec::new();
     for _ in 0..8 {
         let migrator = migrator.clone();
-        let other = connect(&url, "axeon_orm_pg_migrate_race", DbOptions::new().max_connections(2)).await;
+        let other = t.connect(DbOptions::new().max_connections(2)).await;
         handles.push(tokio::spawn(async move { migrator.run(&other).await }));
     }
     let mut applied = Vec::new();
@@ -209,18 +241,21 @@ async fn concurrent_migrations_apply_once() {
     assert!(migrator.pending(&db).await.unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn eager_loading_beyond_the_parameter_chunk() {
-    let Some(db) = db("big_load").await else { return };
+async fn eager_loading_beyond_the_parameter_chunk(t: &Target) {
+    let db = t.db().await;
     db.create_table::<Owner>().await.unwrap();
     db.create_table::<Item>().await.unwrap();
     // 12,000 owners (more than two 5,000-key chunks), one item per third.
-    db.execute(
+    let seed = if t.mysql() {
+        "SET SESSION cte_max_recursion_depth = 20000;
+         INSERT INTO owners (name) WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 12000)
+             SELECT CONCAT('owner ', n) FROM seq;
+         INSERT INTO items (owner_id, code) SELECT id, CONCAT('code ', id) FROM owners WHERE id % 3 = 0;"
+    } else {
         "INSERT INTO owners (name) SELECT 'owner ' || n FROM generate_series(1, 12000) AS n;
-         INSERT INTO items (owner_id, code) SELECT id, 'code ' || id FROM owners WHERE id % 3 = 0;",
-    )
-    .await
-    .unwrap();
+         INSERT INTO items (owner_id, code) SELECT id, 'code ' || id FROM owners WHERE id % 3 = 0;"
+    };
+    db.execute(seed).await.unwrap();
 
     let owners = Owner::query().order_by(Owner::ID.asc()).with(Owner::ITEMS).all(&db).await.unwrap();
     assert_eq!(owners.len(), 12_000);
@@ -234,26 +269,32 @@ async fn eager_loading_beyond_the_parameter_chunk() {
     assert_eq!(Owner::query().filter(Owner::ID.is_in(ids)).count(&db).await.unwrap(), 12_000);
 }
 
-#[tokio::test]
-async fn errors_inside_transactions() {
-    let Some(db) = db("tx_errors").await else { return };
+async fn errors_inside_transactions(t: &Target) {
+    let db = t.db().await;
     db.create_table::<Owner>().await.unwrap();
     db.create_table::<Item>().await.unwrap();
     let owner = Owner { id: 0, name: "tx".into() }.insert(&db).await.unwrap();
     Item { id: 0, owner_id: owner.id, code: "taken".into() }.insert(&db).await.unwrap();
 
     // After an error PostgreSQL rejects further statements in the
-    // transaction; rolling back must still work and leave nothing behind.
+    // transaction (MySQL carries on); rolling back must still work and
+    // leave nothing behind.
     let mut tx = db.begin().await.unwrap();
     Item { id: 0, owner_id: owner.id, code: "new".into() }.insert(&mut tx).await.unwrap();
     let duplicate = Item { id: 0, owner_id: owner.id, code: "taken".into() }.insert(&mut tx).await;
     assert!(matches!(duplicate, Err(Error::UniqueViolation(_))));
-    assert!(matches!(Owner::all(&mut tx).await, Err(Error::Database(_))), "transaction is aborted");
+    let after = Owner::all(&mut tx).await;
+    if t.mysql() {
+        assert!(after.is_ok());
+    } else {
+        assert!(matches!(after, Err(Error::Database(_))), "transaction is aborted");
+    }
     tx.rollback().await.unwrap();
     assert_eq!(Item::query().count(&db).await.unwrap(), 1);
 
-    // Committing an aborted transaction reports the rollback instead of
-    // succeeding silently, and keeps nothing, even the writes before the error.
+    // Committing after a failed statement reports the rollback instead of
+    // succeeding silently, and keeps nothing, even the writes before the
+    // error (the same on both databases).
     let mut tx = db.begin().await.unwrap();
     Item { id: 0, owner_id: owner.id, code: "before".into() }.insert(&mut tx).await.unwrap();
     let orphan = Item { id: 0, owner_id: 9_999, code: "orphan".into() }.insert(&mut tx).await;
@@ -265,11 +306,11 @@ async fn errors_inside_transactions() {
     db.ping().await.unwrap();
 }
 
-#[tokio::test]
-async fn bad_credentials_are_an_error_not_a_panic() {
-    let Ok(url) = std::env::var("AXEON_ORM_POSTGRES_URL") else { return };
-    let Some(host) = url.split('@').nth(1) else { return };
-    let wrong = format!("postgres://postgres:wrong-password@{}", host);
+async fn bad_credentials_are_an_error_not_a_panic(t: &Target) {
+    let (scheme, rest) = t.url.split_once("://").unwrap();
+    let (user, host) = rest.split_once('@').unwrap();
+    let user = user.split(':').next().unwrap();
+    let wrong = format!("{}://{}:wrong-password@{}", scheme, user, host);
     let options = DbOptions::new().acquire_timeout(std::time::Duration::from_secs(5));
     match Db::connect_with(&wrong, options).await {
         Err(Error::Database(_)) => {}
@@ -279,12 +320,11 @@ async fn bad_credentials_are_an_error_not_a_panic() {
 }
 
 #[cfg(feature = "axeon")]
-#[tokio::test]
-async fn axeon_requests_on_postgres() {
+async fn axeon_requests(t: &Target) {
     use axeon::{Method, Request, Server, ServerError};
     use axeon_orm::server::{DbRequest, Transactional};
 
-    let Some(db) = db("axeon").await else { return };
+    let db = t.db().await;
     db.create_table::<Owner>().await.unwrap();
     db.create_table::<Item>().await.unwrap();
     let owner = Owner { id: 0, name: "web".into() }.insert(&db).await.unwrap();
@@ -330,3 +370,41 @@ async fn axeon_requests_on_postgres() {
     assert_eq!(call(Method::GET, &format!("/owners/{}", owner.id)).await.body_text(), "web");
     assert_eq!(call(Method::GET, "/owners/0").await.status, 404);
 }
+
+macro_rules! server_tests {
+    ($($(#[$cfg:meta])* $name:ident),* $(,)?) => {
+        #[cfg(feature = "postgres")]
+        mod postgres {
+            $($(#[$cfg])*
+            #[tokio::test]
+            async fn $name() {
+                if let Some(target) = super::Target::new(axeon_orm::Backend::Postgres, stringify!($name)).await {
+                    super::$name(&target).await;
+                }
+            })*
+        }
+        #[cfg(feature = "mysql")]
+        mod mysql {
+            $($(#[$cfg])*
+            #[tokio::test]
+            async fn $name() {
+                if let Some(target) = super::Target::new(axeon_orm::Backend::MySql, stringify!($name)).await {
+                    super::$name(&target).await;
+                }
+            })*
+        }
+    };
+}
+
+server_tests!(
+    every_type_and_typed_nulls_round_trip,
+    #[cfg(feature = "uuid")]
+    uuid_primary_keys,
+    concurrent_writes_through_the_pool,
+    concurrent_migrations_apply_once,
+    eager_loading_beyond_the_parameter_chunk,
+    errors_inside_transactions,
+    bad_credentials_are_an_error_not_a_panic,
+    #[cfg(feature = "axeon")]
+    axeon_requests,
+);

@@ -1,9 +1,10 @@
 //! The [`Model`] trait and the row operations behind the derived methods.
 
-use crate::db::{Conn, Executor, Row};
+use crate::db::{Backend, Conn, Executor, Row};
 use crate::error::{Error, Result};
-use crate::sql::{column_list, ident, Sql};
+use crate::sql::{column_list, Sql};
 use crate::value::{Kind, Value};
+use std::borrow::Cow;
 
 /// A Rust struct mapped to a database table.
 ///
@@ -30,7 +31,12 @@ pub trait Model: Sized + Send + Sync + Unpin + 'static {
     /// Every column, in field order.
     const COLUMNS: &'static [ColumnDef];
     /// Builds the model from a row holding all of its columns.
-    fn from_row(row: &Row) -> Result<Self>;
+    fn from_row(row: &Row) -> Result<Self> {
+        Self::from_row_prefixed(row, "")
+    }
+    /// Builds the model from a row whose column names start with `prefix`,
+    /// as in a join.
+    fn from_row_prefixed(row: &Row, prefix: &str) -> Result<Self>;
     /// The current value of a column, or `None` if there is no such column.
     fn get(&self, column: &str) -> Option<Value>;
 }
@@ -153,14 +159,29 @@ fn now(kind: Kind) -> Option<Value> {
     }
 }
 
+/// `prefix` + `column`, allocating only when there is a prefix.
+#[doc(hidden)]
+pub fn column_name<'a>(prefix: &str, column: &'a str) -> Cow<'a, str> {
+    if prefix.is_empty() {
+        Cow::Borrowed(column)
+    } else {
+        Cow::Owned(format!("{}{}", prefix, column))
+    }
+}
+
+/// The primary key column's definition.
+pub(crate) fn primary_key<M: Model>() -> &'static ColumnDef {
+    M::COLUMNS.iter().find(|c| c.primary_key).expect("models have a primary key")
+}
+
 fn value_of<M: Model>(model: &M, column: &'static str) -> Value {
     model.get(column).unwrap_or_else(|| panic!("{} has no column `{}`", std::any::type_name::<M>(), column))
 }
 
 pub(crate) async fn fetch_one_where<M: Model>(conn: &mut Conn<'_>, column: &'static str, key: Value) -> Result<Option<M>> {
     let mut sql = Sql::new(conn.backend());
-    sql.push("SELECT ").push(&column_list::<M>()).push(" FROM ").push(&ident(M::TABLE));
-    sql.push(" WHERE ").push(&ident(column)).push(" = ").arg(key).push(" LIMIT 1");
+    sql.push("SELECT ").push(&column_list::<M>(conn.backend())).push(" FROM ").ident(M::TABLE);
+    sql.push(" WHERE ").ident(column).push(" = ").arg(key).push(" LIMIT 1");
     let (sql, args) = sql.finish();
     conn.fetch_optional(sql, args).await?.map(|row| M::from_row(&row)).transpose()
 }
@@ -184,13 +205,16 @@ pub async fn insert<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M>
             Some(_) => now(column.kind).unwrap_or_else(|| value_of(model, column.name)),
             None => value_of(model, column.name),
         };
-        columns.push(ident(column.name));
+        columns.push(crate::sql::ident(conn.backend(), column.name));
         values.push(value);
     }
 
-    let mut sql = Sql::new(conn.backend());
-    sql.push("INSERT INTO ").push(&ident(M::TABLE));
-    if columns.is_empty() {
+    let backend = conn.backend();
+    let mut sql = Sql::new(backend);
+    sql.push("INSERT INTO ").ident(M::TABLE);
+    if columns.is_empty() && backend == Backend::MySql {
+        sql.push(" () VALUES ()");
+    } else if columns.is_empty() {
         sql.push(" DEFAULT VALUES");
     } else {
         sql.push(" (").push(&columns.join(", ")).push(") VALUES (");
@@ -202,17 +226,40 @@ pub async fn insert<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M>
         }
         sql.push(")");
     }
-    sql.push(" RETURNING ").push(&column_list::<M>());
+    if backend == Backend::MySql {
+        return insert_mysql(&mut conn, sql, model).await;
+    }
+    sql.push(" RETURNING ").push(&column_list::<M>(backend));
     let (sql, args) = sql.finish();
     let row = conn.fetch_optional(sql, args).await?.ok_or(Error::NotFound)?;
     M::from_row(&row)
 }
 
+/// MySQL has no `RETURNING`: insert, then read the row back by its key.
+#[cfg(feature = "mysql")]
+async fn insert_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, model: &M) -> Result<M> {
+    let (sql, args) = sql.finish();
+    let id = conn.insert_mysql(sql, args).await?;
+    let pk = primary_key::<M>();
+    let key = match (pk.auto_increment, pk.kind) {
+        (true, Kind::I32) => Value::I32(id as i32),
+        (true, _) => Value::I64(id as i64),
+        (false, _) => value_of(model, pk.name),
+    };
+    fetch_one_where(conn, pk.name, key).await?.ok_or(Error::NotFound)
+}
+
+#[cfg(not(feature = "mysql"))]
+async fn insert_mysql<M: Model>(_: &mut Conn<'_>, _: Sql, _: &M) -> Result<M> {
+    unreachable!("MySQL connections need the `mysql` feature")
+}
+
 #[doc(hidden)]
 pub async fn update<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M> {
     let mut conn = ex.into_conn();
-    let mut sql = Sql::new(conn.backend());
-    sql.push("UPDATE ").push(&ident(M::TABLE)).push(" SET ");
+    let backend = conn.backend();
+    let mut sql = Sql::new(backend);
+    sql.push("UPDATE ").ident(M::TABLE).push(" SET ");
     let mut first = true;
     for column in M::COLUMNS.iter().filter(|c| !c.primary_key) {
         let value = match column.timestamp {
@@ -223,14 +270,22 @@ pub async fn update<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M>
             sql.push(", ");
         }
         first = false;
-        sql.push(&ident(column.name)).push(" = ").arg(value);
+        sql.ident(column.name).push(" = ").arg(value);
     }
     if first {
         // Only a primary key: nothing to change, but still check the row exists.
         return fetch_one_where(&mut conn, M::PRIMARY_KEY, value_of(model, M::PRIMARY_KEY)).await?.ok_or(Error::NotFound);
     }
-    sql.push(" WHERE ").push(&ident(M::PRIMARY_KEY)).push(" = ").arg(value_of(model, M::PRIMARY_KEY));
-    sql.push(" RETURNING ").push(&column_list::<M>());
+    let key = value_of(model, M::PRIMARY_KEY);
+    sql.push(" WHERE ").ident(M::PRIMARY_KEY).push(" = ").arg(key.clone());
+    if backend == Backend::MySql {
+        // No `RETURNING`, and affected rows count only changed rows: read
+        // the row back to both reload it and tell whether it exists.
+        let (sql, args) = sql.finish();
+        conn.execute(sql, args).await?;
+        return fetch_one_where(&mut conn, M::PRIMARY_KEY, key).await?.ok_or(Error::NotFound);
+    }
+    sql.push(" RETURNING ").push(&column_list::<M>(backend));
     let (sql, args) = sql.finish();
     let row = conn.fetch_optional(sql, args).await?.ok_or(Error::NotFound)?;
     M::from_row(&row)
@@ -240,8 +295,8 @@ pub async fn update<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M>
 pub async fn delete<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<()> {
     let mut conn = ex.into_conn();
     let mut sql = Sql::new(conn.backend());
-    sql.push("DELETE FROM ").push(&ident(M::TABLE));
-    sql.push(" WHERE ").push(&ident(M::PRIMARY_KEY)).push(" = ").arg(value_of(model, M::PRIMARY_KEY));
+    sql.push("DELETE FROM ").ident(M::TABLE);
+    sql.push(" WHERE ").ident(M::PRIMARY_KEY).push(" = ").arg(value_of(model, M::PRIMARY_KEY));
     let (sql, args) = sql.finish();
     match conn.execute(sql, args).await? {
         0 => Err(Error::NotFound),

@@ -1,7 +1,9 @@
-//! The same tests against SQLite (always) and PostgreSQL (when
+//! The same tests against SQLite (always), PostgreSQL (when
 //! `AXEON_ORM_POSTGRES_URL` is set, e.g.
-//! `postgres://postgres@localhost/postgres`). Each PostgreSQL test runs in
-//! its own schema, so they can run in parallel.
+//! `postgres://postgres:postgres@localhost:55432/postgres`) and MySQL (when
+//! `AXEON_ORM_MYSQL_URL` is set, e.g. `mysql://root:mysql@localhost:53306/axeon`).
+//! Each PostgreSQL test runs in its own schema and each MySQL test in its
+//! own database, so they can run in parallel.
 
 #![cfg(all(feature = "chrono", feature = "json"))]
 
@@ -29,6 +31,7 @@ struct User {
 }
 
 #[derive(Model, Clone, Debug)]
+#[model(belongs_to_many(Tag))]
 struct Post {
     id: i64,
     #[model(belongs_to = User, on_delete = "cascade")]
@@ -49,7 +52,7 @@ struct Profile {
 }
 
 #[derive(Model, Clone, Debug, PartialEq)]
-#[model(table = "tag_list")]
+#[model(table = "tag_list", belongs_to_many(Post))]
 struct Tag {
     #[model(primary_key)]
     slug: String,
@@ -272,17 +275,160 @@ async fn migrations(db: &Db) {
     let edited = Migrator::new(vec![Migration::new(1, "create_accounts", "SELECT 1")]);
     assert!(matches!(edited.run(db).await, Err(Error::Migration(m)) if m.contains("changed")));
 
-    // A failing migration leaves nothing behind.
+    // A failing migration leaves nothing behind, except on MySQL, which
+    // commits each schema change on its own.
     let mut list = migrator.migrations().to_vec();
     list.push(Migration::new(3, "good", "CREATE TABLE extra (id BIGINT PRIMARY KEY)"));
     list.push(Migration::new(4, "bad", "CREATE TABLE broken (id BIGINT PRIMARY KEY"));
     let failing = Migrator::new(list);
     assert!(matches!(failing.run(db).await, Err(Error::Migration(m)) if m.contains("migration 4")));
-    assert_eq!(failing.pending(db).await.unwrap().len(), 2);
-    assert!(db.execute("SELECT * FROM extra").await.is_err());
+    if db.backend() == Backend::MySql {
+        assert_eq!(failing.pending(db).await.unwrap().len(), 1);
+        assert!(db.execute("SELECT * FROM extra").await.is_ok());
+    } else {
+        assert_eq!(failing.pending(db).await.unwrap().len(), 2);
+        assert!(db.execute("SELECT * FROM extra").await.is_err());
+    }
+
+    let status = failing.status(db).await.unwrap();
+    let applied: Vec<bool> = status.iter().map(|s| s.applied_at.is_some()).collect();
+    assert_eq!(applied.len(), 4);
+    assert!(applied[0] && applied[1] && !applied[3]);
+    assert!(status.iter().all(|s| !s.changed && !s.missing));
+    let edited_status = edited.status(db).await.unwrap();
+    assert!(edited_status[0].changed, "checksum mismatch is reported");
+    assert!(edited_status.iter().skip(1).all(|s| s.missing), "unknown applied migrations are reported");
 
     let duplicate = Migrator::new(vec![Migration::new(7, "a", "SELECT 1"), Migration::new(7, "b", "SELECT 1")]);
     assert!(matches!(duplicate.run(db).await, Err(Error::Migration(m)) if m.contains("version 7")));
+}
+
+async fn many_to_many(db: &Db) {
+    setup(db).await;
+    db.create_pivot_table(&Post::TAGS).await.unwrap();
+    let ada = user("Ada", 36).insert(db).await.unwrap();
+    let one = post(&ada, "One").insert(db).await.unwrap();
+    let two = post(&ada, "Two").insert(db).await.unwrap();
+    let tag = |slug: &str| Tag { slug: slug.into(), label: slug.to_uppercase(), uses: 0 };
+    let rust = tag("rust").insert(db).await.unwrap();
+    let orm = tag("orm").insert(db).await.unwrap();
+    let web = tag("web").insert(db).await.unwrap();
+
+    Post::TAGS.attach(db, &one, &rust).await.unwrap();
+    Post::TAGS.attach(db, &one, &rust).await.unwrap(); // already linked: no error, no duplicate
+    Post::TAGS.attach(db, &one, &orm).await.unwrap();
+    Post::TAGS.attach_key(db, &two, "rust".to_string()).await.unwrap();
+    let slugs = |tags: Vec<Tag>| tags.into_iter().map(|t| t.slug).collect::<Vec<_>>();
+    assert_eq!(slugs(one.tags().order_by(Tag::SLUG.asc()).all(db).await.unwrap()), ["orm", "rust"]);
+    assert_eq!(rust.posts().count(db).await.unwrap(), 2, "the inverse side sees both links");
+    assert!(matches!(Post::TAGS.attach_key(db, &one, "missing".to_string()).await, Err(Error::ForeignKeyViolation(_))));
+
+    // Eager loading, both directions.
+    let posts = Post::query().order_by(Post::ID.asc()).with(Post::TAGS).all(db).await.unwrap();
+    assert_eq!(posts.iter().map(|(_, tags)| slugs(tags.clone())).collect::<Vec<_>>(), [vec!["orm", "rust"], vec!["rust"]]);
+    let tags = Tag::query().order_by(Tag::SLUG.asc()).with(Tag::POSTS).all(db).await.unwrap();
+    assert_eq!(tags.iter().map(|(_, posts)| posts.len()).collect::<Vec<_>>(), [1, 2, 0]);
+
+    // Filtering by linked records.
+    assert_eq!(Post::query().where_has(Post::TAGS, Tag::SLUG.eq("orm")).count(db).await.unwrap(), 1);
+    assert_eq!(Post::query().has(Post::TAGS).count(db).await.unwrap(), 2);
+    assert_eq!(slugs(Tag::query().doesnt_have(Tag::POSTS).all(db).await.unwrap()), ["web"]);
+
+    // Detach and sync.
+    assert!(Post::TAGS.detach(db, &one, &orm).await.unwrap());
+    assert!(!Post::TAGS.detach(db, &one, &orm).await.unwrap());
+    Post::TAGS.sync(db, &one, ["web".to_string(), "rust".to_string()]).await.unwrap();
+    assert_eq!(slugs(one.tags().order_by(Tag::SLUG.asc()).all(db).await.unwrap()), ["rust", "web"]);
+    let mut tx = db.begin().await.unwrap();
+    Post::TAGS.sync(&mut tx, &one, Vec::<String>::new()).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(one.tags().count(db).await.unwrap(), 0);
+    Post::TAGS.attach(db, &one, &web).await.unwrap();
+    assert_eq!(Post::TAGS.detach_all(db, &one).await.unwrap(), 1);
+
+    // Deleting a record deletes its links.
+    two.delete(db).await.unwrap();
+    assert_eq!(rust.posts().count(db).await.unwrap(), 0);
+}
+
+async fn aggregates(db: &Db) {
+    setup(db).await;
+    let mut users = Vec::new();
+    for (name, age) in [("u1", 10), ("u2", 20), ("u3", 30)] {
+        let mut u = user(name, age);
+        u.bio = (age > 10).then(|| format!("bio {}", age));
+        u.active = age != 20;
+        users.push(u.insert(db).await.unwrap());
+    }
+    for score in [1.5, 2.5, -1.0] {
+        Post { score, ..post(&users[0], &format!("p{}", score)) }.insert(db).await.unwrap();
+    }
+
+    assert_eq!(User::query().sum(db, User::AGE).await.unwrap(), Some(60));
+    assert_eq!(User::query().avg(db, User::AGE).await.unwrap(), Some(20.0));
+    assert_eq!(User::query().min(db, User::AGE).await.unwrap(), Some(10));
+    assert_eq!(User::query().max(db, User::NAME).await.unwrap().as_deref(), Some("u3"));
+    assert_eq!(User::query().filter(User::AGE.gt(15)).sum(db, User::ID).await.unwrap(), Some(users[1].id + users[2].id));
+    assert_eq!(Post::query().sum(db, Post::SCORE).await.unwrap(), Some(3.0));
+    assert!(User::query().max(db, User::CREATED_AT).await.unwrap().is_some());
+
+    let none = || User::query().filter(User::AGE.gt(100));
+    assert_eq!(none().sum(db, User::AGE).await.unwrap(), None);
+    assert_eq!(none().avg(db, User::AGE).await.unwrap(), None);
+    assert_eq!(none().min(db, User::AGE).await.unwrap(), None);
+
+    assert_eq!(User::query().count_by(db, User::ACTIVE).await.unwrap(), [(false, 1), (true, 2)]);
+    let bios = User::query().count_by(db, User::BIO).await.unwrap();
+    assert_eq!(bios, [("bio 20".to_string(), 1), ("bio 30".to_string(), 1)], "NULL is left out");
+}
+
+async fn relation_filters_and_joins(db: &Db) {
+    setup(db).await;
+    let ada = user("Ada", 36).insert(db).await.unwrap();
+    let bob = user("Bob", 41).insert(db).await.unwrap();
+    let cy = user("Cy", 25).insert(db).await.unwrap();
+    post(&ada, "Rust").insert(db).await.unwrap();
+    post(&ada, "Go").insert(db).await.unwrap();
+    post(&bob, "Zig").insert(db).await.unwrap();
+    Profile { id: 0, user_id: Some(ada.id), website: "ada.dev".into() }.insert(db).await.unwrap();
+    // A profile without a user must not break NOT IN.
+    Profile { id: 0, user_id: None, website: "nobody".into() }.insert(db).await.unwrap();
+
+    let names = |users: Vec<User>| users.into_iter().map(|u| u.name).collect::<Vec<_>>();
+    let by_id = || User::query().order_by(User::ID.asc());
+    assert_eq!(names(by_id().has(User::POSTS).all(db).await.unwrap()), ["Ada", "Bob"]);
+    assert_eq!(names(by_id().doesnt_have(User::POSTS).all(db).await.unwrap()), ["Cy"]);
+    assert_eq!(names(by_id().where_has(User::POSTS, Post::TITLE.eq("Rust")).all(db).await.unwrap()), ["Ada"]);
+    assert_eq!(names(by_id().where_doesnt_have(User::POSTS, Post::TITLE.eq("Rust")).all(db).await.unwrap()), ["Bob", "Cy"]);
+    assert_eq!(names(by_id().has(User::PROFILE).all(db).await.unwrap()), ["Ada"]);
+    assert_eq!(names(by_id().doesnt_have(User::PROFILE).all(db).await.unwrap()), ["Bob", "Cy"]);
+    assert_eq!(Post::query().where_has(Post::USER, User::NAME.eq("Bob")).count(db).await.unwrap(), 1);
+
+    // Inner join on belongs_to, filtered and sorted by either side.
+    let rows = Post::query()
+        .join(Post::USER)
+        .filter_related(User::NAME.eq("Ada"))
+        .order_by(Post::TITLE.asc())
+        .all(db)
+        .await
+        .unwrap();
+    let titles: Vec<(String, String)> = rows.iter().map(|(p, u)| (p.title.clone(), u.name.clone())).collect();
+    assert_eq!(titles, [("Go".into(), "Ada".into()), ("Rust".into(), "Ada".into())]);
+    assert!(rows.iter().all(|(p, u)| p.user_id == u.id && p.id != 0), "same-named columns stay apart");
+    let (first, author) = Post::query().join(Post::USER).order_by_related(User::NAME.desc()).first(db).await.unwrap().unwrap();
+    assert_eq!((first.title.as_str(), author.name.as_str()), ("Zig", "Bob"));
+    assert_eq!(Post::query().join(Post::USER).filter(Post::TITLE.ne("Go")).count(db).await.unwrap(), 2);
+
+    // Left join on has_one keeps users without a profile.
+    let profiles = by_id().left_join(User::PROFILE).all(db).await.unwrap();
+    assert_eq!(profiles.iter().map(|(_, p)| p.as_ref().map(|p| p.website.as_str())).collect::<Vec<_>>(), [Some("ada.dev"), None, None]);
+
+    // has_many joins repeat the parent per child.
+    assert_eq!(User::query().join(User::POSTS).count(db).await.unwrap(), 3);
+    assert_eq!(User::query().left_join(User::POSTS).count(db).await.unwrap(), 4);
+    let page = by_id().join(User::POSTS).order_by_related(Post::TITLE.asc()).limit(2).offset(1).all(db).await.unwrap();
+    assert_eq!(page.iter().map(|(_, p)| p.title.as_str()).collect::<Vec<_>>(), ["Rust", "Zig"]);
+    assert_eq!(cy.posts().count(db).await.unwrap(), 0);
 }
 
 #[cfg(feature = "sqlite")]
@@ -306,6 +452,22 @@ async fn postgres(name: &str) -> Option<Db> {
     Some(db)
 }
 
+#[cfg(feature = "mysql")]
+async fn mysql(name: &str) -> Option<Db> {
+    let Ok(url) = std::env::var("AXEON_ORM_MYSQL_URL") else {
+        eprintln!("skipping: AXEON_ORM_MYSQL_URL is not set");
+        return None;
+    };
+    let database = format!("axeon_orm_{}", name);
+    let admin = Db::connect(&url).await.unwrap();
+    admin.execute(&format!("DROP DATABASE IF EXISTS {0}; CREATE DATABASE {0}", database)).await.unwrap();
+    admin.close().await;
+    let (base, _) = url.rsplit_once('/').unwrap();
+    let db = Db::connect(&format!("{}/{}", base, database)).await.unwrap();
+    assert_eq!(db.backend(), Backend::MySql);
+    Some(db)
+}
+
 macro_rules! backend_tests {
     ($($name:ident),* $(,)?) => {
         #[cfg(feature = "sqlite")]
@@ -325,10 +487,30 @@ macro_rules! backend_tests {
                 }
             })*
         }
+        #[cfg(feature = "mysql")]
+        mod mysql {
+            $(#[tokio::test]
+            async fn $name() {
+                if let Some(db) = super::mysql(stringify!($name)).await {
+                    super::$name(&db).await;
+                }
+            })*
+        }
     };
 }
 
-backend_tests!(crud, queries, constraints, relations, types, transactions, migrations);
+backend_tests!(
+    crud,
+    queries,
+    constraints,
+    relations,
+    types,
+    transactions,
+    migrations,
+    many_to_many,
+    aggregates,
+    relation_filters_and_joins,
+);
 
 #[test]
 fn generated_schema() {
@@ -351,11 +533,28 @@ fn generated_schema() {
     assert!(lite.contains(r#""created_at" TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"#), "{}", lite);
     assert!(schema::create_table::<Profile>(Backend::Postgres).contains(r#""id" SERIAL PRIMARY KEY"#));
     assert!(schema::create_table::<Tag>(Backend::Sqlite).contains(r#""uses" INTEGER NOT NULL DEFAULT 0"#));
+
+    let my = schema::create_table::<Post>(Backend::MySql);
+    assert!(my.contains("`id` BIGINT AUTO_INCREMENT PRIMARY KEY"), "{}", my);
+    assert!(my.contains("`slug` VARCHAR(255) NOT NULL"), "indexed text can't be TEXT: {}", my);
+    assert!(my.contains("FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE"), "{}", my);
+    assert!(my.contains("INDEX `posts_slug_index` (`slug`)"), "{}", my);
+    assert!(!my.contains(" REFERENCES `users` (`id`) ON DELETE CASCADE,\n    `title`"), "no inline REFERENCES: {}", my);
+    let my_user = schema::create_table::<User>(Backend::MySql);
+    assert!(my_user.contains("`created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)"), "{}", my_user);
+    assert!(my_user.contains("`bio` TEXT,"), "{}", my_user);
+
+    let pivot = schema::create_pivot_table(&Post::TAGS, Backend::Postgres);
+    assert!(pivot.contains(r#"CREATE TABLE IF NOT EXISTS "post_tag""#), "{}", pivot);
+    assert!(pivot.contains(r#""post_id" BIGINT NOT NULL"#) && pivot.contains(r#""tag_id" TEXT NOT NULL"#), "{}", pivot);
+    assert!(pivot.contains(r#"PRIMARY KEY ("post_id", "tag_id")"#), "{}", pivot);
+    assert!(pivot.contains(r#"FOREIGN KEY ("tag_id") REFERENCES "tag_list" ("slug") ON DELETE CASCADE"#), "{}", pivot);
+    assert_eq!((Tag::POSTS.pivot(), Tag::POSTS.foreign_key(), Tag::POSTS.related_key()), ("post_tag", "tag_id", "post_id"));
 }
 
 #[tokio::test]
 async fn rejects_unknown_urls() {
-    assert!(matches!(Db::connect("mysql://localhost/app").await, Err(Error::Config(_))));
+    assert!(matches!(Db::connect("oracle://localhost/app").await, Err(Error::Config(_))));
 }
 
 #[cfg(feature = "sqlite")]

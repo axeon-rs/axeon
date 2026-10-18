@@ -7,6 +7,7 @@ use syn::{Data, DeriveInput, Error, Fields, GenericArgument, Ident, LitStr, Path
 enum RelKind {
     HasMany,
     HasOne,
+    BelongsToMany,
 }
 
 struct Relation {
@@ -14,6 +15,8 @@ struct Relation {
     target: Path,
     foreign_key: Option<LitStr>,
     name: Option<LitStr>,
+    pivot: Option<LitStr>,
+    related_key: Option<LitStr>,
 }
 
 #[derive(Default)]
@@ -57,17 +60,36 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
             if meta.path.is_ident("table") {
                 table = Some(meta.value()?.parse::<LitStr>()?.value());
                 Ok(())
-            } else if meta.path.is_ident("has_many") || meta.path.is_ident("has_one") {
-                let kind = if meta.path.is_ident("has_many") { RelKind::HasMany } else { RelKind::HasOne };
-                let mut relation = Relation { kind, target: Path::from(format_ident!("_")), foreign_key: None, name: None };
+            } else if meta.path.is_ident("has_many") || meta.path.is_ident("has_one") || meta.path.is_ident("belongs_to_many") {
+                let kind = if meta.path.is_ident("has_many") {
+                    RelKind::HasMany
+                } else if meta.path.is_ident("has_one") {
+                    RelKind::HasOne
+                } else {
+                    RelKind::BelongsToMany
+                };
+                let mut relation = Relation {
+                    kind,
+                    target: Path::from(format_ident!("_")),
+                    foreign_key: None,
+                    name: None,
+                    pivot: None,
+                    related_key: None,
+                };
                 let mut target = None;
                 meta.parse_nested_meta(|inner| {
                     if inner.path.is_ident("foreign_key") {
                         relation.foreign_key = Some(inner.value()?.parse()?);
                     } else if inner.path.is_ident("name") {
                         relation.name = Some(inner.value()?.parse()?);
-                    } else if target.is_none() {
+                    } else if inner.path.is_ident("pivot") && kind == RelKind::BelongsToMany {
+                        relation.pivot = Some(inner.value()?.parse()?);
+                    } else if inner.path.is_ident("related_key") && kind == RelKind::BelongsToMany {
+                        relation.related_key = Some(inner.value()?.parse()?);
+                    } else if target.is_none() && !inner.input.peek(syn::Token![=]) {
                         target = Some(inner.path.clone());
+                    } else if kind == RelKind::BelongsToMany {
+                        return Err(inner.error("expected `pivot`, `foreign_key`, `related_key` or `name`"));
                     } else {
                         return Err(inner.error("expected `foreign_key = \"...\"` or `name = \"...\"`"));
                     }
@@ -77,7 +99,7 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                 relations.push(relation);
                 Ok(())
             } else {
-                Err(meta.error("expected `table`, `has_many` or `has_one`"))
+                Err(meta.error("expected `table`, `has_many`, `has_one` or `belongs_to_many`"))
             }
         })?;
     }
@@ -203,7 +225,9 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         if f.attrs.skip {
             quote! { #ident: ::core::default::Default::default() }
         } else {
-            quote! { #ident: <#ty as ::axeon_orm::SqlType>::decode(row, #col)? }
+            quote! {
+                #ident: <#ty as ::axeon_orm::SqlType>::decode(row, &::axeon_orm::__private::column_name(prefix, #col))?
+            }
         }
     });
     let get_arms = columns.iter().map(|f| {
@@ -232,14 +256,35 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         let target_name = target.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
         let foreign_key = relation.foreign_key.as_ref().map(LitStr::value).unwrap_or_else(|| format!("{}_id", parent_snake));
         let accessor = relation.name.as_ref().map(LitStr::value).unwrap_or_else(|| match relation.kind {
-            RelKind::HasMany => pluralize(&snake_case(&target_name)),
+            RelKind::HasMany | RelKind::BelongsToMany => pluralize(&snake_case(&target_name)),
             RelKind::HasOne => snake_case(&target_name),
         });
         let accessor_ident = Ident::new(&accessor, Span::call_site());
         let const_ident = format_ident!("{}", accessor.to_uppercase());
+        if relation.kind == RelKind::BelongsToMany {
+            let target_snake = snake_case(&target_name);
+            let pivot = relation.pivot.as_ref().map(LitStr::value).unwrap_or_else(|| {
+                let mut names = [parent_snake.clone(), target_snake.clone()];
+                names.sort();
+                names.join("_")
+            });
+            let related_key =
+                relation.related_key.as_ref().map(LitStr::value).unwrap_or_else(|| format!("{}_id", target_snake));
+            let doc = format!("The `{}` records linked to this one through `{}`.", target_name, pivot);
+            relation_items.push(quote! {
+                #[doc = #doc]
+                pub const #const_ident: ::axeon_orm::BelongsToMany<Self, #target> =
+                    ::axeon_orm::BelongsToMany::new(#pivot, #foreign_key, #related_key);
+                #[doc = #doc]
+                pub fn #accessor_ident(&self) -> ::axeon_orm::Query<#target> {
+                    Self::#const_ident.of(self)
+                }
+            });
+            continue;
+        }
         let (rel_ty, doc) = match relation.kind {
             RelKind::HasMany => (quote! { HasMany }, format!("The `{}` this record has (by `{}.{}`).", target_name, target_name, foreign_key)),
-            RelKind::HasOne => (quote! { HasOne }, format!("The `{}` this record has (by `{}.{}`).", target_name, target_name, foreign_key)),
+            _ => (quote! { HasOne }, format!("The `{}` this record has (by `{}.{}`).", target_name, target_name, foreign_key)),
         };
         relation_items.push(quote! {
             #[doc = #doc]
@@ -281,7 +326,7 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
             const PRIMARY_KEY: &'static str = #pk_column;
             const COLUMNS: &'static [::axeon_orm::ColumnDef] = &[#(#column_defs),*];
 
-            fn from_row(row: &::axeon_orm::Row) -> ::axeon_orm::Result<Self> {
+            fn from_row_prefixed(row: &::axeon_orm::Row, prefix: &str) -> ::axeon_orm::Result<Self> {
                 ::core::result::Result::Ok(Self { #(#decode),* })
             }
 

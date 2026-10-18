@@ -1,5 +1,5 @@
-//! An Eloquent-style ORM for Rust, built on [sqlx], for PostgreSQL and
-//! SQLite, with first-class [Axeon](https://docs.rs/axeon) integration.
+//! An Eloquent-style ORM for Rust, built on [sqlx], for PostgreSQL, MySQL
+//! and SQLite, with first-class [Axeon](https://docs.rs/axeon) integration.
 //!
 //! Define a model as a plain struct, and get typed queries, relations,
 //! migrations and pagination without writing SQL:
@@ -71,7 +71,9 @@
 //! | `#[model(table = "people")]` | Table name |
 //! | `#[model(has_many(Post))]` | `User::POSTS`, `user.posts()`; foreign key `user_id` on `Post` |
 //! | `#[model(has_one(Profile))]` | `User::PROFILE`, `user.profile()` |
+//! | `#[model(belongs_to_many(Tag))]` | `Post::TAGS`, `post.tags()`, through a `post_tag` pivot table ([more](relation#many-to-many)) |
 //! | `has_many(Post, foreign_key = "author_id", name = "articles")` | Custom foreign key or accessor name |
+//! | `belongs_to_many(Tag, pivot = "taggings", foreign_key = "post_id", related_key = "tag_id")` | Custom pivot table and columns |
 //!
 //! On fields:
 //!
@@ -97,13 +99,26 @@
 //! |---|---|---|
 //! | `postgres` | yes | PostgreSQL |
 //! | `sqlite` | yes | SQLite |
+//! | `mysql` | no | MySQL 8 (MariaDB 10.5+ should work but isn't tested) |
+//! | `tls` | yes | Encrypted connections (rustls), needed by most managed databases and MySQL 8's default login |
 //! | `chrono` | yes | `DateTime<Utc>`, `NaiveDateTime`, `NaiveDate` columns and timestamps |
 //! | `json` | yes | `serde_json::Value` and `sqlx::types::Json<T>` columns |
 //! | `axeon` | yes | The [`server`] module |
 //! | `uuid` | no | `Uuid` columns |
 //!
+//! # Beyond simple queries
+//!
+//! - **Aggregates:** [`Query::sum`], [`avg`](Query::avg), [`min`](Query::min),
+//!   [`max`](Query::max) and [`count_by`](Query::count_by).
+//! - **Filtering by relations:** [`Query::has`], [`doesnt_have`](Query::doesnt_have)
+//!   and [`where_has`](Query::where_has).
+//! - **Joins:** [`Query::join`] and [`left_join`](Query::left_join) give
+//!   `(Post, User)` pairs from one query, filtered and sorted by either side.
+//! - **Migrations:** [`migrate`], and the `axeon-orm` command-line tool
+//!   (`cargo install axeon-orm-cli`).
+//!
 //! When the ORM can't express a query, use sqlx directly through
-//! [`Db::postgres`] or [`Db::sqlite`]; sqlx is re-exported as
+//! [`Db::postgres`], `Db::mysql` or [`Db::sqlite`]; sqlx is re-exported as
 //! [`axeon_orm::sqlx`](sqlx).
 
 #![warn(missing_docs)]
@@ -124,8 +139,8 @@ pub mod server;
 pub use crate::db::{Backend, Db, DbOptions, Executor, Row, Transaction};
 pub use crate::error::{Error, Result};
 pub use crate::model::{ColumnDef, Model, Reference, Timestamp};
-pub use crate::query::{Assignment, Column, Expr, Order, Page, Query};
-pub use crate::relation::{BelongsTo, HasMany, HasOne, Relation};
+pub use crate::query::{Assignment, Column, Expr, JoinQuery, Numeric, Order, Page, Query};
+pub use crate::relation::{BelongsTo, BelongsToMany, HasMany, HasOne, Join, Related, Relation};
 pub use crate::value::{Kind, SqlType, Value};
 
 /// Derives [`Model`](trait@Model); see the [crate docs](crate#defining-models).
@@ -148,7 +163,7 @@ pub mod prelude {
 #[doc(hidden)]
 pub mod __private {
     pub use crate::db::Conn;
-    pub use crate::model::{delete, find, has_column, insert, update};
+    pub use crate::model::{column_name, delete, find, has_column, insert, update};
 }
 
 /// Mistakes the derive and the typed API reject at compile time.

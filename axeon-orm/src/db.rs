@@ -6,8 +6,8 @@ use crate::value::{Kind, SqlType, Value};
 use sqlx::AssertSqlSafe;
 use std::time::Duration;
 
-#[cfg(not(any(feature = "postgres", feature = "sqlite")))]
-compile_error!("axeon-orm needs at least one database feature: `postgres` or `sqlite`");
+#[cfg(not(any(feature = "postgres", feature = "sqlite", feature = "mysql")))]
+compile_error!("axeon-orm needs at least one database feature: `postgres`, `sqlite` or `mysql`");
 
 /// Which database a [`Db`] talks to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +17,8 @@ pub enum Backend {
     Postgres,
     /// SQLite (feature `sqlite`).
     Sqlite,
+    /// MySQL 8 (feature `mysql`). MariaDB 10.5+ should work but isn't tested.
+    MySql,
 }
 
 /// Connection pool settings for [`Db::connect_with`].
@@ -79,6 +81,7 @@ impl DbOptions {
 /// let db = Db::connect("postgres://localhost/app").await?;
 /// let db = Db::connect("sqlite://app.db").await?; // created if missing
 /// let db = Db::connect("sqlite::memory:").await?;
+/// let db = Db::connect("mysql://root:secret@localhost/app").await?; // feature `mysql`
 /// # Ok(()) }
 /// ```
 #[derive(Clone, Debug)]
@@ -92,11 +95,14 @@ enum Pool {
     Postgres(sqlx::PgPool),
     #[cfg(feature = "sqlite")]
     Sqlite(sqlx::SqlitePool),
+    #[cfg(feature = "mysql")]
+    MySql(sqlx::MySqlPool),
 }
 
 impl Db {
     /// Connects with default [`DbOptions`]. The URL scheme picks the
-    /// database: `postgres://` / `postgresql://` or `sqlite:`.
+    /// database: `postgres://` / `postgresql://`, `sqlite:`, or
+    /// `mysql://` / `mariadb://`.
     pub async fn connect(url: &str) -> Result<Db> {
         Self::connect_with(url, DbOptions::default()).await
     }
@@ -141,8 +147,26 @@ impl Db {
             #[cfg(not(feature = "sqlite"))]
             return Err(Error::Config("SQLite support needs the `sqlite` feature".into()));
         }
+        if url.starts_with("mysql://") || url.starts_with("mariadb://") {
+            #[cfg(feature = "mysql")]
+            {
+                use std::str::FromStr;
+                let url = url.replacen("mariadb://", "mysql://", 1);
+                let connect = sqlx::mysql::MySqlConnectOptions::from_str(&url)?;
+                let pool = sqlx::mysql::MySqlPoolOptions::new()
+                    .max_connections(options.max_connections)
+                    .min_connections(options.min_connections)
+                    .acquire_timeout(options.acquire_timeout)
+                    .idle_timeout(options.idle_timeout)
+                    .connect_with(connect)
+                    .await?;
+                return Ok(Db { inner: Pool::MySql(pool) });
+            }
+            #[cfg(not(feature = "mysql"))]
+            return Err(Error::Config("MySQL support needs the `mysql` feature".into()));
+        }
         Err(Error::Config(format!(
-            "unsupported database URL `{}`: expected postgres:// or sqlite:",
+            "unsupported database URL `{}`: expected postgres://, sqlite: or mysql://",
             url.split('@').next_back().unwrap_or_default()
         )))
     }
@@ -154,6 +178,8 @@ impl Db {
             Pool::Postgres(_) => Backend::Postgres,
             #[cfg(feature = "sqlite")]
             Pool::Sqlite(_) => Backend::Sqlite,
+            #[cfg(feature = "mysql")]
+            Pool::MySql(_) => Backend::MySql,
         }
     }
 
@@ -165,6 +191,8 @@ impl Db {
             Pool::Postgres(pool) => Tx::Postgres(pool.begin().await?),
             #[cfg(feature = "sqlite")]
             Pool::Sqlite(pool) => Tx::Sqlite(pool.begin().await?),
+            #[cfg(feature = "mysql")]
+            Pool::MySql(pool) => Tx::MySql(pool.begin().await?),
         };
         Ok(Transaction { inner, failed: false })
     }
@@ -187,9 +215,16 @@ impl Db {
         self.execute(&crate::schema::create_table::<M>(self.backend())).await
     }
 
+    /// Creates a many-to-many pivot table if it doesn't exist:
+    /// `db.create_pivot_table(&Post::TAGS)`. See
+    /// [`schema::create_pivot_table`](crate::schema::create_pivot_table).
+    pub async fn create_pivot_table<P: Model, C: Model>(&self, relation: &crate::BelongsToMany<P, C>) -> Result<()> {
+        self.execute(&crate::schema::create_pivot_table(relation, self.backend())).await
+    }
+
     /// Drops the model's table if it exists.
     pub async fn drop_table<M: Model>(&self) -> Result<()> {
-        self.execute(&format!("DROP TABLE IF EXISTS {}", crate::sql::ident(M::TABLE))).await
+        self.execute(&format!("DROP TABLE IF EXISTS {}", crate::sql::ident(self.backend(), M::TABLE))).await
     }
 
     /// Closes every connection; later queries fail.
@@ -199,6 +234,8 @@ impl Db {
             Pool::Postgres(pool) => pool.close().await,
             #[cfg(feature = "sqlite")]
             Pool::Sqlite(pool) => pool.close().await,
+            #[cfg(feature = "mysql")]
+            Pool::MySql(pool) => pool.close().await,
         }
     }
 
@@ -220,6 +257,23 @@ impl Db {
             #[allow(unreachable_patterns)]
             _ => None,
         }
+    }
+
+    /// The underlying sqlx pool, for queries the ORM can't express.
+    #[cfg(feature = "mysql")]
+    pub fn mysql(&self) -> Option<&sqlx::MySqlPool> {
+        match &self.inner {
+            Pool::MySql(pool) => Some(pool),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl From<sqlx::MySqlPool> for Db {
+    fn from(pool: sqlx::MySqlPool) -> Self {
+        Db { inner: Pool::MySql(pool) }
     }
 }
 
@@ -254,6 +308,8 @@ enum Tx {
     Postgres(sqlx::Transaction<'static, sqlx::Postgres>),
     #[cfg(feature = "sqlite")]
     Sqlite(sqlx::Transaction<'static, sqlx::Sqlite>),
+    #[cfg(feature = "mysql")]
+    MySql(sqlx::Transaction<'static, sqlx::MySql>),
 }
 
 impl Transaction {
@@ -275,6 +331,8 @@ impl Transaction {
             Tx::Postgres(tx) => tx.commit().await?,
             #[cfg(feature = "sqlite")]
             Tx::Sqlite(tx) => tx.commit().await?,
+            #[cfg(feature = "mysql")]
+            Tx::MySql(tx) => tx.commit().await?,
         }
         Ok(())
     }
@@ -286,6 +344,8 @@ impl Transaction {
             Tx::Postgres(tx) => tx.rollback().await?,
             #[cfg(feature = "sqlite")]
             Tx::Sqlite(tx) => tx.rollback().await?,
+            #[cfg(feature = "mysql")]
+            Tx::MySql(tx) => tx.rollback().await?,
         }
         Ok(())
     }
@@ -297,6 +357,8 @@ impl Transaction {
             Tx::Postgres(_) => Backend::Postgres,
             #[cfg(feature = "sqlite")]
             Tx::Sqlite(_) => Backend::Sqlite,
+            #[cfg(feature = "mysql")]
+            Tx::MySql(_) => Backend::MySql,
         }
     }
 
@@ -316,6 +378,9 @@ pub enum Row {
     #[doc(hidden)]
     #[cfg(feature = "sqlite")]
     Sqlite(sqlx::sqlite::SqliteRow),
+    #[doc(hidden)]
+    #[cfg(feature = "mysql")]
+    MySql(sqlx::mysql::MySqlRow),
 }
 
 impl Row {
@@ -332,7 +397,34 @@ impl Row {
             Row::Postgres(row) => row.try_get_raw(column).map(|v| v.is_null()).map_err(|e| Error::decode(column, e)),
             #[cfg(feature = "sqlite")]
             Row::Sqlite(row) => row.try_get_raw(column).map(|v| v.is_null()).map_err(|e| Error::decode(column, e)),
+            #[cfg(feature = "mysql")]
+            Row::MySql(row) => row.try_get_raw(column).map(|v| v.is_null()).map_err(|e| Error::decode(column, e)),
         }
+    }
+
+    /// Reads a column as a [`Value`] of the given kind.
+    pub(crate) fn get_value(&self, column: &str, kind: Kind) -> Result<Value> {
+        if self.is_null(column)? {
+            return Ok(Value::Null(kind));
+        }
+        Ok(match kind {
+            Kind::Bool => Value::Bool(self.get(column)?),
+            Kind::I32 => Value::I32(self.get(column)?),
+            Kind::I64 => Value::I64(self.get(column)?),
+            Kind::F64 => Value::F64(self.get(column)?),
+            Kind::Text => Value::Text(self.get(column)?),
+            Kind::Bytes => Value::Bytes(self.get(column)?),
+            #[cfg(feature = "chrono")]
+            Kind::DateTime => Value::DateTime(self.get(column)?),
+            #[cfg(feature = "chrono")]
+            Kind::NaiveDateTime => Value::NaiveDateTime(self.get(column)?),
+            #[cfg(feature = "chrono")]
+            Kind::Date => Value::Date(self.get(column)?),
+            #[cfg(feature = "uuid")]
+            Kind::Uuid => Value::Uuid(self.get(column)?),
+            #[cfg(feature = "json")]
+            Kind::Json => Value::Json(self.get(column)?),
+        })
     }
 }
 
@@ -431,6 +523,18 @@ macro_rules! run {
                 let $ex = pool;
                 $body
             }
+            #[cfg(feature = "mysql")]
+            Conn::Db(Db { inner: Pool::MySql(pool) }) => {
+                let $q = bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe($sql)), $args);
+                let $ex = pool;
+                $body
+            }
+            #[cfg(feature = "mysql")]
+            Conn::Tx(Transaction { inner: Tx::MySql(tx), .. }) => {
+                let $q = bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe($sql)), $args);
+                let $ex = &mut **tx;
+                $body
+            }
             #[cfg(feature = "postgres")]
             Conn::Tx(Transaction { inner: Tx::Postgres(tx), .. }) => {
                 let $q = bind_all!(sqlx::query::<sqlx::Postgres>(AssertSqlSafe($sql)), $args);
@@ -480,6 +584,20 @@ impl Conn<'_> {
         self.track(result)
     }
 
+    /// Runs an `INSERT` on MySQL, which has no `RETURNING`; returns the
+    /// auto-increment id it assigned.
+    #[cfg(feature = "mysql")]
+    pub(crate) async fn insert_mysql(&mut self, sql: String, args: Vec<Value>) -> Result<u64> {
+        let query = bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe(sql)), args);
+        let result = match self {
+            Conn::Db(Db { inner: Pool::MySql(pool) }) => query.execute(pool).await.map_err(Error::from),
+            Conn::Tx(Transaction { inner: Tx::MySql(tx), .. }) => query.execute(&mut **tx).await.map_err(Error::from),
+            #[allow(unreachable_patterns)]
+            _ => Err(Error::Config("insert_mysql on another database".into())),
+        };
+        self.track(result.map(|r| r.last_insert_id()))
+    }
+
     /// Runs SQL without parameters; may hold several statements.
     pub(crate) async fn execute_raw(&mut self, sql: String) -> Result<()> {
         let result = self.execute_raw_inner(sql).await;
@@ -505,6 +623,14 @@ impl Conn<'_> {
             Conn::Tx(Transaction { inner: Tx::Sqlite(tx), .. }) => {
                 raw.execute(&mut **tx).await?;
             }
+            #[cfg(feature = "mysql")]
+            Conn::Db(Db { inner: Pool::MySql(pool) }) => {
+                raw.execute(pool).await?;
+            }
+            #[cfg(feature = "mysql")]
+            Conn::Tx(Transaction { inner: Tx::MySql(tx), .. }) => {
+                raw.execute(&mut **tx).await?;
+            }
         };
         Ok(())
     }
@@ -514,6 +640,13 @@ impl Conn<'_> {
 impl From<sqlx::postgres::PgRow> for Row {
     fn from(row: sqlx::postgres::PgRow) -> Self {
         Row::Postgres(row)
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl From<sqlx::mysql::MySqlRow> for Row {
+    fn from(row: sqlx::mysql::MySqlRow) -> Self {
+        Row::MySql(row)
     }
 }
 

@@ -22,13 +22,49 @@
 //! (`user.posts().all(&db)`). To load a relation for many records without
 //! a query per record (the "N+1" problem), use [`Query::with`] or the
 //! relation's `load`, which fetch all relatives in one query.
+//!
+//! # Many-to-many
+//!
+//! `belongs_to_many` links two models through a pivot table holding both
+//! keys. The defaults follow the model names: for `Post` and `Tag`, a
+//! `post_tag` table with `post_id` and `tag_id` columns.
+//!
+//! ```
+//! use axeon_orm::Model;
+//!
+//! #[derive(Model, Clone)]
+//! #[model(belongs_to_many(Tag))]      // Post::TAGS, post.tags()
+//! struct Post { id: i64, title: String }
+//!
+//! #[derive(Model, Clone)]
+//! #[model(belongs_to_many(Post))]     // Tag::POSTS, tag.posts()
+//! struct Tag { id: i64, name: String }
+//! ```
+//!
+//! Link records with [`BelongsToMany::attach`], [`detach`](BelongsToMany::detach)
+//! and [`sync`](BelongsToMany::sync), and create the pivot table with
+//! [`Db::create_pivot_table`](crate::Db::create_pivot_table) or a migration.
+//!
+//! # Filtering by relations
+//!
+//! [`Query::has`], [`Query::doesnt_have`] and [`Query::where_has`] keep rows
+//! by their relatives, with any relation type:
+//!
+//! ```no_run
+//! # use axeon_orm::{Db, Model};
+//! # #[derive(Model, Clone)] #[model(has_many(Post))] struct User { id: i64 }
+//! # #[derive(Model, Clone)] struct Post { id: i64, #[model(belongs_to = User)] user_id: i64, published: bool }
+//! # async fn run(db: Db) -> axeon_orm::Result<()> {
+//! let authors = User::query().where_has(User::POSTS, Post::PUBLISHED.eq(true)).all(&db).await?;
+//! # Ok(()) }
+//! ```
 
-use crate::db::{Conn, Executor};
+use crate::db::{Backend, Conn, Executor};
 use crate::error::Result;
-use crate::model::Model;
-use crate::query::Query;
-use crate::sql::Cond;
-use crate::value::Value;
+use crate::model::{primary_key, Model};
+use crate::query::{Expr, Query};
+use crate::sql::{Cond, Sql, Subquery};
+use crate::value::{SqlType, Value};
 use futures::future::BoxFuture;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
@@ -118,6 +154,79 @@ relation_type!(
     /// `C` belongs to `P`: `C`'s foreign key holds `P`'s primary key.
     BelongsTo<C, P>
 );
+
+/// A condition on a model by its relatives, from [`Related::related_cond`].
+#[doc(hidden)]
+pub struct RelatedCond(pub(crate) Cond);
+
+/// A relation usable with [`Query::has`] and [`Query::where_has`].
+pub trait Related<M: Model>: Send + Sync {
+    /// The related model.
+    type Target: Model;
+
+    #[doc(hidden)]
+    fn related_cond(&self, filter: Option<Expr<Self::Target>>, negated: bool) -> RelatedCond;
+}
+
+/// A relation usable with [`Query::join`]: `belongs_to`, `has_one` and
+/// `has_many`.
+pub trait Join<M: Model>: Send + Sync {
+    /// The joined model.
+    type Target: Model;
+
+    /// The column of `M` and the column of the target that must be equal.
+    #[doc(hidden)]
+    fn on(&self) -> (&'static str, &'static str);
+}
+
+fn filter_conds<T>(filter: Option<Expr<T>>) -> Vec<Cond> {
+    filter.map(|expr| expr.cond).into_iter().collect()
+}
+
+impl<P: Model, C: Model> Related<P> for HasMany<P, C> {
+    type Target = C;
+    fn related_cond(&self, filter: Option<Expr<C>>, negated: bool) -> RelatedCond {
+        let sub = Subquery { table: C::TABLE, column: self.foreign_key, conds: filter_conds(filter) };
+        RelatedCond(Cond::InSubquery(P::PRIMARY_KEY, Box::new(sub), negated))
+    }
+}
+
+impl<P: Model, C: Model> Related<P> for HasOne<P, C> {
+    type Target = C;
+    fn related_cond(&self, filter: Option<Expr<C>>, negated: bool) -> RelatedCond {
+        let sub = Subquery { table: C::TABLE, column: self.foreign_key, conds: filter_conds(filter) };
+        RelatedCond(Cond::InSubquery(P::PRIMARY_KEY, Box::new(sub), negated))
+    }
+}
+
+impl<C: Model, P: Model> Related<C> for BelongsTo<C, P> {
+    type Target = P;
+    fn related_cond(&self, filter: Option<Expr<P>>, negated: bool) -> RelatedCond {
+        let sub = Subquery { table: P::TABLE, column: P::PRIMARY_KEY, conds: filter_conds(filter) };
+        RelatedCond(Cond::InSubquery(self.foreign_key, Box::new(sub), negated))
+    }
+}
+
+impl<P: Model, C: Model> Join<P> for HasMany<P, C> {
+    type Target = C;
+    fn on(&self) -> (&'static str, &'static str) {
+        (P::PRIMARY_KEY, self.foreign_key)
+    }
+}
+
+impl<P: Model, C: Model> Join<P> for HasOne<P, C> {
+    type Target = C;
+    fn on(&self) -> (&'static str, &'static str) {
+        (P::PRIMARY_KEY, self.foreign_key)
+    }
+}
+
+impl<C: Model, P: Model> Join<C> for BelongsTo<C, P> {
+    type Target = P;
+    fn on(&self) -> (&'static str, &'static str) {
+        (self.foreign_key, P::PRIMARY_KEY)
+    }
+}
 
 /// Rows of `T` grouped by the key in `column`.
 fn group<T: Model>(rows: Vec<T>, column: &str) -> HashMap<Value, Vec<T>> {
@@ -211,6 +320,205 @@ impl<C: Model, P: Model + Clone> Relation<C> for BelongsTo<C, P> {
                 parents.into_iter().filter_map(|p| key_of(&p, P::PRIMARY_KEY).map(|k| (k, p))).collect();
             Ok(children.iter().map(|c| key_of(c, self.foreign_key).and_then(|k| by_key.get(&k).cloned())).collect())
         })
+    }
+}
+
+/// `P` and `C` are linked through a pivot table holding both keys; see
+/// [many-to-many](self#many-to-many).
+pub struct BelongsToMany<P, C> {
+    pivot: &'static str,
+    foreign_key: &'static str,
+    related_key: &'static str,
+    _marker: PhantomData<fn() -> (P, C)>,
+}
+
+impl<P, C> Clone for BelongsToMany<P, C> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P, C> Copy for BelongsToMany<P, C> {}
+
+impl<P, C> std::fmt::Debug for BelongsToMany<P, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BelongsToMany({}.{} -> {})", self.pivot, self.foreign_key, self.related_key)
+    }
+}
+
+impl<P, C> BelongsToMany<P, C> {
+    #[doc(hidden)]
+    pub const fn new(pivot: &'static str, foreign_key: &'static str, related_key: &'static str) -> Self {
+        Self { pivot, foreign_key, related_key, _marker: PhantomData }
+    }
+
+    /// The pivot table.
+    pub const fn pivot(&self) -> &'static str {
+        self.pivot
+    }
+
+    /// The pivot column holding `P`'s key.
+    pub const fn foreign_key(&self) -> &'static str {
+        self.foreign_key
+    }
+
+    /// The pivot column holding `C`'s key.
+    pub const fn related_key(&self) -> &'static str {
+        self.related_key
+    }
+}
+
+impl<P: Model, C: Model> BelongsToMany<P, C> {
+    fn parent_key(parent: &P) -> Value {
+        parent.get(P::PRIMARY_KEY).unwrap_or(Value::Null(primary_key::<P>().kind))
+    }
+
+    /// The records linked to one parent.
+    pub fn of(&self, parent: &P) -> Query<C> {
+        let sub = Subquery {
+            table: self.pivot,
+            column: self.related_key,
+            conds: vec![Cond::Compare(self.foreign_key, "=", Self::parent_key(parent))],
+        };
+        Query::new().cond(Cond::InSubquery(C::PRIMARY_KEY, Box::new(sub), false))
+    }
+
+    /// Links `related` to `parent`; linking twice is not an error.
+    pub async fn attach<'c>(&self, ex: impl Executor<'c>, parent: &P, related: &C) -> Result<()> {
+        let key = related.get(C::PRIMARY_KEY).unwrap_or(Value::Null(primary_key::<C>().kind));
+        self.insert_links(&mut ex.into_conn(), Self::parent_key(parent), vec![key]).await
+    }
+
+    /// Links the record with this key to `parent`.
+    pub async fn attach_key<'c>(&self, ex: impl Executor<'c>, parent: &P, key: impl SqlType) -> Result<()> {
+        self.insert_links(&mut ex.into_conn(), Self::parent_key(parent), vec![key.to_value()]).await
+    }
+
+    /// Unlinks `related` from `parent`; returns whether a link existed.
+    pub async fn detach<'c>(&self, ex: impl Executor<'c>, parent: &P, related: &C) -> Result<bool> {
+        let mut conn = ex.into_conn();
+        let key = related.get(C::PRIMARY_KEY).unwrap_or(Value::Null(primary_key::<C>().kind));
+        let mut sql = Sql::new(conn.backend());
+        sql.push("DELETE FROM ").ident(self.pivot);
+        sql.where_clause(&[Cond::Compare(self.foreign_key, "=", Self::parent_key(parent)), Cond::Compare(self.related_key, "=", key)]);
+        let (sql, args) = sql.finish();
+        Ok(conn.execute(sql, args).await? > 0)
+    }
+
+    /// Unlinks everything from `parent`; returns how many links were removed.
+    pub async fn detach_all<'c>(&self, ex: impl Executor<'c>, parent: &P) -> Result<u64> {
+        let mut conn = ex.into_conn();
+        let mut sql = Sql::new(conn.backend());
+        sql.push("DELETE FROM ").ident(self.pivot);
+        sql.where_clause(&[Cond::Compare(self.foreign_key, "=", Self::parent_key(parent))]);
+        let (sql, args) = sql.finish();
+        conn.execute(sql, args).await
+    }
+
+    /// Makes `parent` linked to exactly the records with these keys,
+    /// adding and removing links as needed. Pass a transaction to make it
+    /// atomic.
+    pub async fn sync<'c, V: SqlType>(&self, ex: impl Executor<'c>, parent: &P, keys: impl IntoIterator<Item = V>) -> Result<()> {
+        let mut conn = ex.into_conn();
+        let keys: Vec<Value> = keys.into_iter().map(|k| k.to_value()).collect();
+        let mut sql = Sql::new(conn.backend());
+        sql.push("DELETE FROM ").ident(self.pivot);
+        sql.where_clause(&[
+            Cond::Compare(self.foreign_key, "=", Self::parent_key(parent)),
+            Cond::In(self.related_key, keys.clone(), true),
+        ]);
+        let (sql, args) = sql.finish();
+        conn.execute(sql, args).await?;
+        self.insert_links(&mut conn, Self::parent_key(parent), keys).await
+    }
+
+    /// Inserts pivot rows, skipping links that already exist.
+    async fn insert_links(&self, conn: &mut Conn<'_>, parent: Value, keys: Vec<Value>) -> Result<()> {
+        for chunk in keys.chunks(CHUNK / 2) {
+            let backend = conn.backend();
+            let mut sql = Sql::new(backend);
+            sql.push("INSERT INTO ").ident(self.pivot).push(" (").ident(self.foreign_key).push(", ");
+            sql.ident(self.related_key).push(") VALUES ");
+            for (i, key) in chunk.iter().enumerate() {
+                if i > 0 {
+                    sql.push(", ");
+                }
+                sql.push("(").arg(parent.clone()).push(", ").arg(key.clone()).push(")");
+            }
+            if backend == Backend::MySql {
+                // Not INSERT IGNORE, which would also hide foreign key errors.
+                sql.push(" ON DUPLICATE KEY UPDATE ").ident(self.foreign_key).push(" = ").ident(self.foreign_key);
+            } else {
+                sql.push(" ON CONFLICT DO NOTHING");
+            }
+            let (sql, args) = sql.finish();
+            conn.execute(sql, args).await?;
+        }
+        Ok(())
+    }
+}
+
+impl<P: Model, C: Model + Clone> BelongsToMany<P, C> {
+    /// The linked records of each parent, in the parents' order, in two
+    /// queries.
+    pub async fn load<'c>(&self, ex: impl Executor<'c>, parents: &[P]) -> Result<Vec<Vec<C>>> {
+        self.load_for(&mut ex.into_conn(), parents).await
+    }
+}
+
+impl<P: Model, C: Model + Clone> Relation<P> for BelongsToMany<P, C> {
+    type Output = Vec<C>;
+
+    fn load_for<'a, 'c: 'a>(&'a self, conn: &'a mut Conn<'c>, parents: &'a [P]) -> BoxFuture<'a, Result<Vec<Vec<C>>>> {
+        Box::pin(async move {
+            let (parent_kind, related_kind) = (primary_key::<P>().kind, primary_key::<C>().kind);
+            let mut links: HashMap<Value, Vec<Value>> = HashMap::new();
+            let mut related_keys = Vec::new();
+            let mut seen = HashSet::new();
+            for chunk in keys(parents, P::PRIMARY_KEY).chunks(CHUNK) {
+                let mut sql = Sql::new(conn.backend());
+                sql.push("SELECT ").ident(self.foreign_key).push(", ").ident(self.related_key);
+                sql.push(" FROM ").ident(self.pivot);
+                sql.where_clause(&[Cond::In(self.foreign_key, chunk.to_vec(), false)]);
+                sql.push(" ORDER BY ").ident(self.related_key);
+                let (sql, args) = sql.finish();
+                for row in conn.fetch_all(sql, args).await? {
+                    let parent = row.get_value(self.foreign_key, parent_kind)?.key();
+                    let related = row.get_value(self.related_key, related_kind)?;
+                    if seen.insert(related.clone().key()) {
+                        related_keys.push(related.clone());
+                    }
+                    links.entry(parent).or_default().push(related.key());
+                }
+            }
+            let by_key: HashMap<Value, C> = fetch_in::<C>(conn, C::PRIMARY_KEY, related_keys)
+                .await?
+                .into_iter()
+                .filter_map(|c| key_of(&c, C::PRIMARY_KEY).map(|k| (k, c)))
+                .collect();
+            Ok(parents
+                .iter()
+                .map(|p| {
+                    key_of(p, P::PRIMARY_KEY)
+                        .and_then(|k| links.get(&k))
+                        .map(|keys| keys.iter().filter_map(|k| by_key.get(k).cloned()).collect())
+                        .unwrap_or_default()
+                })
+                .collect())
+        })
+    }
+}
+
+impl<P: Model, C: Model> Related<P> for BelongsToMany<P, C> {
+    type Target = C;
+    fn related_cond(&self, filter: Option<Expr<C>>, negated: bool) -> RelatedCond {
+        let mut conds = Vec::new();
+        if let Some(expr) = filter {
+            let related = Subquery { table: C::TABLE, column: C::PRIMARY_KEY, conds: vec![expr.cond] };
+            conds.push(Cond::InSubquery(self.related_key, Box::new(related), false));
+        }
+        let sub = Subquery { table: self.pivot, column: self.foreign_key, conds };
+        RelatedCond(Cond::InSubquery(P::PRIMARY_KEY, Box::new(sub), negated))
     }
 }
 

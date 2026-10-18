@@ -24,10 +24,18 @@
 //!
 //! Applied migrations are recorded in the `_axeon_migrations` table, with a
 //! checksum: editing a migration after it ran is an error, so add a new one
-//! instead. All pending migrations run in one transaction, so a failure
-//! leaves the database unchanged; on PostgreSQL an advisory lock stops two
-//! instances from migrating at once. Statements that can't run inside a
-//! transaction, like `CREATE INDEX CONCURRENTLY`, aren't supported.
+//! instead. All pending migrations run in one transaction, so on PostgreSQL
+//! and SQLite a failure leaves the database unchanged. Statements that
+//! can't run inside a transaction, like `CREATE INDEX CONCURRENTLY`, aren't
+//! supported. A lock (an advisory lock on PostgreSQL, `GET_LOCK` on MySQL)
+//! stops two instances from migrating at once.
+//!
+//! **MySQL** commits every schema change (`CREATE`, `ALTER`, `DROP`) on its
+//! own, so a failing migration there can leave earlier statements applied.
+//! Keep MySQL migrations small: one change per file.
+//!
+//! The [`axeon-orm` command-line tool](https://docs.rs/axeon-orm-cli)
+//! creates, runs and lists migrations: `axeon-orm migrate new|run|status`.
 //!
 //! [`embed_migrations!`](crate::embed_migrations) reads the folder at
 //! compile time. Cargo doesn't notice new files on its own, so add a
@@ -35,6 +43,7 @@
 
 use crate::db::{Backend, Conn, Db};
 use crate::error::{Error, Result};
+use crate::sql::{ident, Sql};
 use crate::value::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -122,9 +131,34 @@ impl Migrator {
         Ok(())
     }
 
-    async fn applied(conn: &mut Conn<'_>) -> Result<HashMap<i64, String>> {
-        let rows = conn.fetch_all(format!("SELECT \"version\", \"checksum\" FROM \"{}\"", TABLE), Vec::new()).await?;
-        rows.iter().map(|row| Ok((row.get::<i64>("version")?, row.get::<String>("checksum")?))).collect()
+    async fn applied(conn: &mut Conn<'_>) -> Result<HashMap<i64, Applied>> {
+        let backend = conn.backend();
+        let applied_at = match backend {
+            Backend::Postgres => format!("CAST({} AS TEXT)", ident(backend, "applied_at")),
+            Backend::MySql => format!("CAST({} AS CHAR)", ident(backend, "applied_at")),
+            _ => ident(backend, "applied_at"),
+        };
+        let sql = format!(
+            "SELECT {}, {}, {}, {} AS {} FROM {} ORDER BY {}",
+            ident(backend, "version"),
+            ident(backend, "name"),
+            ident(backend, "checksum"),
+            applied_at,
+            ident(backend, "applied_at"),
+            ident(backend, TABLE),
+            ident(backend, "version"),
+        );
+        let rows = conn.fetch_all(sql, Vec::new()).await?;
+        rows.iter()
+            .map(|row| {
+                let applied = Applied {
+                    name: row.get("name")?,
+                    checksum: row.get("checksum")?,
+                    applied_at: row.get("applied_at")?,
+                };
+                Ok((row.get::<i64>("version")?, applied))
+            })
+            .collect()
     }
 
     /// Migrations that haven't been applied yet.
@@ -135,6 +169,37 @@ impl Migrator {
         Ok(self.migrations.iter().filter(|m| !applied.contains_key(&m.version)).collect())
     }
 
+    /// Every known migration with whether it was applied, plus migrations
+    /// recorded in the database that are missing here; by version.
+    pub async fn status(&self, db: &Db) -> Result<Vec<MigrationStatus>> {
+        let mut conn = Conn::Db(db);
+        conn.execute_raw(create_table_sql(db.backend())).await?;
+        let mut applied = Self::applied(&mut conn).await?;
+        let mut status: Vec<MigrationStatus> = self
+            .migrations
+            .iter()
+            .map(|m| {
+                let record = applied.remove(&m.version);
+                MigrationStatus {
+                    version: m.version,
+                    name: m.name.to_string(),
+                    changed: record.as_ref().is_some_and(|r| r.checksum != m.checksum()),
+                    applied_at: record.map(|r| r.applied_at),
+                    missing: false,
+                }
+            })
+            .collect();
+        status.extend(applied.into_iter().map(|(version, record)| MigrationStatus {
+            version,
+            name: record.name,
+            applied_at: Some(record.applied_at),
+            changed: false,
+            missing: true,
+        }));
+        status.sort_by_key(|s| s.version);
+        Ok(status)
+    }
+
     /// Applies every pending migration in one transaction; returns the
     /// versions applied.
     pub async fn run(&self, db: &Db) -> Result<Vec<i64>> {
@@ -142,17 +207,28 @@ impl Migrator {
         let mut tx = db.begin().await?;
         let backend = tx.backend();
         let mut conn = Conn::Tx(&mut tx);
-        if backend == Backend::Postgres {
-            conn.execute_raw(format!("SELECT pg_advisory_xact_lock({})", LOCK_KEY)).await?;
+        match backend {
+            Backend::Postgres => conn.execute_raw(format!("SELECT pg_advisory_xact_lock({})", LOCK_KEY)).await?,
+            Backend::MySql => conn.execute_raw(format!("SELECT GET_LOCK('{}', 60)", TABLE)).await?,
+            _ => {}
         }
-        conn.execute_raw(create_table_sql(backend)).await?;
-        let applied = Self::applied(&mut conn).await?;
+        let result = self.apply(&mut conn, backend).await;
+        if backend == Backend::MySql {
+            let _ = conn.execute_raw(format!("SELECT RELEASE_LOCK('{}')", TABLE)).await;
+        }
+        let ran = result?;
+        tx.commit().await?;
+        Ok(ran)
+    }
 
+    async fn apply(&self, conn: &mut Conn<'_>, backend: Backend) -> Result<Vec<i64>> {
+        conn.execute_raw(create_table_sql(backend)).await?;
+        let applied = Self::applied(conn).await?;
         let mut ran = Vec::new();
         for migration in &self.migrations {
             let checksum = migration.checksum();
             match applied.get(&migration.version) {
-                Some(previous) if *previous == checksum => continue,
+                Some(previous) if previous.checksum == checksum => continue,
                 Some(_) => {
                     return Err(Error::Migration(format!(
                         "migration {} ({}) was changed after it was applied; add a new migration instead",
@@ -164,28 +240,58 @@ impl Migrator {
             conn.execute_raw(migration.sql.to_string()).await.map_err(|e| {
                 Error::Migration(format!("migration {} ({}) failed: {}", migration.version, migration.name, e))
             })?;
-            let insert = match backend {
-                Backend::Postgres => format!("INSERT INTO \"{}\" (\"version\", \"name\", \"checksum\") VALUES ($1, $2, $3)", TABLE),
-                Backend::Sqlite => format!("INSERT INTO \"{}\" (\"version\", \"name\", \"checksum\") VALUES (?, ?, ?)", TABLE),
-            };
-            let args = vec![Value::I64(migration.version), Value::Text(migration.name.to_string()), Value::Text(checksum)];
-            conn.execute(insert, args).await?;
+            let mut sql = Sql::new(backend);
+            sql.push("INSERT INTO ").ident(TABLE).push(" (").ident("version").push(", ").ident("name");
+            sql.push(", ").ident("checksum").push(") VALUES (");
+            sql.arg(Value::I64(migration.version)).push(", ").arg(Value::Text(migration.name.to_string()));
+            sql.push(", ").arg(Value::Text(checksum)).push(")");
+            let (sql, args) = sql.finish();
+            conn.execute(sql, args).await?;
             ran.push(migration.version);
         }
-        tx.commit().await?;
         Ok(ran)
     }
 }
 
+/// A migration's row in the `_axeon_migrations` table.
+struct Applied {
+    name: String,
+    checksum: String,
+    applied_at: String,
+}
+
+/// Where one migration stands, from [`Migrator::status`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MigrationStatus {
+    /// The version.
+    pub version: i64,
+    /// The name.
+    pub name: String,
+    /// When it was applied, as the database prints it; `None` if pending.
+    pub applied_at: Option<String>,
+    /// It was applied, but its SQL has changed since.
+    pub changed: bool,
+    /// It was applied, but its file is gone.
+    pub missing: bool,
+}
+
 fn create_table_sql(backend: Backend) -> String {
-    let applied_at = match backend {
-        Backend::Postgres => "TIMESTAMPTZ",
-        Backend::Sqlite => "TEXT",
+    let (name, applied_at, now) = match backend {
+        Backend::Postgres => ("TEXT", "TIMESTAMPTZ", "CURRENT_TIMESTAMP"),
+        Backend::MySql => ("VARCHAR(255)", "DATETIME(6)", "CURRENT_TIMESTAMP(6)"),
+        _ => ("TEXT", "TEXT", "CURRENT_TIMESTAMP"),
     };
     format!(
-        "CREATE TABLE IF NOT EXISTS \"{}\" (\"version\" BIGINT PRIMARY KEY, \"name\" TEXT NOT NULL, \
-         \"checksum\" TEXT NOT NULL, \"applied_at\" {} NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-        TABLE, applied_at
+        "CREATE TABLE IF NOT EXISTS {} ({} BIGINT PRIMARY KEY, {} {} NOT NULL, {} VARCHAR(64) NOT NULL, {} {} NOT NULL DEFAULT {})",
+        ident(backend, TABLE),
+        ident(backend, "version"),
+        ident(backend, "name"),
+        name,
+        ident(backend, "checksum"),
+        ident(backend, "applied_at"),
+        applied_at,
+        now,
     )
 }
 

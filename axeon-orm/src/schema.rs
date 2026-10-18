@@ -19,53 +19,71 @@
 //! ```
 
 use crate::db::Backend;
-use crate::model::{ColumnDef, Model};
+use crate::model::{primary_key, ColumnDef, Model};
+use crate::relation::BelongsToMany;
 use crate::sql::ident;
 use crate::value::Kind;
 
-/// The SQL type for a column kind.
-pub fn sql_type(kind: Kind, backend: Backend) -> &'static str {
-    let postgres = backend == Backend::Postgres;
-    match kind {
-        Kind::Bool => "BOOLEAN",
-        Kind::I32 => "INTEGER",
-        Kind::I64 if postgres => "BIGINT",
-        Kind::I64 => "INTEGER",
-        Kind::F64 if postgres => "DOUBLE PRECISION",
-        Kind::F64 => "REAL",
-        Kind::Text => "TEXT",
-        Kind::Bytes if postgres => "BYTEA",
-        Kind::Bytes => "BLOB",
+/// The SQL type for a column kind. On MySQL, `indexed` text becomes
+/// `VARCHAR(255)`, since `TEXT` can't be a key there.
+fn sql_type(kind: Kind, backend: Backend, indexed: bool) -> &'static str {
+    match (backend, kind) {
+        (_, Kind::Bool) => "BOOLEAN",
+        (_, Kind::I32) => "INTEGER",
+        (Backend::Sqlite, Kind::I64) => "INTEGER",
+        (_, Kind::I64) => "BIGINT",
+        (Backend::Postgres, Kind::F64) => "DOUBLE PRECISION",
+        (Backend::MySql, Kind::F64) => "DOUBLE",
+        (_, Kind::F64) => "REAL",
+        (Backend::MySql, Kind::Text) if indexed => "VARCHAR(255)",
+        (_, Kind::Text) => "TEXT",
+        (Backend::Postgres, Kind::Bytes) => "BYTEA",
+        (Backend::MySql, Kind::Bytes) => "LONGBLOB",
+        (_, Kind::Bytes) => "BLOB",
         #[cfg(feature = "chrono")]
-        Kind::DateTime if postgres => "TIMESTAMPTZ",
+        (Backend::Postgres, Kind::DateTime) => "TIMESTAMPTZ",
         #[cfg(feature = "chrono")]
-        Kind::NaiveDateTime if postgres => "TIMESTAMP",
+        (Backend::Postgres, Kind::NaiveDateTime) => "TIMESTAMP",
         #[cfg(feature = "chrono")]
-        Kind::Date if postgres => "DATE",
+        (Backend::MySql, Kind::DateTime | Kind::NaiveDateTime) => "DATETIME(6)",
         #[cfg(feature = "chrono")]
-        Kind::DateTime | Kind::NaiveDateTime | Kind::Date => "TEXT",
+        (Backend::Postgres | Backend::MySql, Kind::Date) => "DATE",
+        #[cfg(feature = "chrono")]
+        (_, Kind::DateTime | Kind::NaiveDateTime | Kind::Date) => "TEXT",
         #[cfg(feature = "uuid")]
-        Kind::Uuid if postgres => "UUID",
+        (Backend::Postgres, Kind::Uuid) => "UUID",
         #[cfg(feature = "uuid")]
-        Kind::Uuid => "BLOB",
+        (Backend::MySql, Kind::Uuid) => "BINARY(16)",
+        #[cfg(feature = "uuid")]
+        (_, Kind::Uuid) => "BLOB",
         #[cfg(feature = "json")]
-        Kind::Json if postgres => "JSONB",
+        (Backend::Postgres, Kind::Json) => "JSONB",
         #[cfg(feature = "json")]
-        Kind::Json => "TEXT",
+        (Backend::MySql, Kind::Json) => "JSON",
+        #[cfg(feature = "json")]
+        (_, Kind::Json) => "TEXT",
     }
 }
 
+/// Whether a column is part of a key or index, which MySQL can't build on
+/// `TEXT`.
+fn is_indexed(column: &ColumnDef) -> bool {
+    column.primary_key || column.unique || column.index || column.references.is_some()
+}
+
 fn column_sql(column: &ColumnDef, backend: Backend) -> String {
-    let name = ident(column.name);
+    let name = ident(backend, column.name);
     if column.primary_key && column.auto_increment {
         return match (backend, column.kind) {
             (Backend::Postgres, Kind::I32) => format!("{} SERIAL PRIMARY KEY", name),
             (Backend::Postgres, _) => format!("{} BIGSERIAL PRIMARY KEY", name),
+            (Backend::MySql, Kind::I32) => format!("{} INT AUTO_INCREMENT PRIMARY KEY", name),
+            (Backend::MySql, _) => format!("{} BIGINT AUTO_INCREMENT PRIMARY KEY", name),
             // Only exactly `INTEGER PRIMARY KEY` aliases SQLite's rowid.
             (Backend::Sqlite, _) => format!("{} INTEGER PRIMARY KEY AUTOINCREMENT", name),
         };
     }
-    let mut sql = format!("{} {}", name, sql_type(column.kind, backend));
+    let mut sql = format!("{} {}", name, sql_type(column.kind, backend, is_indexed(column)));
     if column.primary_key {
         sql.push_str(" PRIMARY KEY");
     } else if !column.nullable {
@@ -74,13 +92,19 @@ fn column_sql(column: &ColumnDef, backend: Backend) -> String {
     if column.unique {
         sql.push_str(" UNIQUE");
     }
+    let now = match (backend, column.kind) {
+        #[cfg(feature = "chrono")]
+        (Backend::MySql, Kind::DateTime | Kind::NaiveDateTime) => "CURRENT_TIMESTAMP(6)",
+        _ => "CURRENT_TIMESTAMP",
+    };
     match (column.default_sql, column.timestamp) {
         (Some(default), _) => sql.push_str(&format!(" DEFAULT {}", default)),
-        (None, Some(_)) => sql.push_str(" DEFAULT CURRENT_TIMESTAMP"),
+        (None, Some(_)) => sql.push_str(&format!(" DEFAULT {}", now)),
         _ => {}
     }
-    if let Some(reference) = column.references {
-        sql.push_str(&format!(" REFERENCES {} ({})", ident(reference.table), ident(reference.column)));
+    // MySQL ignores inline REFERENCES; it gets a table-level FOREIGN KEY.
+    if let (Some(reference), false) = (column.references, backend == Backend::MySql) {
+        sql.push_str(&format!(" REFERENCES {} ({})", ident(backend, reference.table), ident(backend, reference.column)));
         if let Some(action) = reference.on_delete {
             sql.push_str(&format!(" ON DELETE {}", action.to_ascii_uppercase()));
         }
@@ -88,18 +112,66 @@ fn column_sql(column: &ColumnDef, backend: Backend) -> String {
     sql
 }
 
-/// `CREATE TABLE IF NOT EXISTS` for the model, plus `CREATE INDEX IF NOT
-/// EXISTS` for each `#[model(index)]` column.
-pub fn create_table<M: Model>(backend: Backend) -> String {
-    let columns: Vec<String> = M::COLUMNS.iter().map(|c| format!("    {}", column_sql(c, backend))).collect();
-    let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (\n{}\n);", ident(M::TABLE), columns.join(",\n"));
-    for column in M::COLUMNS.iter().filter(|c| c.index && !c.unique && !c.primary_key) {
-        sql.push_str(&format!(
-            "\nCREATE INDEX IF NOT EXISTS {} ON {} ({});",
-            ident(&format!("{}_{}_index", M::TABLE, column.name)),
-            ident(M::TABLE),
-            ident(column.name)
-        ));
+fn foreign_key(backend: Backend, column: &str, table: &str, target: &str, on_delete: Option<&str>) -> String {
+    let mut sql = format!(
+        "    FOREIGN KEY ({}) REFERENCES {} ({})",
+        ident(backend, column),
+        ident(backend, table),
+        ident(backend, target)
+    );
+    if let Some(action) = on_delete {
+        sql.push_str(&format!(" ON DELETE {}", action.to_ascii_uppercase()));
     }
     sql
+}
+
+/// `CREATE TABLE IF NOT EXISTS` for the model, plus an index for each
+/// `#[model(index)]` column.
+pub fn create_table<M: Model>(backend: Backend) -> String {
+    let table = ident(backend, M::TABLE);
+    let mut lines: Vec<String> = M::COLUMNS.iter().map(|c| format!("    {}", column_sql(c, backend))).collect();
+    let indexed = M::COLUMNS.iter().filter(|c| c.index && !c.unique && !c.primary_key);
+    let index_name = |column: &str| ident(backend, &format!("{}_{}_index", M::TABLE, column));
+    let mut after = String::new();
+    if backend == Backend::MySql {
+        // MySQL has no CREATE INDEX IF NOT EXISTS; declare everything inline.
+        for column in M::COLUMNS {
+            if let Some(reference) = column.references {
+                lines.push(foreign_key(backend, column.name, reference.table, reference.column, reference.on_delete));
+            }
+        }
+        for column in indexed {
+            lines.push(format!("    INDEX {} ({})", index_name(column.name), ident(backend, column.name)));
+        }
+    } else {
+        for column in indexed {
+            after.push_str(&format!(
+                "\nCREATE INDEX IF NOT EXISTS {} ON {} ({});",
+                index_name(column.name),
+                table,
+                ident(backend, column.name)
+            ));
+        }
+    }
+    format!("CREATE TABLE IF NOT EXISTS {} (\n{}\n);{}", table, lines.join(",\n"), after)
+}
+
+/// `CREATE TABLE IF NOT EXISTS` for a many-to-many pivot table: both key
+/// columns, a composite primary key, and foreign keys that delete links
+/// with either record.
+pub fn create_pivot_table<P: Model, C: Model>(relation: &BelongsToMany<P, C>, backend: Backend) -> String {
+    let (parent, related) = (primary_key::<P>(), primary_key::<C>());
+    let column = |name: &str, kind: Kind| format!("    {} {} NOT NULL", ident(backend, name), sql_type(kind, backend, true));
+    let lines = [
+        column(relation.foreign_key(), parent.kind),
+        column(relation.related_key(), related.kind),
+        format!(
+            "    PRIMARY KEY ({}, {})",
+            ident(backend, relation.foreign_key()),
+            ident(backend, relation.related_key())
+        ),
+        foreign_key(backend, relation.foreign_key(), P::TABLE, parent.name, Some("cascade")),
+        foreign_key(backend, relation.related_key(), C::TABLE, related.name, Some("cascade")),
+    ];
+    format!("CREATE TABLE IF NOT EXISTS {} (\n{}\n);", ident(backend, relation.pivot()), lines.join(",\n"))
 }

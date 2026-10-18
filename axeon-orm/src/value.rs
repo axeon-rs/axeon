@@ -155,6 +155,8 @@ macro_rules! sql_type {
                     Row::Postgres(row) => sqlx::Row::try_get(row, column).map_err(|e| Error::decode(column, e)),
                     #[cfg(feature = "sqlite")]
                     Row::Sqlite(row) => sqlx::Row::try_get(row, column).map_err(|e| Error::decode(column, e)),
+                    #[cfg(feature = "mysql")]
+                    Row::MySql(row) => sqlx::Row::try_get(row, column).map_err(|e| Error::decode(column, e)),
                 }
             }
         }

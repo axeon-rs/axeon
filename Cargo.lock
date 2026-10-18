@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "axeon-orm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axeon",
  "axeon-orm-macros",
@@ -202,8 +202,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "axeon-orm-cli"
+version = "0.2.0"
+dependencies = [
+ "axeon-orm",
+ "chrono",
+ "tokio",
+]
+
+[[package]]
 name = "axeon-orm-macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1925,6 +1934,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -2208,6 +2218,7 @@ dependencies = [
  "log",
  "memchr",
  "percent-encoding",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2218,6 +2229,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2935,6 +2947,15 @@ checksum = "88261b9deccee56594c11a3460c462c41f58d148598fe70ad77070126a68aba4"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

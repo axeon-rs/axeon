@@ -1,10 +1,10 @@
 //! Typed columns, conditions and the query builder.
 
-use crate::db::{Conn, Executor};
+use crate::db::{Backend, Conn, Executor, Row};
 use crate::error::{Error, Result};
-use crate::model::Model;
-use crate::relation::{Relation, WithQuery};
-use crate::sql::{column_list, ident, Cond, Sql};
+use crate::model::{primary_key, Model};
+use crate::relation::{Join, Related, Relation, WithQuery};
+use crate::sql::{column_list, Cond, Sql};
 use crate::value::{SqlType, Value};
 use serde::Serialize;
 use std::marker::PhantomData;
@@ -135,7 +135,7 @@ impl<M> Column<M, String> {
 /// A condition on model `M`. Combine with [`and`](Expr::and),
 /// [`or`](Expr::or), [`not`](Expr::not) or the `&`, `|` and `!` operators.
 pub struct Expr<M> {
-    cond: Cond,
+    pub(crate) cond: Cond,
     _marker: PhantomData<fn() -> M>,
 }
 
@@ -333,32 +333,55 @@ impl<M: Model> Query<M> {
         WithQuery::new(self, relation)
     }
 
-    fn select(&self, conn: &Conn<'_>) -> (String, Vec<Value>) {
-        let mut sql = Sql::new(conn.backend());
-        sql.push("SELECT ").push(&column_list::<M>()).push(" FROM ").push(&ident(M::TABLE));
+    /// Keeps rows with at least one related record:
+    /// `User::query().has(User::POSTS)`.
+    pub fn has<R: Related<M>>(self, relation: R) -> Self {
+        self.cond(relation.related_cond(None, false).0)
+    }
+
+    /// Keeps rows without any related record.
+    pub fn doesnt_have<R: Related<M>>(self, relation: R) -> Self {
+        self.cond(relation.related_cond(None, true).0)
+    }
+
+    /// Keeps rows with at least one related record matching `expr`:
+    /// `User::query().where_has(User::POSTS, Post::PUBLISHED.eq(true))`.
+    pub fn where_has<R: Related<M>>(self, relation: R, expr: Expr<R::Target>) -> Self {
+        self.cond(relation.related_cond(Some(expr), false).0)
+    }
+
+    /// Keeps rows without any related record matching `expr`.
+    pub fn where_doesnt_have<R: Related<M>>(self, relation: R, expr: Expr<R::Target>) -> Self {
+        self.cond(relation.related_cond(Some(expr), true).0)
+    }
+
+    /// Joins a `belongs_to`, `has_one` or `has_many` relation in the same
+    /// query, keeping rows that have a match: gives `(M, Related)` pairs.
+    /// With `has_many`, a row appears once per related record.
+    pub fn join<R: Join<M>>(self, relation: R) -> JoinQuery<M, R::Target, R::Target> {
+        JoinQuery::new(self, relation.on())
+    }
+
+    /// Like [`join`](Query::join), but keeps rows without a match:
+    /// gives `(M, Option<Related>)` pairs.
+    pub fn left_join<R: Join<M>>(self, relation: R) -> JoinQuery<M, R::Target, Option<R::Target>> {
+        JoinQuery::new(self, relation.on())
+    }
+
+    fn select(&self, backend: Backend) -> (String, Vec<Value>) {
+        let mut sql = Sql::new(backend);
+        sql.push("SELECT ").push(&column_list::<M>(backend)).push(" FROM ").ident(M::TABLE);
         sql.where_clause(&self.conds);
         for (i, (column, descending)) in self.order.iter().enumerate() {
             sql.push(if i == 0 { " ORDER BY " } else { ", " });
-            sql.push(&ident(column)).push(if *descending { " DESC" } else { " ASC" });
+            sql.ident(column).push(if *descending { " DESC" } else { " ASC" });
         }
-        match (self.limit, self.offset) {
-            (Some(limit), _) => {
-                sql.push(&format!(" LIMIT {}", limit));
-            }
-            // SQLite needs a LIMIT before OFFSET; -1 means none.
-            (None, Some(_)) if conn.backend() == crate::Backend::Sqlite => {
-                sql.push(" LIMIT -1");
-            }
-            _ => {}
-        }
-        if let Some(offset) = self.offset {
-            sql.push(&format!(" OFFSET {}", offset));
-        }
+        sql.limit_offset(self.limit, self.offset);
         sql.finish()
     }
 
     pub(crate) async fn fetch(&self, conn: &mut Conn<'_>) -> Result<Vec<M>> {
-        let (sql, args) = self.select(conn);
+        let (sql, args) = self.select(conn.backend());
         conn.fetch_all(sql, args).await?.iter().map(M::from_row).collect()
     }
 
@@ -377,13 +400,18 @@ impl<M: Model> Query<M> {
         self.first(ex).await?.ok_or(Error::NotFound)
     }
 
-    async fn count_on(&self, conn: &mut Conn<'_>) -> Result<u64> {
+    /// Runs `SELECT <expr> AS value` over the matching rows.
+    async fn scalar<T: SqlType>(&self, conn: &mut Conn<'_>, expr: &str) -> Result<T> {
         let mut sql = Sql::new(conn.backend());
-        sql.push("SELECT COUNT(*) AS \"count\" FROM ").push(&ident(M::TABLE));
+        sql.push("SELECT ").push(expr).push(" AS ").ident("value").push(" FROM ").ident(M::TABLE);
         sql.where_clause(&self.conds);
         let (sql, args) = sql.finish();
         let row = conn.fetch_optional(sql, args).await?.ok_or(Error::NotFound)?;
-        Ok(row.get::<i64>("count")?.max(0) as u64)
+        row.get::<T>("value")
+    }
+
+    async fn count_on(&self, conn: &mut Conn<'_>) -> Result<u64> {
+        Ok(self.scalar::<i64>(conn, "COUNT(*)").await?.max(0) as u64)
     }
 
     /// How many rows match; ignores order, limit and offset.
@@ -395,11 +423,82 @@ impl<M: Model> Query<M> {
     pub async fn exists<'c>(self, ex: impl Executor<'c>) -> Result<bool> {
         let mut conn = ex.into_conn();
         let mut sql = Sql::new(conn.backend());
-        sql.push("SELECT 1 AS \"one\" FROM ").push(&ident(M::TABLE));
+        sql.push("SELECT 1 AS ").ident("one").push(" FROM ").ident(M::TABLE);
         sql.where_clause(&self.conds);
         sql.push(" LIMIT 1");
         let (sql, args) = sql.finish();
         Ok(conn.fetch_optional(sql, args).await?.is_some())
+    }
+
+    /// `aggregate(column)`, cast to a fixed type so every database returns
+    /// the same Rust type.
+    fn aggregate(backend: Backend, function: &str, column: &str, float: bool) -> String {
+        let target = match (backend, float) {
+            (Backend::Postgres, true) => "DOUBLE PRECISION",
+            (Backend::Postgres, false) => "BIGINT",
+            (Backend::MySql, true) => "DOUBLE",
+            (Backend::MySql, false) => "SIGNED",
+            (_, true) => "REAL",
+            (_, false) => "INTEGER",
+        };
+        format!("CAST({}({}) AS {})", function, crate::sql::ident(backend, column), target)
+    }
+
+    /// The sum of a numeric column over the matching rows (`None` when no
+    /// rows match). Integer columns sum to `i64`, float columns to `f64`.
+    pub async fn sum<'c, T: Numeric>(self, ex: impl Executor<'c>, column: Column<M, T>) -> Result<Option<T::Sum>> {
+        let mut conn = ex.into_conn();
+        let expr = Self::aggregate(conn.backend(), "SUM", column.name, T::FLOAT);
+        self.scalar::<Option<T::Sum>>(&mut conn, &expr).await
+    }
+
+    /// The average of a numeric column, or `None` when no rows match.
+    pub async fn avg<'c, T: Numeric>(self, ex: impl Executor<'c>, column: Column<M, T>) -> Result<Option<f64>> {
+        let mut conn = ex.into_conn();
+        let expr = Self::aggregate(conn.backend(), "AVG", column.name, true);
+        self.scalar::<Option<f64>>(&mut conn, &expr).await
+    }
+
+    /// The smallest value of a column, or `None` when no rows match.
+    pub async fn min<'c, T: SqlType>(self, ex: impl Executor<'c>, column: Column<M, T>) -> Result<Option<T>> {
+        let mut conn = ex.into_conn();
+        let expr = format!("MIN({})", crate::sql::ident(conn.backend(), column.name));
+        self.scalar::<Option<T>>(&mut conn, &expr).await
+    }
+
+    /// The largest value of a column, or `None` when no rows match.
+    pub async fn max<'c, T: SqlType>(self, ex: impl Executor<'c>, column: Column<M, T>) -> Result<Option<T>> {
+        let mut conn = ex.into_conn();
+        let expr = format!("MAX({})", crate::sql::ident(conn.backend(), column.name));
+        self.scalar::<Option<T>>(&mut conn, &expr).await
+    }
+
+    /// How many matching rows have each value of a column, ordered by the
+    /// value. Rows where the column is `NULL` are left out.
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, Model};
+    /// # #[derive(Model)] struct Order { id: i64, status: String }
+    /// # async fn run(db: Db) -> axeon_orm::Result<()> {
+    /// for (status, n) in Order::query().count_by(&db, Order::STATUS).await? {
+    ///     println!("{}: {}", status, n);
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn count_by<'c, T: SqlType>(self, ex: impl Executor<'c>, column: Column<M, T>) -> Result<Vec<(T, u64)>> {
+        let mut conn = ex.into_conn();
+        let mut sql = Sql::new(conn.backend());
+        sql.push("SELECT ").ident(column.name).push(" AS ").ident("key");
+        sql.push(", COUNT(*) AS ").ident("count").push(" FROM ").ident(M::TABLE);
+        sql.where_clause(&self.conds);
+        sql.where_clause(&[Cond::Null(column.name, true)]);
+        sql.push(" GROUP BY ").ident(column.name).push(" ORDER BY ").ident(column.name);
+        let (sql, args) = sql.finish();
+        conn.fetch_all(sql, args)
+            .await?
+            .iter()
+            .map(|row| Ok((row.get::<T>("key")?, row.get::<i64>("count")?.max(0) as u64)))
+            .collect()
     }
 
     /// Page `page` (from 1) of `per_page` rows, with the total count.
@@ -416,13 +515,14 @@ impl<M: Model> Query<M> {
     pub async fn delete<'c>(self, ex: impl Executor<'c>) -> Result<u64> {
         let mut conn = ex.into_conn();
         let mut sql = Sql::new(conn.backend());
-        sql.push("DELETE FROM ").push(&ident(M::TABLE));
+        sql.push("DELETE FROM ").ident(M::TABLE);
         sql.where_clause(&self.conds);
         let (sql, args) = sql.finish();
         conn.execute(sql, args).await
     }
 
-    /// Updates every matching row; returns how many.
+    /// Updates every matching row; returns how many matched (MySQL counts
+    /// only rows whose values changed).
     ///
     /// ```no_run
     /// # use axeon_orm::{Db, Model};
@@ -434,14 +534,14 @@ impl<M: Model> Query<M> {
     pub async fn update<'c>(self, ex: impl Executor<'c>, set: impl IntoIterator<Item = Assignment<M>>) -> Result<u64> {
         let mut conn = ex.into_conn();
         let mut sql = Sql::new(conn.backend());
-        sql.push("UPDATE ").push(&ident(M::TABLE)).push(" SET ");
+        sql.push("UPDATE ").ident(M::TABLE).push(" SET ");
         let mut empty = true;
         for assignment in set {
             if !empty {
                 sql.push(", ");
             }
             empty = false;
-            sql.push(&ident(assignment.column)).push(" = ").arg(assignment.value);
+            sql.ident(assignment.column).push(" = ").arg(assignment.value);
         }
         if empty {
             return Ok(0);
@@ -449,5 +549,179 @@ impl<M: Model> Query<M> {
         sql.where_clause(&self.conds);
         let (sql, args) = sql.finish();
         conn.execute(sql, args).await
+    }
+}
+
+/// A numeric column type for [`Query::sum`] and [`Query::avg`].
+pub trait Numeric: SqlType {
+    /// What the sum is read as: `i64` for integers, `f64` for floats.
+    type Sum: SqlType;
+    #[doc(hidden)]
+    const FLOAT: bool;
+}
+
+impl Numeric for i32 {
+    type Sum = i64;
+    const FLOAT: bool = false;
+}
+
+impl Numeric for i64 {
+    type Sum = i64;
+    const FLOAT: bool = false;
+}
+
+impl Numeric for f64 {
+    type Sum = f64;
+    const FLOAT: bool = true;
+}
+
+/// How a joined row is read: `T` for an inner join, `Option<T>` for a left
+/// join.
+#[doc(hidden)]
+pub trait JoinOutput<T: Model>: Sized + Send {
+    const LEFT: bool;
+    fn decode(row: &Row, prefix: &str) -> Result<Self>;
+}
+
+impl<T: Model> JoinOutput<T> for T {
+    const LEFT: bool = false;
+    fn decode(row: &Row, prefix: &str) -> Result<Self> {
+        T::from_row_prefixed(row, prefix)
+    }
+}
+
+impl<T: Model> JoinOutput<T> for Option<T> {
+    const LEFT: bool = true;
+    fn decode(row: &Row, prefix: &str) -> Result<Self> {
+        let key = format!("{}{}", prefix, primary_key::<T>().name);
+        if row.is_null(&key)? {
+            Ok(None)
+        } else {
+            T::from_row_prefixed(row, prefix).map(Some)
+        }
+    }
+}
+
+const LEFT_ALIAS: &str = "t0";
+const RIGHT_ALIAS: &str = "t1";
+
+/// A query joining a related table, from [`Query::join`] or
+/// [`Query::left_join`]. Filter and sort by either side.
+///
+/// ```no_run
+/// # use axeon_orm::{Db, Model};
+/// # #[derive(Model, Clone)] struct User { id: i64, name: String }
+/// # #[derive(Model)] struct Post { id: i64, #[model(belongs_to = User)] user_id: i64, title: String }
+/// # async fn run(db: Db) -> axeon_orm::Result<()> {
+/// let rows: Vec<(Post, User)> = Post::query()
+///     .join(Post::USER)
+///     .filter_related(User::NAME.eq("Ada"))
+///     .order_by(Post::TITLE.asc())
+///     .all(&db)
+///     .await?;
+/// # Ok(()) }
+/// ```
+pub struct JoinQuery<M, T, O> {
+    query: Query<M>,
+    related: Vec<Cond>,
+    order: Vec<(&'static str, &'static str, bool)>,
+    on: (&'static str, &'static str),
+    _marker: PhantomData<fn() -> (T, O)>,
+}
+
+impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
+    fn new(query: Query<M>, on: (&'static str, &'static str)) -> Self {
+        let order = query.order.iter().map(|(column, desc)| (LEFT_ALIAS, *column, *desc)).collect();
+        Self { query, related: Vec::new(), order, on, _marker: PhantomData }
+    }
+
+    /// Keeps rows matching a condition on the main model.
+    pub fn filter(mut self, expr: Expr<M>) -> Self {
+        self.query.conds.push(expr.cond);
+        self
+    }
+
+    /// Keeps rows matching a condition on the joined model.
+    pub fn filter_related(mut self, expr: Expr<T>) -> Self {
+        self.related.push(expr.cond);
+        self
+    }
+
+    /// Sorts by a column of the main model.
+    pub fn order_by(mut self, order: Order<M>) -> Self {
+        self.order.push((LEFT_ALIAS, order.column, order.descending));
+        self
+    }
+
+    /// Sorts by a column of the joined model.
+    pub fn order_by_related(mut self, order: Order<T>) -> Self {
+        self.order.push((RIGHT_ALIAS, order.column, order.descending));
+        self
+    }
+
+    /// Returns at most `n` rows.
+    pub fn limit(mut self, n: u64) -> Self {
+        self.query.limit = Some(n);
+        self
+    }
+
+    /// Skips the first `n` rows.
+    pub fn offset(mut self, n: u64) -> Self {
+        self.query.offset = Some(n);
+        self
+    }
+
+    fn write_from(&self, sql: &mut Sql) {
+        sql.push(" FROM ").ident(M::TABLE).push(" AS ").ident(LEFT_ALIAS);
+        sql.push(if O::LEFT { " LEFT JOIN " } else { " INNER JOIN " });
+        sql.ident(T::TABLE).push(" AS ").ident(RIGHT_ALIAS).push(" ON ");
+        sql.ident(LEFT_ALIAS).push(".").ident(self.on.0).push(" = ");
+        sql.ident(RIGHT_ALIAS).push(".").ident(self.on.1);
+        sql.where_clause_as(&self.query.conds, Some(LEFT_ALIAS));
+        sql.where_clause_as(&self.related, Some(RIGHT_ALIAS));
+    }
+
+    /// Every matching pair.
+    pub async fn all<'c>(self, ex: impl Executor<'c>) -> Result<Vec<(M, O)>> {
+        let mut conn = ex.into_conn();
+        let mut sql = Sql::new(conn.backend());
+        sql.push("SELECT ");
+        let columns = M::COLUMNS.iter().map(|c| (LEFT_ALIAS, c.name)).chain(T::COLUMNS.iter().map(|c| (RIGHT_ALIAS, c.name)));
+        for (i, (alias, column)) in columns.enumerate() {
+            if i > 0 {
+                sql.push(", ");
+            }
+            sql.ident(alias).push(".").ident(column).push(" AS ").ident(&format!("{}_{}", alias, column));
+        }
+        self.write_from(&mut sql);
+        for (i, (alias, column, descending)) in self.order.iter().enumerate() {
+            sql.push(if i == 0 { " ORDER BY " } else { ", " });
+            sql.ident(alias).push(".").ident(column).push(if *descending { " DESC" } else { " ASC" });
+        }
+        sql.limit_offset(self.query.limit, self.query.offset);
+        let (sql, args) = sql.finish();
+        let left = format!("{}_", LEFT_ALIAS);
+        let right = format!("{}_", RIGHT_ALIAS);
+        conn.fetch_all(sql, args)
+            .await?
+            .iter()
+            .map(|row| Ok((M::from_row_prefixed(row, &left)?, O::decode(row, &right)?)))
+            .collect()
+    }
+
+    /// The first matching pair.
+    pub async fn first<'c>(self, ex: impl Executor<'c>) -> Result<Option<(M, O)>> {
+        Ok(self.limit(1).all(ex).await?.into_iter().next())
+    }
+
+    /// How many pairs match.
+    pub async fn count<'c>(self, ex: impl Executor<'c>) -> Result<u64> {
+        let mut conn = ex.into_conn();
+        let mut sql = Sql::new(conn.backend());
+        sql.push("SELECT COUNT(*) AS ").ident("count");
+        self.write_from(&mut sql);
+        let (sql, args) = sql.finish();
+        let row = conn.fetch_optional(sql, args).await?.ok_or(Error::NotFound)?;
+        Ok(row.get::<i64>("count")?.max(0) as u64)
     }
 }

@@ -55,7 +55,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p axeon --all-features
       - uses: dtolnay/rust-toolchain@1.94
-      - run: cargo check -p axeon-orm --all-features --all-targets
+      - run: cargo check -p axeon-orm -p axeon-orm-cli --all-features --all-targets
 
   lint:
     name: Clippy and docs
@@ -74,7 +74,7 @@ jobs:
       - run: cargo bench --no-run
 
   orm:
-    name: axeon-orm (SQLite and PostgreSQL)
+    name: axeon-orm (SQLite, PostgreSQL and MySQL)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -85,19 +85,30 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: mysql
+          MYSQL_DATABASE: axeon
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -pmysql" --health-interval 5s --health-timeout 5s --health-retries 20
     env:
       AXEON_ORM_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+      AXEON_ORM_MYSQL_URL: mysql://root:mysql@localhost:3306/axeon
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p axeon-orm -p axeon-orm-macros --all-features
+      - run: cargo test -p axeon-orm -p axeon-orm-macros -p axeon-orm-cli --all-features
       - run: cargo check -p axeon-orm --no-default-features --features sqlite --all-targets
       - run: cargo check -p axeon-orm --no-default-features --features postgres --all-targets
-      - run: cargo clippy -p axeon-orm -p axeon-orm-macros --all-targets --all-features
-      - run: cargo doc -p axeon-orm --no-deps --all-features
+      - run: cargo check -p axeon-orm --no-default-features --features mysql --all-targets
+      - run: cargo clippy -p axeon-orm -p axeon-orm-macros -p axeon-orm-cli --all-targets --all-features
+      - run: cargo doc -p axeon-orm -p axeon-orm-cli --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 

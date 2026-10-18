@@ -1,0 +1,21 @@
+[package]
+name = "axeon-orm-cli"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.94"
+description = "Command-line tool for axeon-orm migrations: create, run and list them"
+license = "MIT"
+repository = "https://github.com/axeon-rs/axeon"
+documentation = "https://docs.rs/axeon-orm"
+readme = "README.md"
+keywords = ["orm", "migrations", "database", "cli"]
+categories = ["database", "command-line-utilities"]
+
+[[bin]]
+name = "axeon-orm"
+path = "src/main.rs"
+
+[dependencies]
+axeon-orm = { version = "0.2.0", path = "../axeon-orm", default-features = false, features = ["postgres", "sqlite", "mysql", "tls", "chrono"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

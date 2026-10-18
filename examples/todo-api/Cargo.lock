@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "axeon-orm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axeon",
  "axeon-orm-macros",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "axeon-orm-macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",

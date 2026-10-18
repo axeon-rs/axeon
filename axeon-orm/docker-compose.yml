@@ -1,6 +1,8 @@
-# PostgreSQL for the axeon-orm tests:
+# PostgreSQL and MySQL for the axeon-orm tests:
 #   docker compose -f axeon-orm/docker-compose.yml up -d
-#   AXEON_ORM_POSTGRES_URL=postgres://postgres:postgres@localhost:55432/postgres cargo test -p axeon-orm
+#   export AXEON_ORM_POSTGRES_URL=postgres://postgres:postgres@localhost:55432/postgres
+#   export AXEON_ORM_MYSQL_URL=mysql://root:mysql@localhost:53306/axeon
+#   cargo test -p axeon-orm -p axeon-orm-cli --all-features
 services:
   postgres:
     image: postgres:17
@@ -12,3 +14,14 @@ services:
       test: ["CMD", "pg_isready", "-U", "postgres"]
       interval: 2s
       retries: 30
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: mysql
+      MYSQL_DATABASE: axeon
+    ports:
+      - "53306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-pmysql"]
+      interval: 2s
+      retries: 60

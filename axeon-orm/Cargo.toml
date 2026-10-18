@@ -1,6 +1,6 @@
 [package]
 name = "axeon-orm"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.94"
 description = "An Eloquent-style ORM for Rust on top of sqlx, with first-class Axeon integration"
@@ -16,7 +16,7 @@ categories = ["database", "web-programming"]
 all-features = true
 
 [dependencies]
-axeon-orm-macros = { version = "0.1.0", path = "../axeon-orm-macros" }
+axeon-orm-macros = { version = "0.2.0", path = "../axeon-orm-macros" }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
 futures = { version = "0.3.31", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,10 +31,14 @@ tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 
 [features]
-default = ["postgres", "sqlite", "chrono", "json", "axeon"]
+default = ["postgres", "sqlite", "tls", "chrono", "json", "axeon"]
 # Database backends; enable at least one.
 postgres = ["sqlx/postgres"]
 sqlite = ["sqlx/sqlite"]
+mysql = ["sqlx/mysql"]
+# Encrypted connections to PostgreSQL and MySQL (rustls with webpki roots).
+# Needed for most managed databases, and for MySQL 8's default login method.
+tls = ["sqlx/tls-rustls-ring-webpki"]
 # Column types.
 chrono = ["dep:chrono", "sqlx/chrono"]
 uuid = ["dep:uuid", "sqlx/uuid"]

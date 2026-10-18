@@ -1,6 +1,41 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.2.0 (unreleased)
+
+### Added
+
+- **Many-to-many relations:** `#[model(belongs_to_many(Tag))]` gives
+  `Post::TAGS` and `post.tags()`, through a pivot table (`post_tag` with
+  `post_id` and `tag_id` by default; all configurable). `attach`,
+  `attach_key`, `detach`, `detach_all` and `sync` manage links (linking
+  twice is not an error), `.with(Post::TAGS)` eager-loads them, and
+  `Db::create_pivot_table` / `schema::create_pivot_table` create the table.
+- **Aggregates:** `sum`, `avg`, `min`, `max` and `count_by` on queries.
+  Results are cast so every database returns the same Rust type (`sum` of
+  integers is `i64`, `avg` is `f64`).
+- **Filtering by relations:** `has`, `doesnt_have`, `where_has` and
+  `where_doesnt_have`, for every relation type.
+- **Joins:** `join` and `left_join` over `belongs_to`, `has_one` and
+  `has_many`, returning `(Model, Related)` or `(Model, Option<Related>)`
+  pairs from one query, with `filter_related` and `order_by_related`.
+- **MySQL** (feature `mysql`): MySQL 8, including inserts without
+  `RETURNING`, MySQL-specific table definitions, and `GET_LOCK` around
+  migrations. Tested against MySQL 8.4.
+- **TLS** (feature `tls`, on by default): encrypted connections to
+  PostgreSQL and MySQL with rustls. Most managed databases require it, and
+  MySQL 8's default login method needs it.
+- `Migrator::status`: applied and pending migrations, edited ones and ones
+  whose file is gone.
+- **`axeon-orm-cli`**, a new crate with the `axeon-orm` command:
+  `migrate new`, `migrate run` and `migrate status`.
+
+### Changed
+
+- `Model::from_row` now has a default implementation; the derive implements
+  the new `Model::from_row_prefixed` instead. Only hand-written `Model`
+  implementations need updating.
+
+## 0.1.0 (2026-10-17)
 
 First release.
 

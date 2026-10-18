@@ -375,8 +375,9 @@ let config: Config = config::from_env().expect("invalid configuration"); // list
 ### Databases
 
 [axeon-orm](axeon-orm) is the companion ORM: models are plain structs, with
-typed queries, relations, migrations and pagination, for PostgreSQL and
-SQLite (built on sqlx). It plugs into Axeon: `?` turns "not found" into a
+typed queries, relations (including many-to-many), aggregates, joins,
+migrations and pagination, for PostgreSQL, MySQL and SQLite (built on
+sqlx). It plugs into Axeon: `?` turns "not found" into a
 404 and constraint violations into a 409, and `Transactional` wraps each
 request in a transaction.
 
