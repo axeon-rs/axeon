@@ -46,7 +46,7 @@ multer = { version = "3", default-features = false, optional = true }
 cookie = { version = "0.18", features = ["percent-encode", "signed", "private", "key-expansion"], optional = true }
 getrandom = { version = "0.3", optional = true }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"], optional = true }
-base64 = "0.22"
+base64 = "0.23"
 minijinja = { version = "2", default-features = false, features = ["serde", "loader", "builtins", "macros", "multi_template", "adjacent_loop_items", "std_collections", "debug"], optional = true }
 
 [[example]]
