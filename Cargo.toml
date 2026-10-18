@@ -82,7 +82,7 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 tracing-subscriber = "0.3.20"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "timeout", "compression-gzip", "set-header", "decompression-gzip"] }
+tower-http = { version = "0.7", features = ["cors", "timeout", "compression-gzip", "set-header", "decompression-gzip"] }
 flate2 = "1"
 proptest = "1"
 
