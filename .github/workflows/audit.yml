@@ -1,0 +1,32 @@
+name: Security audit
+
+# New RustSec advisories appear without any change to this repository, so
+# check the lockfiles every week; the CI workflow covers pushes and pull
+# requests. Each advisory found opens (or updates) a GitHub issue.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  checks: write
+
+jobs:
+  audit:
+    name: Audit (${{ matrix.dir }})
+    if: github.repository == 'axeon-rs/axeon'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The published crates and the example app. The benchmark suite is
+        # left out: it only compares frameworks and is never deployed.
+        dir: [".", "examples/todo-api"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: ${{ matrix.dir }}

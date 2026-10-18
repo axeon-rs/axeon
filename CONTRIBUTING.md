@@ -72,6 +72,26 @@ compare `cargo bench` before and after and mention the results in the PR.
 A maintainer will review it. Please be patient: this is a volunteer project.
 CI must pass before a pull request is merged.
 
+## Releasing
+
+For maintainers. Releases are automated with
+[release-plz](https://release-plz.dev) (`release-plz.toml`):
+
+1. After CI passes on `master`, release-plz opens or updates a pull request
+   titled "chore: release" that bumps the version of every crate changed
+   since its last release. It runs `cargo-semver-checks` and fails if a
+   change breaks semver (for `axeon`, that would need 2.0).
+2. In that pull request, check the version bumps and move the changelog's
+   unreleased entries under the new version with today's date. Changelogs
+   are written by hand.
+3. Merge it. After CI passes again, release-plz publishes the new versions
+   to crates.io in dependency order, tags them (`v1.2.3` for `axeon`,
+   `axeon-orm-v0.3.0` and so on) and creates GitHub releases.
+
+Dependencies are kept current by Dependabot (`.github/dependabot.yml`), and
+a weekly `cargo audit` (`.github/workflows/audit.yml`) opens an issue for
+any new security advisory.
+
 ## License
 
 Axeon is licensed under the [MIT License](LICENSE). By contributing, you agree

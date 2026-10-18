@@ -1,0 +1,53 @@
+# Weekly dependency updates, each tested by CI before it can be merged.
+# Minor and patch updates are grouped into one pull request per folder to
+# keep the noise down; major updates (which may need code changes) come
+# one at a time. Security updates are opened as soon as an advisory is
+# published, independent of this schedule (enable "Dependabot security
+# updates" in the repository settings).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: cargo
+    directory: /examples/todo-api
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "deps(todo-api)"
+
+  - package-ecosystem: cargo
+    directory: /benchmarks/rust
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    groups:
+      all:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps(benchmarks)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"

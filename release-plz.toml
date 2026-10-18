@@ -1,0 +1,34 @@
+# Release automation: https://release-plz.dev
+#
+# On every push to master, release-plz opens (or updates) a "release PR"
+# that bumps the version of each crate changed since its last release.
+# Merging that PR publishes the bumped crates to crates.io, tags them and
+# creates GitHub releases. See CONTRIBUTING.md#releasing.
+
+[workspace]
+# Changelogs are written by hand: edit them in the release PR.
+changelog_update = false
+# Fail the release PR when a change breaks semver (cargo-semver-checks).
+semver_check = true
+git_release_enable = true
+pr_labels = ["release"]
+
+[[package]]
+name = "axeon"
+# Matches the existing v0.4.0 / v1.0.0 tags.
+git_tag_name = "v{{ version }}"
+git_release_name = "Axeon v{{ version }}"
+
+[[package]]
+name = "axeon-orm"
+git_tag_name = "axeon-orm-v{{ version }}"
+
+[[package]]
+name = "axeon-orm-macros"
+git_tag_name = "axeon-orm-macros-v{{ version }}"
+# Released together with axeon-orm; no separate GitHub release.
+git_release_enable = false
+
+[[package]]
+name = "axeon-orm-cli"
+git_tag_name = "axeon-orm-cli-v{{ version }}"
