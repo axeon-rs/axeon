@@ -46,6 +46,9 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    ignore:
+      # The tag names the pinned toolchain (MSRV), not an action version.
+      - dependency-name: "dtolnay/rust-toolchain"
     groups:
       actions:
         patterns: ["*"]

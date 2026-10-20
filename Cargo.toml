@@ -44,9 +44,9 @@ tower-layer = "0.3"
 http-body = "1"
 multer = { version = "3", default-features = false, optional = true }
 cookie = { version = "0.18", features = ["percent-encode", "signed", "private", "key-expansion"], optional = true }
-getrandom = { version = "0.3", optional = true }
+getrandom = { version = "0.4", optional = true }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"], optional = true }
-base64 = "0.22"
+base64 = "0.23"
 minijinja = { version = "2", default-features = false, features = ["serde", "loader", "builtins", "macros", "multi_template", "adjacent_loop_items", "std_collections", "debug"], optional = true }
 
 [[example]]
@@ -82,7 +82,7 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 tracing-subscriber = "0.3.20"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "timeout", "compression-gzip", "set-header", "decompression-gzip"] }
+tower-http = { version = "0.7", features = ["cors", "timeout", "compression-gzip", "set-header", "decompression-gzip"] }
 flate2 = "1"
 proptest = "1"
 
