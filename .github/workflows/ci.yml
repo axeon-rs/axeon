@@ -51,10 +51,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.120
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p axeon --all-features
-      - uses: dtolnay/rust-toolchain@1.120
+      - uses: dtolnay/rust-toolchain@1.94
       - run: cargo check -p axeon-orm -p axeon-orm-cli --all-features --all-targets
 
   lint:
