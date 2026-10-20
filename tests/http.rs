@@ -651,7 +651,7 @@ async fn tls_negotiates_http2_and_http11() {
     let cert_path = dir.0.join("cert.pem");
     let key_path = dir.0.join("key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     let mut app = Server::new();
     app.get("/", |_req| async { Response::text("secure") });
