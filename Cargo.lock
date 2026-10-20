@@ -186,9 +186,9 @@ dependencies = [
 
 [[package]]
 name = "axeon"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "cookie",
  "criterion",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "axeon-orm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axeon",
  "axeon-orm-macros",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "axeon-orm-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axeon-orm",
  "chrono",
@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "axeon-orm-macros"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proc-macro2",
  "quote",
