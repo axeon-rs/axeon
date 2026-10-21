@@ -13,6 +13,10 @@ pub enum Error {
     UniqueViolation(String),
     /// A foreign key constraint rejected the write; holds the database message.
     ForeignKeyViolation(String),
+    /// Another transaction holds a lock on a row that a
+    /// [`nowait`](crate::Query::nowait) query wanted; holds the database
+    /// message.
+    LockNotAvailable(String),
     /// A column couldn't be read into its Rust type.
     Decode {
         /// The column name.
@@ -42,6 +46,7 @@ impl fmt::Display for Error {
             Error::NotFound => f.write_str("record not found"),
             Error::UniqueViolation(msg) => write!(f, "unique constraint violated: {}", msg),
             Error::ForeignKeyViolation(msg) => write!(f, "foreign key constraint violated: {}", msg),
+            Error::LockNotAvailable(msg) => write!(f, "row lock not available: {}", msg),
             Error::Decode { column, message } => write!(f, "cannot decode column `{}`: {}", column, message),
             Error::Migration(msg) => write!(f, "migration error: {}", msg),
             Error::Config(msg) => write!(f, "configuration error: {}", msg),
@@ -68,8 +73,19 @@ impl From<sqlx::Error> for Error {
             sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
                 Error::ForeignKeyViolation(db.message().to_string())
             }
+            sqlx::Error::Database(db) if is_lock_not_available(&*db) => Error::LockNotAvailable(db.message().to_string()),
             sqlx::Error::ColumnDecode { index, source } => Error::Decode { column: index, message: source.to_string() },
             error => Error::Database(error),
         }
     }
+}
+
+/// PostgreSQL's `lock_not_available` (55P03), or MySQL's `ER_LOCK_NOWAIT`
+/// (3572), which only has the generic SQLSTATE `HY000`.
+fn is_lock_not_available(error: &dyn sqlx::error::DatabaseError) -> bool {
+    #[cfg(feature = "mysql")]
+    if let Some(error) = error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>() {
+        return error.number() == 3572;
+    }
+    error.code().as_deref() == Some("55P03")
 }

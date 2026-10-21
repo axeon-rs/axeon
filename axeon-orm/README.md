@@ -179,6 +179,31 @@ new_post(&user).insert(&mut tx).await?;
 tx.commit().await?;     // dropping `tx` instead rolls back
 ```
 
+### Row locks
+
+Inside a transaction, `for_update()` locks the rows a query reads until
+commit. `skip_locked()` leaves out rows other transactions have locked, so
+several workers can claim different jobs from one table, and `nowait()`
+fails at once with `Error::LockNotAvailable` instead of waiting:
+
+```rust
+let mut tx = db.begin().await?;
+if let Some(job) = Job::query()
+    .filter(Job::STATUS.eq("pending"))
+    .order_by(Job::ID.asc())
+    .skip_locked()
+    .first(&mut tx)
+    .await?
+{
+    Job::query().filter(Job::ID.eq(job.id)).update(&mut tx, [Job::STATUS.set("running")]).await?;
+}
+tx.commit().await?;
+```
+
+Joins lock only the main table's rows; `count`, `exists` and aggregates
+don't lock. SQLite has no row locks (a write transaction locks the whole
+database), so these are left out there.
+
 ## Migrations
 
 Put SQL files named `<version>_<name>.sql` in `migrations/`, then:

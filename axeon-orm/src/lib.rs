@@ -117,6 +117,8 @@
 //! - **Raw SQL fragments:** [`Expr::raw`] and [`Order::raw`] mix SQL
 //!   (JSONB, full-text search, pgvector) into a typed query, with bound
 //!   parameters.
+//! - **Row locks:** [`Query::for_update`], [`skip_locked`](Query::skip_locked)
+//!   and [`nowait`](Query::nowait), for claiming rows in a transaction.
 //! - **Migrations:** [`migrate`], and the `axeon-orm` command-line tool
 //!   (`cargo install axeon-orm-cli`).
 //!

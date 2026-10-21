@@ -4,7 +4,7 @@ use crate::db::{Backend, Conn, Executor, Row};
 use crate::error::{Error, Result};
 use crate::model::{primary_key, Model};
 use crate::relation::{Join, Related, Relation, WithQuery};
-use crate::sql::{column_list, Cond, Fragment, Sort, SortTerm, Sql};
+use crate::sql::{column_list, Cond, Fragment, Lock, Sort, SortTerm, Sql};
 use crate::value::{SqlType, Value};
 use serde::Serialize;
 use std::marker::PhantomData;
@@ -384,6 +384,7 @@ pub struct Query<M> {
     order: Vec<Sort>,
     limit: Option<u64>,
     offset: Option<u64>,
+    lock: Option<Lock>,
     _marker: PhantomData<fn() -> M>,
 }
 
@@ -394,6 +395,7 @@ impl<M> Clone for Query<M> {
             order: self.order.clone(),
             limit: self.limit,
             offset: self.offset,
+            lock: self.lock,
             _marker: PhantomData,
         }
     }
@@ -406,6 +408,7 @@ impl<M> std::fmt::Debug for Query<M> {
             .field("order", &self.order)
             .field("limit", &self.limit)
             .field("offset", &self.offset)
+            .field("lock", &self.lock)
             .finish()
     }
 }
@@ -419,7 +422,7 @@ impl<M: Model> Default for Query<M> {
 impl<M: Model> Query<M> {
     /// Every row of the table.
     pub fn new() -> Self {
-        Self { conds: Vec::new(), order: Vec::new(), limit: None, offset: None, _marker: PhantomData }
+        Self { conds: Vec::new(), order: Vec::new(), limit: None, offset: None, lock: None, _marker: PhantomData }
     }
 
     /// Keeps rows matching `expr`. Several filters must all match.
@@ -449,6 +452,59 @@ impl<M: Model> Query<M> {
     /// Skips the first `n` rows.
     pub fn offset(mut self, n: u64) -> Self {
         self.offset = Some(n);
+        self
+    }
+
+    /// Locks the selected rows (`FOR UPDATE`) until the transaction ends,
+    /// waiting for rows another transaction has locked. Run it in a
+    /// [transaction](crate::Db::begin): outside one, the lock is released
+    /// as soon as the statement finishes.
+    ///
+    /// The lock applies to the rows read by [`all`](Query::all),
+    /// [`first`](Query::first), [`paginate`](Query::paginate) and
+    /// [`with`](Query::with); `count`, `exists` and aggregates don't lock.
+    /// In a [join](Query::join), only rows of the main table are locked.
+    ///
+    /// SQLite has no row locks (a write transaction locks the whole
+    /// database), so there the query runs without one.
+    pub fn for_update(mut self) -> Self {
+        self.lock = Some(Lock::Wait);
+        self
+    }
+
+    /// Locks the selected rows like [`for_update`](Query::for_update), but
+    /// leaves out rows another transaction has locked instead of waiting
+    /// (`FOR UPDATE SKIP LOCKED`). This lets several workers claim
+    /// different rows of a queue at once:
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, Model};
+    /// # #[derive(Model)] struct Job { id: i64, status: String }
+    /// # async fn run(db: Db) -> axeon_orm::Result<()> {
+    /// let mut tx = db.begin().await?;
+    /// let next = Job::query()
+    ///     .filter(Job::STATUS.eq("pending"))
+    ///     .order_by(Job::ID.asc())
+    ///     .skip_locked()
+    ///     .first(&mut tx)
+    ///     .await?;
+    /// if let Some(job) = next {
+    ///     Job::query().filter(Job::ID.eq(job.id)).update(&mut tx, [Job::STATUS.set("running")]).await?;
+    /// }
+    /// tx.commit().await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn skip_locked(mut self) -> Self {
+        self.lock = Some(Lock::SkipLocked);
+        self
+    }
+
+    /// Locks the selected rows like [`for_update`](Query::for_update), but
+    /// fails with [`Error::LockNotAvailable`] instead of waiting when
+    /// another transaction holds a lock on one (`FOR UPDATE NOWAIT`). In
+    /// PostgreSQL the failure aborts the transaction, so roll it back.
+    pub fn nowait(mut self) -> Self {
+        self.lock = Some(Lock::NoWait);
         self
     }
 
@@ -500,6 +556,7 @@ impl<M: Model> Query<M> {
         sql.where_clause(&self.conds);
         sql.order_by(&self.order);
         sql.limit_offset(self.limit, self.offset);
+        sql.lock(self.lock, None);
         sql.finish()
     }
 
@@ -794,6 +851,27 @@ impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
         self
     }
 
+    /// Locks the selected rows of the main table; see
+    /// [`Query::for_update`].
+    pub fn for_update(mut self) -> Self {
+        self.query.lock = Some(Lock::Wait);
+        self
+    }
+
+    /// Locks the selected rows of the main table, leaving out rows locked
+    /// elsewhere; see [`Query::skip_locked`].
+    pub fn skip_locked(mut self) -> Self {
+        self.query.lock = Some(Lock::SkipLocked);
+        self
+    }
+
+    /// Locks the selected rows of the main table, failing if one is locked
+    /// elsewhere; see [`Query::nowait`].
+    pub fn nowait(mut self) -> Self {
+        self.query.lock = Some(Lock::NoWait);
+        self
+    }
+
     fn write_from(&self, sql: &mut Sql) {
         sql.push(" FROM ").ident(M::TABLE).push(" AS ").ident(LEFT_ALIAS);
         sql.push(if O::LEFT { " LEFT JOIN " } else { " INNER JOIN " });
@@ -819,6 +897,8 @@ impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
         self.write_from(&mut sql);
         sql.order_by(&self.order);
         sql.limit_offset(self.query.limit, self.query.offset);
+        // `OF`, since the nullable side of a left join can't be locked.
+        sql.lock(self.query.lock, Some(LEFT_ALIAS));
         let (sql, args) = sql.finish();
         let left = format!("{}_", LEFT_ALIAS);
         let right = format!("{}_", RIGHT_ALIAS);

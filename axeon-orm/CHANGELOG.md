@@ -21,6 +21,10 @@
   values (`RawArgs`: `()`, tuples of up to eight, arrays, `Vec`), numbered
   `$n` on PostgreSQL, and `??` is a literal `?` for PostgreSQL's JSONB
   operators. A placeholder/value count mismatch panics.
+- **Row locks:** `for_update`, `skip_locked` and `nowait` on queries and
+  joins (`FOR UPDATE [SKIP LOCKED | NOWAIT]`; joins lock only the main
+  table). Left out on SQLite, which has no row locks. A `nowait` conflict
+  is the new `Error::LockNotAvailable`.
 - `From` conversions into `Value` for `serde_json::Value`, `Uuid` and the
   chrono types.
 - **Joins:** `join` and `left_join` over `belongs_to`, `has_one` and

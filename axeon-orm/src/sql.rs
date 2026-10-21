@@ -78,6 +78,18 @@ impl Fragment {
     }
 }
 
+/// A row lock: `FOR UPDATE`, and what to do about rows another
+/// transaction has locked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lock {
+    /// Wait for them.
+    Wait,
+    /// Leave them out (`SKIP LOCKED`).
+    SkipLocked,
+    /// Fail at once (`NOWAIT`).
+    NoWait,
+}
+
 /// An `ORDER BY` term.
 #[derive(Clone, Debug)]
 pub(crate) struct Sort {
@@ -185,6 +197,25 @@ impl Sql {
             let _ = write!(self.text, " OFFSET {}", offset);
         }
         self
+    }
+
+    /// Appends `FOR UPDATE`, locking only the rows of table alias `of` in a
+    /// join. SQLite has no row locks (a write transaction locks the whole
+    /// database), so nothing is written there.
+    pub fn lock(&mut self, lock: Option<Lock>, of: Option<&'static str>) -> &mut Self {
+        let Some(lock) = lock else { return self };
+        if self.backend == Backend::Sqlite {
+            return self;
+        }
+        self.push(" FOR UPDATE");
+        if let Some(alias) = of {
+            self.push(" OF ").ident(alias);
+        }
+        match lock {
+            Lock::Wait => self,
+            Lock::SkipLocked => self.push(" SKIP LOCKED"),
+            Lock::NoWait => self.push(" NOWAIT"),
+        }
     }
 
     /// Appends `WHERE` (or `AND`, after an earlier `where_clause`) and the

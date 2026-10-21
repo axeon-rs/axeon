@@ -491,6 +491,56 @@ async fn raw_expressions(db: &Db) {
     }
 }
 
+async fn row_locks(db: &Db) {
+    setup(db).await;
+    let mut users = Vec::new();
+    for (name, age) in [("Ada", 36), ("Bob", 41), ("Cy", 25)] {
+        users.push(user(name, age).insert(db).await.unwrap());
+    }
+    post(&users[0], "Rust").insert(db).await.unwrap();
+    let names = |users: Vec<User>| users.into_iter().map(|u| u.name).collect::<Vec<_>>();
+    let by_id = || User::query().order_by(User::ID.asc());
+
+    // Without contention, every lock kind reads like a plain query.
+    let mut tx = db.begin().await.unwrap();
+    assert_eq!(names(by_id().for_update().all(&mut tx).await.unwrap()), ["Ada", "Bob", "Cy"]);
+    assert_eq!(names(by_id().filter(User::AGE.gt(30)).skip_locked().limit(1).all(&mut tx).await.unwrap()), ["Ada"]);
+    assert_eq!(by_id().nowait().first(&mut tx).await.unwrap().unwrap().name, "Ada");
+    let page = by_id().for_update().paginate(&mut tx, 2, 2).await.unwrap();
+    assert_eq!((names(page.items), page.total), (vec!["Cy".to_string()], 3));
+    assert_eq!(by_id().for_update().count(&mut tx).await.unwrap(), 3, "count ignores the lock");
+    assert!(by_id().for_update().exists(&mut tx).await.unwrap());
+    assert_eq!(by_id().for_update().with(User::POSTS).all(&mut tx).await.unwrap()[0].1.len(), 1);
+    // Left joins lock only the main table; its nullable side can't be locked.
+    let rows = by_id().for_update().left_join(User::PROFILE).all(&mut tx).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(Post::query().join(Post::USER).skip_locked().all(&mut tx).await.unwrap().len(), 1);
+    tx.commit().await.unwrap();
+
+    if db.backend() == Backend::Sqlite {
+        return; // One writer at a time: there are no row locks to contend for.
+    }
+    let mut holder = db.begin().await.unwrap();
+    let ada = User::query().filter(User::ID.eq(users[0].id)).for_update().first_or_fail(&mut holder).await.unwrap();
+    assert_eq!(ada.name, "Ada");
+
+    // Another transaction skips the locked row, or fails at once with NOWAIT.
+    let mut other = db.begin().await.unwrap();
+    assert_eq!(names(by_id().skip_locked().all(&mut other).await.unwrap()), ["Bob", "Cy"]);
+    let next = by_id().skip_locked().first(&mut other).await.unwrap().unwrap();
+    assert_eq!(next.name, "Bob");
+    let err = User::query().filter(User::ID.eq(ada.id)).nowait().all(&mut other).await.unwrap_err();
+    assert!(matches!(err, Error::LockNotAvailable(_)), "{:?}", err);
+    other.rollback().await.unwrap();
+
+    // Plain reads don't take locks, so they aren't blocked.
+    assert_eq!(User::find_or_fail(db, ada.id).await.unwrap().name, "Ada");
+    holder.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    assert_eq!(User::query().filter(User::ID.eq(ada.id)).nowait().all(&mut tx).await.unwrap().len(), 1, "released on commit");
+    tx.rollback().await.unwrap();
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -571,6 +621,7 @@ backend_tests!(
     aggregates,
     relation_filters_and_joins,
     raw_expressions,
+    row_locks,
 );
 
 #[test]
