@@ -6,11 +6,11 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{watch, OwnedSemaphorePermit};
-use tokio::time::{sleep, Sleep};
+use tokio::time::{sleep, Instant, Sleep};
 #[cfg(feature = "ws")]
 use tokio_util::sync::CancellationToken;
 #[cfg(feature = "ws")]
@@ -123,6 +123,91 @@ impl UpgradeContext {
 
 /// The connection slot, shared by a connection's requests.
 pub(crate) type Slot = Arc<Mutex<Option<OwnedSemaphorePermit>>>;
+
+/// How long, and how much, a closing connection reads and discards; it stops
+/// sooner once the client has gone quiet.
+const LINGER_TIME: Duration = Duration::from_secs(2);
+const LINGER_QUIET: Duration = Duration::from_millis(500);
+const LINGER_BYTES: usize = 1 << 20;
+
+/// Closes gracefully: after shutting down the write side, reads and discards
+/// what the client is still sending (an unread request body, say) for a
+/// while. Closing a socket with unread data resets the connection, and a
+/// reset can make the client drop the response it was sent before reading it.
+pub(crate) struct LingeringClose<S> {
+    inner: S,
+    linger: Option<Linger>,
+}
+
+struct Linger {
+    deadline: Pin<Box<Sleep>>,
+    quiet: Pin<Box<Sleep>>,
+    left: usize,
+}
+
+impl<S> LingeringClose<S> {
+    pub(crate) fn new(inner: S) -> Self {
+        Self { inner, linger: None }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for LingeringClose<S> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for LingeringClose<S> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        if this.linger.is_none() {
+            ready!(Pin::new(&mut this.inner).poll_shutdown(cx))?;
+            this.linger = Some(Linger {
+                deadline: Box::pin(sleep(LINGER_TIME)),
+                quiet: Box::pin(sleep(LINGER_QUIET)),
+                left: LINGER_BYTES,
+            });
+        }
+        let linger = this.linger.as_mut().expect("set above");
+        let mut scratch = [0u8; 8192];
+        loop {
+            if linger.left == 0 || linger.deadline.as_mut().poll(cx).is_ready() || linger.quiet.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Ok(()));
+            }
+            let mut buf = ReadBuf::new(&mut scratch);
+            match Pin::new(&mut this.inner).poll_read(cx, &mut buf) {
+                Poll::Ready(Ok(())) if buf.filled().is_empty() => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(())) => {
+                    linger.left = linger.left.saturating_sub(buf.filled().len());
+                    linger.quiet.as_mut().reset(Instant::now() + LINGER_QUIET);
+                }
+                // The write side is already shut down: nothing left to protect.
+                Poll::Ready(Err(_)) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
 
 /// Fails writes that make no progress for `timeout`, so a client that stops
 /// reading can't hold a connection (and its buffers) forever.

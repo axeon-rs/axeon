@@ -54,7 +54,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{watch, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use crate::lifecycle::{ConnContext, Slot, WriteTimeout};
+use crate::lifecycle::{ConnContext, LingeringClose, Slot, WriteTimeout};
 #[cfg(feature = "ws")]
 use crate::lifecycle::UpgradeContext;
 use tracing::{debug, error, info, warn};
@@ -603,7 +603,7 @@ impl Server {
                 },
             };
             let _ = stream.set_nodelay(true);
-            let stream = WriteTimeout::new(stream, app.write_timeout);
+            let stream = WriteTimeout::new(LingeringClose::new(stream), app.write_timeout);
             // Shared with the connection's requests so a WebSocket upgrade
             // can keep the slot after the HTTP connection ends.
             let slot: Slot = Arc::new(std::sync::Mutex::new(Some(permit)));
