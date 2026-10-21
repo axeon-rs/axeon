@@ -56,6 +56,35 @@ pub(crate) struct Endpoint {
     middlewares: Vec<Arc<dyn Middleware>>,
     body: BodyConfig,
     timeout: RouteTimeout,
+    /// Values from [`RouteBuilder::meta`], e.g. API documentation.
+    meta: http::Extensions,
+}
+
+/// A registered route, from [`Router::routes`] or
+/// [`Server::routes`](crate::Server::routes): for tools that describe the
+/// API, such as OpenAPI generators.
+#[derive(Clone, Copy, Debug)]
+pub struct RouteInfo<'a> {
+    method: Method,
+    path: &'a str,
+    meta: &'a http::Extensions,
+}
+
+impl<'a> RouteInfo<'a> {
+    /// The HTTP method.
+    pub fn method(&self) -> Method {
+        self.method
+    }
+
+    /// The path pattern, e.g. `/users/:id`.
+    pub fn path(&self) -> &'a str {
+        self.path
+    }
+
+    /// A value attached with [`RouteBuilder::meta`].
+    pub fn meta<T: Send + Sync + 'static>(&self) -> Option<&'a T> {
+        self.meta.get::<T>()
+    }
 }
 
 /// A group of routes with shared middleware. Paths use `:name` for a
@@ -75,6 +104,20 @@ impl Router {
     /// An empty router.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Every registered route, including those of mounted routers, sorted
+    /// by path, then method.
+    pub fn routes(&self) -> Vec<RouteInfo<'_>> {
+        let mut routes: Vec<RouteInfo<'_>> = self
+            .routes
+            .iter()
+            .flat_map(|(path, endpoints)| {
+                endpoints.iter().map(move |(method, endpoint)| RouteInfo { method: *method, path, meta: &endpoint.meta })
+            })
+            .collect();
+        routes.sort_by(|a, b| (a.path, a.method.as_str()).cmp(&(b.path, b.method.as_str())));
+        routes
     }
 
     /// Registers a GET handler for `path`.
@@ -182,7 +225,13 @@ impl Router {
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
-        let endpoint = Endpoint { handler: Arc::new(handler), middlewares: Vec::new(), body: BodyConfig::default(), timeout: RouteTimeout::default() };
+        let endpoint = Endpoint {
+            handler: Arc::new(handler),
+            middlewares: Vec::new(),
+            body: BodyConfig::default(),
+            timeout: RouteTimeout::default(),
+            meta: http::Extensions::new(),
+        };
         self.routes.entry(normalize(path)).or_default().insert(method, endpoint);
     }
 
@@ -222,6 +271,7 @@ impl Router {
             middlewares: Vec::new(),
             body: BodyConfig::default(),
             timeout: RouteTimeout::default(),
+            meta: http::Extensions::new(),
         }
     }
 
@@ -256,7 +306,7 @@ impl Router {
                     .chain(endpoint.middlewares.iter())
                     .cloned()
                     .collect();
-                entry.insert(method, Endpoint { handler: endpoint.handler, middlewares, body: endpoint.body, timeout: endpoint.timeout });
+                entry.insert(method, Endpoint { middlewares, ..endpoint });
             }
         }
         self
@@ -328,6 +378,7 @@ pub struct RouteBuilder<'a> {
     middlewares: Vec<Arc<dyn Middleware>>,
     body: BodyConfig,
     timeout: RouteTimeout,
+    meta: http::Extensions,
 }
 
 macro_rules! route_methods {
@@ -360,7 +411,13 @@ impl RouteBuilder<'_> {
     }
 
     fn add(&mut self, method: Method, handler: Arc<dyn Handler>) -> &mut Self {
-        let endpoint = Endpoint { handler, middlewares: self.middlewares.clone(), body: self.body, timeout: self.timeout };
+        let endpoint = Endpoint {
+            handler,
+            middlewares: self.middlewares.clone(),
+            body: self.body,
+            timeout: self.timeout,
+            meta: self.meta.clone(),
+        };
         self.router.routes.entry(self.path.clone()).or_default().insert(method, endpoint);
         if !self.methods.contains(&method) {
             self.methods.push(method);
@@ -445,6 +502,18 @@ impl RouteBuilder<'_> {
     /// [`Server::handler_timeout`](crate::Server::handler_timeout).
     pub fn no_timeout(&mut self) -> &mut Self {
         self.set_timeout(RouteTimeout::Never)
+    }
+
+    /// Attaches a value to these handlers, replacing one of the same type,
+    /// for tools that read [`Router::routes`]: e.g. axeon-openapi stores
+    /// each route's API documentation this way. It doesn't change how
+    /// requests are handled.
+    pub fn meta<T: Clone + Send + Sync + 'static>(&mut self, value: T) -> &mut Self {
+        self.meta.insert(value.clone());
+        self.update(|endpoint| {
+            endpoint.meta.insert(value.clone());
+        });
+        self
     }
 
     fn set_timeout(&mut self, timeout: RouteTimeout) -> &mut Self {

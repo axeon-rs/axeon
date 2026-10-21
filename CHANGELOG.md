@@ -38,6 +38,10 @@ release, WebSocket and JWT types are now Axeon's own:
 - `rust-version = "1.88"`, tested in CI, and a documented
   [stability policy](README.md#stability).
 - CI runs the test suite on Windows.
+- **Route metadata:** `RouteBuilder::meta(value)` attaches a value to a
+  route's handlers, and `Server::routes()` / `Router::routes()` list every
+  route (`RouteInfo`: method, pattern, metadata), for tools such as
+  axeon-openapi.
 - **Handler timeouts:** `Server::handler_timeout` (off by default) and
   per-route `RouteBuilder::timeout` / `no_timeout`, kept through
   `mount`. A handler that runs over is cancelled and answered with 503,

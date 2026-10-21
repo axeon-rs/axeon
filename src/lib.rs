@@ -145,7 +145,7 @@ mod tls;
 pub use app::{shutdown_signal, App, Server};
 pub use crate::tower::AppService;
 pub use lifecycle::Shutdown;
-pub use router::{RouteBuilder, Router};
+pub use router::{RouteBuilder, RouteInfo, Router};
 
 pub use crate::error::{ServerError, ServerResult};
 pub use crate::handler::{Html, IntoResponse, Json};

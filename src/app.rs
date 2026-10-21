@@ -180,6 +180,12 @@ impl Server {
         self
     }
 
+    /// Every registered route, sorted by path, then method; see
+    /// [`Router::routes`]. Static files and the SPA fallback aren't routes.
+    pub fn routes(&self) -> Vec<crate::RouteInfo<'_>> {
+        self.router.routes()
+    }
+
     /// How long each route's middleware and handler may take to produce a
     /// response; after that the handler is cancelled and the client gets
     /// 503 ([`ServerError::HandlerTimeout`]). Routes can override it with
