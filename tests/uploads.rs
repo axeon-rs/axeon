@@ -8,6 +8,10 @@ use axeon::multipart::sniff;
 use axeon::{Json, Method, Request, Server, ServerError};
 use common::{start, Client, TempDir};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR rest of a png";
 const PDF: &[u8] = b"%PDF-1.7\n1 0 obj << >> endobj\n%%EOF";
@@ -228,14 +232,22 @@ async fn rejected_types_never_reach_the_writer() {
     // A large non-image, arriving in pieces: none of it may be written.
     let data = vec![b'x'; 200_000];
     let (header, body) = form("image/png", &data);
-    let mut client = Client::connect(addr).await;
-    client
-        .send(format!("POST /upload HTTP/1.1\r\nHost: t\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n", header, body.len()).as_bytes())
-        .await;
-    for piece in body.chunks(7_000) {
-        client.send(piece).await;
-    }
-    let res = client.read().await.unwrap();
-    assert_eq!(res.status, 415);
+    // The server answers and closes before the body is done, so read while
+    // writing: once it has, Windows aborts the rest of the writes.
+    let (read, mut write) = TcpStream::connect(addr).await.unwrap().into_split();
+    let head = format!("POST /upload HTTP/1.1\r\nHost: t\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n", header, body.len());
+    let send = async move {
+        write.write_all(head.as_bytes()).await?;
+        for piece in body.chunks(7_000) {
+            write.write_all(piece).await?;
+        }
+        Ok::<_, std::io::Error>(write)
+    };
+    let mut status = String::new();
+    let mut read = BufReader::new(read);
+    let receive = timeout(Duration::from_secs(5), read.read_line(&mut status));
+    let (_, received) = tokio::join!(send, receive);
+    received.expect("timed out waiting for response").unwrap();
+    assert!(status.starts_with("HTTP/1.1 415 "), "{:?}", status);
     assert!(written.0.lock().unwrap().is_empty(), "{} bytes reached the writer", written.0.lock().unwrap().len());
 }

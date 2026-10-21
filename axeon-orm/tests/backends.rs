@@ -805,9 +805,14 @@ async fn json_filters(db: &Db) {
     assert_eq!(names(by_price), ["chair", "lamp", "rug"]);
     let by_color = Item::query().filter(f().key("specs").key("color").exists()).order_by(f().key("specs").key("color").asc()).order_by(Item::ID.asc());
     let colors: Vec<String> = by_color.all(db).await.unwrap().into_iter().map(|i| i.fields["specs"]["color"].as_str().unwrap().to_string()).collect();
-    let mut sorted = colors.clone();
-    sorted.sort();
-    assert_eq!(colors, sorted);
+    // How case sorts is the collation's call: bytewise in SQLite and MySQL
+    // (JSON text is binary), lowercase first under PostgreSQL's en_US.
+    let mut bytewise = colors.clone();
+    bytewise.sort();
+    let mut caseless = colors.clone();
+    caseless.sort_by_key(|c| c.to_lowercase());
+    assert!(colors == bytewise || colors == caseless, "{:?} isn't sorted", colors);
+    assert_eq!(colors.len(), 4);
 
     // A NULL column matches neither a filter nor its negation's opposite.
     assert_eq!(names(find(!Item::EXTRA.has_key("k")).await.unwrap()), ["lamp", "chair", "desk", "rug"]);
