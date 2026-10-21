@@ -166,6 +166,8 @@
 //!   and [`where_has`](Query::where_has).
 //! - **Joins:** [`Query::join`] and [`left_join`](Query::left_join) give
 //!   `(Post, User)` pairs from one query, filtered and sorted by either side.
+//! - **Full-text and hybrid search:** [`search`] (PostgreSQL), with
+//!   [`Query::ranked`].
 //! - **Vector search:** [`vector::Vector`] columns, distances to sort and
 //!   filter by, and [`Query::nearest`] (feature `pgvector`).
 //! - **JSON filters:** [`Column::contains`], [`has_key`](Column::has_key)
@@ -196,6 +198,8 @@ mod sql;
 mod value;
 
 pub mod migrate;
+#[cfg(feature = "postgres")]
+pub mod search;
 #[cfg(feature = "pgvector")]
 pub mod vector;
 #[cfg(all(feature = "axeon", feature = "postgres"))]

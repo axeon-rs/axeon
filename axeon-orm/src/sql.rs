@@ -44,6 +44,30 @@ pub(crate) enum Cond {
     /// `column <op> vector <compare> limit`, e.g. `embedding <=> $1 < 0.3`.
     #[cfg(feature = "pgvector")]
     Distance(&'static str, &'static str, Value, &'static str, f64),
+    /// Full-text match: source, configuration, query text.
+    #[cfg(feature = "postgres")]
+    FullText(FtsSource, String, Value),
+}
+
+/// What full-text search searches.
+#[cfg(feature = "postgres")]
+#[derive(Clone, Debug)]
+pub(crate) enum FtsSource {
+    /// Text columns, made into a `tsvector` per query.
+    Columns(Vec<&'static str>),
+    /// A stored `tsvector` column.
+    Stored(&'static str),
+}
+
+/// One part of a [`Score`](crate::search::Score).
+#[cfg(feature = "postgres")]
+#[derive(Clone, Debug)]
+pub(crate) enum ScoreTerm {
+    /// `ts_rank(..., 32)`: source, configuration, query text.
+    TextRank(FtsSource, String, Value),
+    /// A similarity from a vector distance: column, operator, vector.
+    #[cfg(feature = "pgvector")]
+    Similarity(&'static str, &'static str, Value),
 }
 
 /// A step into a JSON document: an object key or an array index.
@@ -169,6 +193,9 @@ pub(crate) enum SortTerm {
     /// `column <op> vector`.
     #[cfg(feature = "pgvector")]
     Distance(&'static str, &'static str, Value),
+    /// A weighted sum of scores.
+    #[cfg(feature = "postgres")]
+    Score(Vec<(f64, ScoreTerm)>),
 }
 
 /// SQL text with its parameters, numbered for the target database.
@@ -241,6 +268,12 @@ impl Sql {
                 }
                 SortTerm::Raw(fragment) => {
                     self.push("(").fragment(fragment).push(")");
+                }
+                #[cfg(feature = "postgres")]
+                SortTerm::Score(terms) => {
+                    let previous = std::mem::replace(&mut self.qualifier, sort.qualifier);
+                    self.score(terms);
+                    self.qualifier = previous;
                 }
                 #[cfg(feature = "pgvector")]
                 SortTerm::Distance(column, op, target) => {
@@ -379,6 +412,18 @@ impl Sql {
             // Parenthesized, so `OR` inside the fragment can't escape it.
             Cond::Raw(fragment) => {
                 self.push("(").fragment(fragment).push(")");
+            }
+            #[cfg(feature = "postgres")]
+            Cond::FullText(source, config, query) => {
+                if self.backend != Backend::Postgres {
+                    self.push("axeon_orm_full_text_search_needs_postgres()");
+                    return;
+                }
+                self.push("(");
+                self.fts_vector(source, config);
+                self.push(" @@ ");
+                self.fts_query(config, query);
+                self.push(")");
             }
             #[cfg(feature = "pgvector")]
             Cond::Distance(column, op, target, compare, limit) => {
@@ -572,6 +617,81 @@ impl Sql {
                 }
             }
         }
+    }
+
+    /// The `tsvector` searched: `to_tsvector('config'::regconfig,
+    /// coalesce(a, '') || ' ' || coalesce(b, ''))`, or the stored column.
+    /// The configuration is a literal so expression indexes can match.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn fts_vector(&mut self, source: &FtsSource, config: &str) {
+        match source {
+            FtsSource::Stored(column) => {
+                self.column(column);
+            }
+            FtsSource::Columns(columns) => {
+                self.push("to_tsvector('").push(config).push("'::regconfig, ");
+                for (i, column) in columns.iter().enumerate() {
+                    if i > 0 {
+                        self.push(" || ' ' || ");
+                    }
+                    self.push("coalesce(").column(column).push(", '')");
+                }
+                if columns.is_empty() {
+                    self.push("''");
+                }
+                self.push(")");
+            }
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    fn fts_query(&mut self, config: &str, query: &Value) {
+        self.push("websearch_to_tsquery('").push(config).push("'::regconfig, ").arg(query.clone()).push(")");
+    }
+
+    /// `(w1 * term1 + w2 * term2)`, as `double precision`.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn score(&mut self, terms: &[(f64, ScoreTerm)]) {
+        if self.backend != Backend::Postgres {
+            self.push("axeon_orm_scores_need_postgres()");
+            return;
+        }
+        self.push("(");
+        if terms.is_empty() {
+            self.push("0");
+        }
+        for (i, (weight, term)) in terms.iter().enumerate() {
+            if i > 0 {
+                self.push(" + ");
+            }
+            self.arg(Value::F64(*weight)).push(" * ");
+            match term {
+                ScoreTerm::TextRank(source, config, query) => {
+                    self.push("ts_rank(");
+                    self.fts_vector(source, config);
+                    self.push(", ");
+                    self.fts_query(config, query);
+                    self.push(", 32)::float8");
+                }
+                #[cfg(feature = "pgvector")]
+                ScoreTerm::Similarity(column, op, target) => {
+                    // Larger is closer: 1 - cosine distance, 1 / (1 + L2
+                    // distance), or the inner product.
+                    match *op {
+                        "<=>" => {
+                            self.push("(1 - (").column(column).push(" <=> ").arg(target.clone()).push("))");
+                        }
+                        "<->" => {
+                            self.push("(1 / (1 + (").column(column).push(" <-> ").arg(target.clone()).push(")))");
+                        }
+                        _ => {
+                            self.push("(-(").column(column).push(" ").push(op).push(" ").arg(target.clone()).push("))");
+                        }
+                    }
+                }
+            }
+        }
+        self.push(")");
     }
 
     pub fn finish(self) -> (String, Vec<Value>) {

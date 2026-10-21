@@ -442,6 +442,11 @@ impl<M> Order<M> {
         Order { sort: Sort { term, descending, qualifier: None }, _marker: PhantomData }
     }
 
+    #[cfg(feature = "postgres")]
+    pub(crate) fn score(term: SortTerm, descending: bool) -> Order<M> {
+        Order::new(term, descending)
+    }
+
     #[cfg(feature = "pgvector")]
     pub(crate) fn distance(distance: crate::vector::Distance<M>, descending: bool) -> Order<M> {
         let term = SortTerm::Distance(distance.column, distance.metric.operator(), Value::Vector(distance.target));
@@ -750,6 +755,12 @@ impl<M: Model> Query<M> {
         sql.finish()
     }
 
+    /// The `SELECT` this query runs on `backend`, and its parameters: for
+    /// logging, or for `EXPLAIN` to check which indexes it uses.
+    pub fn to_sql(&self, backend: Backend) -> (String, Vec<Value>) {
+        self.select(backend)
+    }
+
     pub(crate) async fn fetch(&self, conn: &mut Conn<'_>) -> Result<Vec<M>> {
         let (sql, args) = self.select(conn.backend());
         conn.fetch_all(sql, args).await?.iter().map(M::from_row).collect()
@@ -778,6 +789,31 @@ impl<M: Model> Query<M> {
             .await?
             .iter()
             .map(|row| Ok((M::from_row(row)?, row.get::<f64>("__axeon_distance")?)))
+            .collect()
+    }
+
+    /// The `k` matching rows with the highest `score`, best first, with
+    /// their scores: for full-text and hybrid search (see
+    /// [`search`](crate::search)). PostgreSQL only.
+    #[cfg(feature = "postgres")]
+    pub async fn ranked<'c>(self, ex: impl Executor<'c>, score: impl Into<crate::search::Score<M>>, k: u64) -> Result<Vec<(M, f64)>> {
+        let score = score.into();
+        let mut conn = ex.into_conn();
+        let backend = conn.backend();
+        if backend != Backend::Postgres {
+            return Err(Error::Config("full-text search needs PostgreSQL".into()));
+        }
+        let mut sql = Sql::new(backend);
+        sql.push("SELECT ").push(&column_list::<M>(backend)).push(", ");
+        sql.score(&score.terms);
+        sql.push(" AS ").ident("__axeon_score").push(" FROM ").ident(M::TABLE);
+        sql.where_clause(&self.conds);
+        sql.push(" ORDER BY ").ident("__axeon_score").push(" DESC LIMIT ").push(&k.to_string());
+        let (sql, args) = sql.finish();
+        conn.fetch_all(sql, args)
+            .await?
+            .iter()
+            .map(|row| Ok((M::from_row(row)?, row.get::<f64>("__axeon_score")?)))
             .collect()
     }
 

@@ -217,6 +217,37 @@ let rows: Vec<(Post, User)> = Post::query()
 let rows: Vec<(User, Option<Profile>)> = User::query().left_join(User::PROFILE).all(&db).await?;
 ```
 
+## Full-text and hybrid search (PostgreSQL)
+
+```rust
+use axeon_orm::search::{self, FullText};
+
+let fts = FullText::columns([Product::NAME, Product::DESCRIPTION]).config("english");
+db.execute(&search::create_index(&fts, "products_fts")).await?;   // GIN, matching the queries
+
+// Web-search syntax: words, "quoted phrases", OR, -excluded.
+let found = Product::query()
+    .filter(fts.matches("led lamp -solar"))
+    .order_by(fts.rank("led lamp -solar").desc())
+    .all(&db)
+    .await?;
+
+// Hybrid: text rank and vector similarity in one score, best first.
+let q = "led lamp";
+let score = fts.rank(q) * 0.6 + Product::EMBEDDING.cosine_distance(&v).similarity() * 0.4;
+let top: Vec<(Product, f64)> = Product::query()
+    .filter(fts.matches(q) | Product::EMBEDDING.cosine_distance(&v).lt(0.5))
+    .ranked(&db, score, 20)
+    .await?;
+```
+
+Ranks are normalized to 0..1 so they mix with similarities. Search a
+stored, generated `tsvector` column instead with `FullText::stored("search")`
+and `search::generated_column(...)`. `Query::to_sql` shows the SQL, e.g. to
+`EXPLAIN` it. PostgreSQL has no Chinese word splitting of its own (`simple`
+treats a run of Chinese characters as one word): install zhparser or
+pg_jieba and pass its configuration to `.config(...)`.
+
 ## Vector search (pgvector)
 
 With the `pgvector` feature and the extension in PostgreSQL

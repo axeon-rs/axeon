@@ -15,6 +15,13 @@
   integers is `i64`, `avg` is `f64`).
 - **Filtering by relations:** `has`, `doesnt_have`, `where_has` and
   `where_doesnt_have`, for every relation type.
+- **Full-text search** (PostgreSQL): `search::FullText` over text columns
+  or a stored `tsvector`, `matches` (`websearch_to_tsquery` syntax) and
+  `rank` (normalized `ts_rank`), `search::create_index` (a GIN index on
+  the exact expression queries use) and `search::generated_column`.
+  Ranks and vector `similarity()` combine into weighted `Score`s for
+  hybrid search, returned with `Query::ranked(&db, score, k)`.
+  `Query::to_sql` shows a query's SQL and parameters.
 - **pgvector** (feature `pgvector`): `vector::Vector` columns with
   `#[model(dimensions = n)]`, `cosine_distance` / `l2_distance` /
   `inner_product` for ordering (`asc`/`desc`) and filtering (`lt`/`lte`),

@@ -310,6 +310,14 @@ impl<M> Distance<M> {
     pub fn lte(&self, max: f64) -> Expr<M> {
         Expr::distance(self.clone(), "<=", max)
     }
+
+    /// A similarity score from this distance, larger when closer, to add
+    /// to a [`Score`](crate::search::Score) for hybrid search: `1 -
+    /// distance` for cosine (0 to 2, usually 0 to 1), `1 / (1 + distance)`
+    /// for L2 (0 to 1), and the inner product itself.
+    pub fn similarity(&self) -> crate::search::Rank<M> {
+        crate::search::Rank::new(crate::sql::ScoreTerm::Similarity(self.column, self.metric.operator(), Value::Vector(self.target.clone())))
+    }
 }
 
 /// An approximate nearest-neighbour index, for [`create_index`].
