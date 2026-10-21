@@ -2,8 +2,10 @@
 //!
 //! The client gets a random 128-bit session ID in an `HttpOnly` cookie; the
 //! data stays on the server in a [`SessionStore`]. [`MemoryStore`] keeps it
-//! in this process; implement [`SessionStore`] for Redis or a database when
-//! you run several instances.
+//! in this process; when you run several instances, use a shared store such
+//! as `RedisSessionStore` from the
+//! [axeon-redis](https://docs.rs/axeon-redis) crate, or implement
+//! [`SessionStore`] for your database.
 //!
 //! ```rust
 //! use axeon::{Server, ServerError};
