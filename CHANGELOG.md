@@ -38,6 +38,15 @@ release, WebSocket and JWT types are now Axeon's own:
 - `rust-version = "1.88"`, tested in CI, and a documented
   [stability policy](README.md#stability).
 - CI runs the test suite on Windows.
+- **Broadcast across instances:** `broadcast::Hub` publishes messages to
+  topics and streams them to subscribers on every instance, with
+  `Hub::sse` for server-sent events resuming from `Last-Event-ID`
+  (`Request::last_event_id`). Replay comes from the backend's log, a
+  `reset` event marks messages that were trimmed, slow subscribers catch
+  up from the log, and each instance uses one wake-up connection however
+  many clients it serves. `MemoryBackend` for one process; implement
+  `broadcast::Backend` for others (Redis and PostgreSQL ones ship in
+  axeon-redis and axeon-orm).
 - **Route metadata:** `RouteBuilder::meta(value)` attaches a value to a
   route's handlers, and `Server::routes()` / `Router::routes()` list every
   route (`RouteInfo`: method, pattern, metadata), for tools such as

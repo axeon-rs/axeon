@@ -1,8 +1,21 @@
 # axeon-redis
 
-Redis integrations for [Axeon](https://docs.rs/axeon). For now: a shared
-session store, so sessions survive restarts and work across every instance
-of an app.
+Redis integrations for [Axeon](https://docs.rs/axeon): a shared session
+store, so sessions survive restarts and work across every instance of an
+app, and a broadcast backend for server-sent events across instances.
+
+```rust
+use axeon::broadcast::Hub;
+use axeon_redis::RedisBroadcast;
+
+let hub = Hub::new(RedisBroadcast::connect("redis://127.0.0.1:6379").await?.max_len(1000));
+```
+
+Each topic is a Redis Stream (`XADD` with approximate `MAXLEN` trimming,
+expiring a day after its last message) and one pub/sub channel wakes every
+instance. Needs Redis 6.2+.
+
+## Sessions
 
 ```rust
 use axeon::session::Sessions;

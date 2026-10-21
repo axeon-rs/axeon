@@ -191,6 +191,8 @@ mod sql;
 mod value;
 
 pub mod migrate;
+#[cfg(all(feature = "axeon", feature = "postgres"))]
+pub mod broadcast;
 #[cfg(feature = "postgres")]
 pub mod notify;
 pub mod relation;

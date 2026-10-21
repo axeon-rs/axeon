@@ -28,10 +28,12 @@
 
 #![warn(missing_docs)]
 
+mod broadcast;
 mod session;
 
 pub use redis;
 pub use redis::aio::ConnectionManager;
+pub use broadcast::RedisBroadcast;
 pub use session::RedisSessionStore;
 
 /// Connects to Redis at `url` (`redis://[:password@]host[:port][/db]`, or

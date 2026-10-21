@@ -123,6 +123,7 @@ pub(crate) mod handler;
 mod lifecycle;
 mod static_files;
 pub(crate) mod message;
+pub mod broadcast;
 pub mod health;
 pub mod metrics;
 pub mod middleware;

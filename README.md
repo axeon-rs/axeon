@@ -472,6 +472,34 @@ app.get("/ws", |mut req| async move {
 });
 ```
 
+With several instances, publish through a `broadcast::Hub` instead: every
+instance streams the messages, and a browser that reconnects with
+`Last-Event-ID` gets what it missed from whichever instance it reaches.
+
+```rust
+use axeon::broadcast::{BoxError, Hub, MemoryBackend, Message};
+use axeon::Server;
+
+// One process: MemoryBackend. Several: axeon_redis::RedisBroadcast or
+// axeon_orm::broadcast::PgBroadcast.
+let hub = Hub::new(MemoryBackend::new());
+let mut app = Server::new();
+app.state(hub.clone());
+app.get("/runs/:run/events", |req| async move {
+    let run: u64 = req.param("run")?;
+    req.state::<Hub>().unwrap().sse(&format!("run:{}", run), req.last_event_id()).await
+});
+
+// Anywhere, on any instance, e.g. in a background job:
+async fn step_done(hub: &Hub) -> Result<(), BoxError> {
+    hub.publish("run:42", Message::new(r#"{"step":3}"#).event("step")).await?;
+    Ok(())
+}
+```
+
+If the client's last message is no longer kept, the stream starts with a
+`reset` event so the client can reload its state.
+
 ## Running in Production
 
 ### Settings

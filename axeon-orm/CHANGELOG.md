@@ -45,6 +45,12 @@
   when the row exists. `ON CONFLICT` on PostgreSQL and SQLite, `ON
   DUPLICATE KEY UPDATE` on MySQL (8.0.19+), where an ignored insert
   doesn't fail the transaction.
+- **Broadcast backend** (features `axeon` + `postgres`):
+  `broadcast::PgBroadcast` for Axeon's `broadcast::Hub`, with messages in
+  an `axeon_broadcast` table and `LISTEN`/`NOTIFY` wake-ups;
+  `broadcast::publish_in(&mut tx, ..)` sends on commit only. Per-topic IDs
+  follow commit order, so readers never skip a message committed late.
+  `PgBroadcast::prune(age)` trims the log.
 - `Transaction::postgres`, `sqlite` and `mysql`: the underlying sqlx
   connection, for raw queries inside an ORM transaction.
 - `From` conversions into `Value` for `serde_json::Value`, `Uuid` and the
