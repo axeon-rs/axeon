@@ -38,6 +38,9 @@ pub enum ServerError {
     MethodNotAllowed(String),
     /// 408: the client sent the request too slowly.
     RequestTimeout,
+    /// 503: the handler didn't respond within its
+    /// [timeout](crate::Server::handler_timeout).
+    HandlerTimeout,
     /// 413: the body exceeds the size limit.
     PayloadTooLarge,
     /// 414: the request URI is too long.
@@ -75,6 +78,7 @@ impl ServerError {
             | ServerError::InternalError(_)
             | ServerError::PanicError(_) => 500,
             ServerError::NotImplemented(_) => 501,
+            ServerError::HandlerTimeout => 503,
             ServerError::Status(status, _) if (400..600).contains(status) => *status,
             ServerError::Status(..) => 500,
         }
@@ -104,6 +108,7 @@ impl fmt::Display for ServerError {
             ServerError::TooManyRequests { .. } => write!(f, "Too many requests"),
             ServerError::MethodNotAllowed(_) => write!(f, "Method not allowed"),
             ServerError::RequestTimeout => write!(f, "Request timeout"),
+            ServerError::HandlerTimeout => write!(f, "The server took too long to respond"),
             ServerError::PayloadTooLarge => write!(f, "Payload too large"),
             ServerError::UriTooLong => write!(f, "URI too long"),
             ServerError::HeadersTooLarge => write!(f, "Request header fields too large"),

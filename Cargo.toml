@@ -9,12 +9,12 @@ authors = ["sketch"]
 repository = "https://github.com/axeon-rs/axeon"
 documentation = "https://docs.rs/axeon"
 readme = "README.md"
-exclude = ["examples/todo-api", "benchmarks", "axeon-orm", "axeon-orm-macros", "axeon-orm-cli", ".github"]
+exclude = ["examples/todo-api", "benchmarks", "axeon-orm", "axeon-orm-macros", "axeon-orm-cli", "axeon-jobs", "axeon-redis", "axeon-openapi", "axeon-client", ".github"]
 keywords = ["web", "framework", "server", "http", "async"]
 categories = ["web-programming::http-server", "asynchronous"]
 
 [workspace]
-members = [".", "axeon-orm", "axeon-orm-macros", "axeon-orm-cli"]
+members = [".", "axeon-orm", "axeon-orm-macros", "axeon-orm-cli", "axeon-jobs", "axeon-redis", "axeon-openapi", "axeon-client"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -43,6 +43,7 @@ tower-service = "0.3"
 tower-layer = "0.3"
 http-body = "1"
 multer = { version = "3", default-features = false, optional = true }
+sha2 = { version = "0.10", optional = true }
 cookie = { version = "0.18", features = ["percent-encode", "signed", "private", "key-expansion"], optional = true }
 getrandom = { version = "0.4", optional = true }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"], optional = true }
@@ -95,7 +96,7 @@ compression = ["dep:flate2"]
 # WebSocket support (`Request::upgrade_websocket`, `axeon::ws`).
 ws = ["dep:tokio-tungstenite"]
 # Streaming multipart/form-data uploads (`Request::multipart`), via multer.
-multipart = ["dep:multer"]
+multipart = ["dep:multer", "dep:sha2"]
 # Cookies (plain, signed, encrypted) and sessions (`axeon::cookies`, `axeon::session`).
 cookies = ["dep:cookie", "dep:getrandom"]
 # JSON Web Token authentication (`axeon::auth::jwt`).

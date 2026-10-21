@@ -48,6 +48,38 @@ The table is the struct name in snake case, pluralized (`users`, `posts`),
 and the primary key is `id` unless you say otherwise. Integer keys are
 assigned by the database.
 
+### Enums
+
+Derive `SqlEnum` on a fieldless enum to use it as a column. It's stored as
+text (the variant in snake case unless renamed), so it works the same on
+every database, and generated tables get a `CHECK` listing the values:
+
+```rust
+use axeon_orm::SqlEnum;
+
+#[derive(SqlEnum, Clone, Copy, Debug, PartialEq)]
+enum Status {
+    Pending,                    // "pending"
+    InReview,                   // "in_review"
+    #[sql_enum(rename = "ok")]
+    Approved,                   // "ok"
+}
+
+#[derive(Model)]
+struct Case { id: i64, status: Status, previous: Option<Status> }
+
+let open = Case::query()
+    .filter(Case::STATUS.is_in([Status::Pending, Status::InReview]))
+    .all(&db)
+    .await?;
+```
+
+`#[sql_enum(rename_all = "SCREAMING_SNAKE_CASE")]` (or `kebab-case`,
+`lowercase`, `UPPERCASE`, `camelCase`, `PascalCase`) changes the case. You
+also get `Status::VALUES`, `as_str()`, `Display` and `FromStr`. A row
+holding a value the enum doesn't know is a decode error, not a panic.
+Native PostgreSQL `ENUM` types aren't supported; use `TEXT`.
+
 ## Queries
 
 ```rust
@@ -78,6 +110,46 @@ Post::query().filter(Post::PUBLISHED.eq(false)).delete(&db).await?;
 
 Columns are typed constants, so `User::EMAIL.eq(42)` or filtering users by
 a post column doesn't compile.
+
+### Bulk inserts
+
+Insert many rows with a few statements instead of one per row (about 9×
+faster on a local PostgreSQL for 2500 rows, more over a network):
+
+```rust
+let stored: Vec<Product> = Product::insert_many(&db, &products).await?;   // with IDs, in input order
+let synced = Product::upsert_many(&db, &products, OnConflict::on(Product::SKU)).await?;
+```
+
+Rows are sent up to 1000 per statement, within each database's parameter
+limit. With `&db`, several statements run in one transaction, so a failure
+inserts nothing; with `&mut tx`, they're part of yours. A conflict key may
+appear only once per `upsert_many` call; that's checked before anything is
+written.
+
+### Upserts
+
+Insert a row, or update the one that already has the same unique columns,
+in one statement, and get the stored row back:
+
+```rust
+use axeon_orm::OnConflict;
+
+let product = Product { id: 0, sku: "L-1".into(), name: "Lamp".into(), price: 120, .. }
+    .upsert(&db, OnConflict::on(Product::SKU))
+    .await?;
+
+// Only overwrite some columns; conflict on several columns together.
+row.upsert(&db, OnConflict::on(Stock::WAREHOUSE).and(Stock::SKU).update(Stock::QTY)).await?;
+
+// Insert unless it exists: `None` when it was already there.
+let inserted: Option<Event> = event.insert_or_ignore(&db, OnConflict::on(Event::EXTERNAL_ID)).await?;
+```
+
+By default an upsert overwrites every column except the primary key, the
+conflict columns and `created_at`. The conflict columns need a unique
+constraint or index. MySQL ignores them and reacts to a conflict on any
+unique key of the table.
 
 ## Relations
 
@@ -145,6 +217,121 @@ let rows: Vec<(Post, User)> = Post::query()
 let rows: Vec<(User, Option<Profile>)> = User::query().left_join(User::PROFILE).all(&db).await?;
 ```
 
+## Full-text and hybrid search (PostgreSQL)
+
+```rust
+use axeon_orm::search::{self, FullText};
+
+let fts = FullText::columns([Product::NAME, Product::DESCRIPTION]).config("english");
+db.execute(&search::create_index(&fts, "products_fts")).await?;   // GIN, matching the queries
+
+// Web-search syntax: words, "quoted phrases", OR, -excluded.
+let found = Product::query()
+    .filter(fts.matches("led lamp -solar"))
+    .order_by(fts.rank("led lamp -solar").desc())
+    .all(&db)
+    .await?;
+
+// Hybrid: text rank and vector similarity in one score, best first.
+let q = "led lamp";
+let score = fts.rank(q) * 0.6 + Product::EMBEDDING.cosine_distance(&v).similarity() * 0.4;
+let top: Vec<(Product, f64)> = Product::query()
+    .filter(fts.matches(q) | Product::EMBEDDING.cosine_distance(&v).lt(0.5))
+    .ranked(&db, score, 20)
+    .await?;
+```
+
+Ranks are normalized to 0..1 so they mix with similarities. Search a
+stored, generated `tsvector` column instead with `FullText::stored("search")`
+and `search::generated_column(...)`. `Query::to_sql` shows the SQL, e.g. to
+`EXPLAIN` it. PostgreSQL has no Chinese word splitting of its own (`simple`
+treats a run of Chinese characters as one word): install zhparser or
+pg_jieba and pass its configuration to `.config(...)`.
+
+## Vector search (pgvector)
+
+With the `pgvector` feature and the extension in PostgreSQL
+(`CREATE EXTENSION vector`):
+
+```rust
+use axeon_orm::vector::{self, Vector, VectorIndex};
+
+#[derive(Model)]
+struct Product {
+    id: i64,
+    category: String,
+    #[model(dimensions = 1024)]
+    embedding: Vector,
+}
+
+db.execute(&vector::create_index::<Product>("embedding", VectorIndex::hnsw_cosine())).await?;
+
+// The 10 nearest in a category, with their distances.
+let hits: Vec<(Product, f64)> = Product::query()
+    .filter(Product::CATEGORY.eq("lighting"))
+    .nearest(&db, Product::EMBEDDING.cosine_distance(&query), 10)
+    .await?;
+
+// Distances also sort and filter ordinary queries.
+Product::query().filter(Product::EMBEDDING.cosine_distance(&query).lt(0.3))
+    .order_by(Product::EMBEDDING.cosine_distance(&query).asc());
+```
+
+`cosine_distance` (`<=>`), `l2_distance` (`<->`) and `inner_product`
+(`<#>`, negated so smaller is closer). Vectors travel in pgvector's binary
+format. HNSW (or IVFFlat) indexes make nearest-neighbour queries
+approximate and fast; filters on other columns apply to the index's
+candidates, so with very selective filters raise `hnsw.ef_search`.
+
+## JSON filters
+
+Filter and sort by values inside JSON columns (`serde_json::Value` or
+`Json<T>`; `JSONB` in PostgreSQL), on every database:
+
+```rust
+let found = Product::query()
+    .filter(Product::FIELDS.contains(json!({ "certs": ["CE"] })))   // @> (GIN index)
+    .filter(Product::FIELDS.has_key("moq"))                         // ?  (GIN index)
+    .filter(Product::FIELDS.key("specs").key("color").text_in(["red", "blue"]))
+    .filter(Product::FIELDS.key("price").key("min").lte(25))
+    .filter(Product::FIELDS.key("sizes").index(0).exists())
+    .order_by(Product::FIELDS.key("price").key("min").asc())
+    .all(&db)
+    .await?;
+```
+
+Paths also have `text_eq`, `text_ne`, `text_like`, `num_eq`, `gt`, `gte`,
+`lt` and `bool_eq`. Text comparisons only match JSON strings and number
+comparisons only JSON numbers, so `"n/a"` in a price field doesn't match
+rather than failing the query. Conditions are never NULL, so `!` gives
+exactly the other rows. Keys are bound as parameters. `contains` needs
+PostgreSQL or MySQL; SQLite has no JSON containment.
+
+## Raw SQL in queries
+
+For what typed columns can't express (JSONB, full-text search, pgvector,
+functions), write a condition or ordering in SQL and keep the rest typed.
+Each `?` binds the next value (a tuple, array or `Vec`; `()` for none),
+and `??` is a literal `?`, as in PostgreSQL's JSONB `?` operator:
+
+```rust
+use axeon_orm::{Expr, Order};
+
+let products = Product::query()
+    .filter(Product::CATEGORY.eq("lighting"))
+    .filter(Expr::raw("fields @> ?", (json!({ "certs": ["CE"] }),)))
+    .filter(Expr::raw("fields ?? 'moq'", ()))
+    .order_by(Order::raw("embedding <=> ?::vector", ("[0.12,0.5,0.33]",)))
+    .limit(20)
+    .all(&db)
+    .await?;
+```
+
+Values are always bound as parameters, never spliced into the SQL; don't
+build the SQL text from user input. Fragments are parenthesized, so an
+`OR` inside one can't escape it. Column names inside them aren't quoted or
+qualified; in a join, the main table is `t0` and the joined one `t1`.
+
 ## Transactions
 
 ```rust
@@ -153,6 +340,52 @@ let user = new_user.insert(&mut tx).await?;
 new_post(&user).insert(&mut tx).await?;
 tx.commit().await?;     // dropping `tx` instead rolls back
 ```
+
+### Row locks
+
+Inside a transaction, `for_update()` locks the rows a query reads until
+commit. `skip_locked()` leaves out rows other transactions have locked, so
+several workers can claim different jobs from one table, and `nowait()`
+fails at once with `Error::LockNotAvailable` instead of waiting:
+
+```rust
+let mut tx = db.begin().await?;
+if let Some(job) = Job::query()
+    .filter(Job::STATUS.eq("pending"))
+    .order_by(Job::ID.asc())
+    .skip_locked()
+    .first(&mut tx)
+    .await?
+{
+    Job::query().filter(Job::ID.eq(job.id)).update(&mut tx, [Job::STATUS.set("running")]).await?;
+}
+tx.commit().await?;
+```
+
+Joins lock only the main table's rows; `count`, `exists` and aggregates
+don't lock. SQLite has no row locks (a write transaction locks the whole
+database), so these are left out there.
+
+## LISTEN / NOTIFY
+
+On PostgreSQL, send lightweight messages between connections, to wake
+workers or fan events out to every server:
+
+```rust
+let mut listener = db.listen(["jobs"]).await?;   // holds one pool connection
+
+let mut tx = db.begin().await?;
+// ... insert the job ...
+tx.notify("jobs", &job.id.to_string()).await?;   // delivered on commit only
+tx.commit().await?;
+
+let message = listener.recv().await?;            // or listener.into_stream()
+println!("{} on {}", message.payload, message.channel);
+```
+
+Messages aren't stored, so a listener only hears what is sent while it's
+connected. It reconnects by itself; `try_recv()` returns `None` when the
+connection dropped, so you can re-read what you might have missed.
 
 ## Migrations
 

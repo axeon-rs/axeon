@@ -38,6 +38,38 @@ release, WebSocket and JWT types are now Axeon's own:
 - `rust-version = "1.88"`, tested in CI, and a documented
   [stability policy](README.md#stability).
 - CI runs the test suite on Windows.
+- **Checked uploads:** multipart `Field::limit(bytes)` caps one field
+  (413), `Field::accept(types)` checks the real type from the first bytes
+  (415; `image/*` works), and `Field::write_to(writer)` / `Field::save(path)`
+  stream into any `AsyncWrite` while computing SHA-256, returning an
+  `Upload` (size, hash, detected and declared type). A rejected file
+  writes nothing. `multipart::sniff` detects PDF, common images, MP4, ZIP,
+  gzip and 7z. `Field::bytes` and `text` respect the limit.
+- **Broadcast across instances:** `broadcast::Hub` publishes messages to
+  topics and streams them to subscribers on every instance, with
+  `Hub::sse` for server-sent events resuming from `Last-Event-ID`
+  (`Request::last_event_id`). Replay comes from the backend's log, a
+  `reset` event marks messages that were trimmed, slow subscribers catch
+  up from the log, and each instance uses one wake-up connection however
+  many clients it serves. `MemoryBackend` for one process; implement
+  `broadcast::Backend` for others (Redis and PostgreSQL ones ship in
+  axeon-redis and axeon-orm).
+- **Route metadata:** `RouteBuilder::meta(value)` attaches a value to a
+  route's handlers, and `Server::routes()` / `Router::routes()` list every
+  route (`RouteInfo`: method, pattern, metadata), for tools such as
+  axeon-openapi.
+- **Handler timeouts:** `Server::handler_timeout` (off by default) and
+  per-route `RouteBuilder::timeout` / `no_timeout`, kept through
+  `mount`. A handler that runs over is cancelled and answered with 503,
+  the new `ServerError::HandlerTimeout`; route middleware counts toward
+  the limit, global middleware sees the 503, and streamed responses only
+  have to start in time.
+- **Application metrics:** `Metrics::counter`, `gauge` and `histogram`
+  (and `_vec` variants with labels) register metrics on the same registry
+  and `/metrics` endpoint as the HTTP metrics. Handles are cheap to clone
+  and update with atomics; histograms have `start_timer()`. Names and
+  labels are validated, registering a name again returns the same
+  metric, and `metrics::DEFAULT_BUCKETS` is public.
 
 ## 1.0.0-rc.1 (2026-10-17)
 

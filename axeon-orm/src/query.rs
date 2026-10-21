@@ -4,7 +4,9 @@ use crate::db::{Backend, Conn, Executor, Row};
 use crate::error::{Error, Result};
 use crate::model::{primary_key, Model};
 use crate::relation::{Join, Related, Relation, WithQuery};
-use crate::sql::{column_list, Cond, Sql};
+use crate::sql::{column_list, Cond, Fragment, Lock, Sort, SortTerm, Sql};
+#[cfg(feature = "json")]
+use crate::sql::{JsonTest, PathStep};
 use crate::value::{SqlType, Value};
 use serde::Serialize;
 use std::marker::PhantomData;
@@ -57,12 +59,12 @@ impl<M, T> Column<M, T> {
 
     /// Ascending order.
     pub fn asc(&self) -> Order<M> {
-        Order { column: self.name, descending: false, _marker: PhantomData }
+        Order::new(SortTerm::Column(self.name), false)
     }
 
     /// Descending order.
     pub fn desc(&self) -> Order<M> {
-        Order { column: self.name, descending: true, _marker: PhantomData }
+        Order::new(SortTerm::Column(self.name), true)
     }
 }
 
@@ -132,6 +134,177 @@ impl<M> Column<M, String> {
     }
 }
 
+/// A JSON column type: `serde_json::Value` or `sqlx::types::Json<T>`.
+#[cfg(feature = "json")]
+pub trait JsonColumn: crate::sealed::Sealed {}
+
+#[cfg(feature = "json")]
+impl JsonColumn for serde_json::Value {}
+#[cfg(feature = "json")]
+impl<T> JsonColumn for sqlx::types::Json<T> {}
+
+/// Filters on JSON columns (feature `json`). In PostgreSQL the column must
+/// be `JSONB`, as [`create_table`](crate::Db::create_table) makes it.
+///
+/// ```no_run
+/// # use axeon_orm::{Db, Model};
+/// # use serde_json::json;
+/// # #[derive(Model)] struct Product { id: i64, fields: serde_json::Value }
+/// # async fn run(db: Db) -> axeon_orm::Result<()> {
+/// let found = Product::query()
+///     .filter(Product::FIELDS.contains(json!({ "certs": ["CE"] })))
+///     .filter(Product::FIELDS.key("specs").key("color").text_eq("red"))
+///     .filter(Product::FIELDS.key("price").key("min").lte(25))
+///     .order_by(Product::FIELDS.key("price").key("min").asc())
+///     .all(&db)
+///     .await?;
+/// # Ok(()) }
+/// ```
+///
+/// Path keys and values are always sent as bound parameters.
+#[cfg(feature = "json")]
+impl<M, T: JsonColumn> Column<M, T> {
+    /// The document contains `value`: every key and array element in
+    /// `value` is in the column too (PostgreSQL `@>`, which a GIN index
+    /// speeds up; MySQL `JSON_CONTAINS`). Not available in SQLite, where
+    /// the query fails.
+    pub fn contains(&self, value: serde_json::Value) -> Expr<M> {
+        Expr::new(Cond::Json(self.name, Vec::new(), JsonTest::Contains(Value::Json(value))))
+    }
+
+    /// The top-level object has `key` (PostgreSQL `?`, which a GIN index
+    /// speeds up), even if its value is `null`.
+    pub fn has_key(&self, key: impl Into<String>) -> Expr<M> {
+        Expr::new(Cond::Json(self.name, Vec::new(), JsonTest::HasKey(key.into())))
+    }
+
+    /// The value under `key` of the top-level object, to filter or sort by.
+    pub fn key(&self, key: impl Into<String>) -> JsonPath<M> {
+        JsonPath { column: self.name, path: vec![PathStep::Key(key.into())], _marker: PhantomData }
+    }
+
+    /// The element at `index` of a top-level array.
+    pub fn index(&self, index: u32) -> JsonPath<M> {
+        JsonPath { column: self.name, path: vec![PathStep::Index(index.min(i32::MAX as u32) as i32)], _marker: PhantomData }
+    }
+}
+
+/// A value inside a JSON column, from [`Column::key`]: go deeper with
+/// [`key`](JsonPath::key) and [`index`](JsonPath::index), then compare.
+///
+/// Text comparisons match only JSON strings and number comparisons only
+/// JSON numbers, so `"n/a"` in a price field just doesn't match instead of
+/// failing the query.
+#[cfg(feature = "json")]
+pub struct JsonPath<M> {
+    column: &'static str,
+    path: Vec<PathStep>,
+    _marker: PhantomData<fn() -> M>,
+}
+
+#[cfg(feature = "json")]
+impl<M> Clone for JsonPath<M> {
+    fn clone(&self) -> Self {
+        Self { column: self.column, path: self.path.clone(), _marker: PhantomData }
+    }
+}
+
+#[cfg(feature = "json")]
+impl<M> std::fmt::Debug for JsonPath<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonPath").field("column", &self.column).field("path", &self.path).finish()
+    }
+}
+
+#[cfg(feature = "json")]
+impl<M> JsonPath<M> {
+    /// The value under `key` of this object.
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.path.push(PathStep::Key(key.into()));
+        self
+    }
+
+    /// The element at `index` of this array.
+    pub fn index(mut self, index: u32) -> Self {
+        self.path.push(PathStep::Index(index.min(i32::MAX as u32) as i32));
+        self
+    }
+
+    fn test(&self, test: JsonTest) -> Expr<M> {
+        Expr::new(Cond::Json(self.column, self.path.clone(), test))
+    }
+
+    /// The path exists, even with a `null` value.
+    pub fn exists(&self) -> Expr<M> {
+        self.test(JsonTest::Exists)
+    }
+
+    /// A string equal to `value`.
+    pub fn text_eq(&self, value: impl Into<String>) -> Expr<M> {
+        self.test(JsonTest::Text("=", Value::Text(value.into())))
+    }
+
+    /// A string other than `value` (not missing or another type).
+    pub fn text_ne(&self, value: impl Into<String>) -> Expr<M> {
+        self.test(JsonTest::Text("<>", Value::Text(value.into())))
+    }
+
+    /// A string matching `pattern`, with `%` and `_` wildcards.
+    pub fn text_like(&self, pattern: impl Into<String>) -> Expr<M> {
+        self.test(JsonTest::Text("LIKE", Value::Text(pattern.into())))
+    }
+
+    /// A string equal to one of `values`; false when `values` is empty.
+    pub fn text_in<S: Into<String>>(&self, values: impl IntoIterator<Item = S>) -> Expr<M> {
+        let values: Vec<Value> = values.into_iter().map(|v| Value::Text(v.into())).collect();
+        if values.is_empty() {
+            return Expr::any([]);
+        }
+        self.test(JsonTest::TextIn(values, false))
+    }
+
+    /// A number equal to `value`.
+    pub fn num_eq(&self, value: impl Into<f64>) -> Expr<M> {
+        self.test(JsonTest::Number("=", value.into()))
+    }
+
+    /// A number greater than `value`.
+    pub fn gt(&self, value: impl Into<f64>) -> Expr<M> {
+        self.test(JsonTest::Number(">", value.into()))
+    }
+
+    /// A number at least `value`.
+    pub fn gte(&self, value: impl Into<f64>) -> Expr<M> {
+        self.test(JsonTest::Number(">=", value.into()))
+    }
+
+    /// A number less than `value`.
+    pub fn lt(&self, value: impl Into<f64>) -> Expr<M> {
+        self.test(JsonTest::Number("<", value.into()))
+    }
+
+    /// A number at most `value`.
+    pub fn lte(&self, value: impl Into<f64>) -> Expr<M> {
+        self.test(JsonTest::Number("<=", value.into()))
+    }
+
+    /// The boolean `value`.
+    pub fn bool_eq(&self, value: bool) -> Expr<M> {
+        self.test(JsonTest::Bool(value))
+    }
+
+    /// Sorts by this value, ascending. Each database orders mixed JSON
+    /// types its own way, so sort by fields of one type.
+    pub fn asc(&self) -> Order<M> {
+        Order::new(SortTerm::Json(self.column, self.path.clone()), false)
+    }
+
+    /// Sorts by this value, descending.
+    pub fn desc(&self) -> Order<M> {
+        Order::new(SortTerm::Json(self.column, self.path.clone()), true)
+    }
+}
+
 /// A condition on model `M`. Combine with [`and`](Expr::and),
 /// [`or`](Expr::or), [`not`](Expr::not) or the `&`, `|` and `!` operators.
 pub struct Expr<M> {
@@ -154,6 +327,47 @@ impl<M> std::fmt::Debug for Expr<M> {
 impl<M> Expr<M> {
     pub(crate) fn new(cond: Cond) -> Self {
         Self { cond, _marker: PhantomData }
+    }
+
+    /// A condition written in SQL, for what the typed columns can't
+    /// express: JSONB and full-text operators, functions, casts. Each `?`
+    /// is bound to the next value of `args` (a tuple, array or `Vec`; `()`
+    /// for none), and `??` writes a literal `?`, such as PostgreSQL's JSONB
+    /// `?` operator. The fragment is parenthesized, so it combines safely
+    /// with other conditions.
+    ///
+    /// Column names are not quoted or qualified. In a
+    /// [join](Query::join), the main table is `t0` and the joined one `t1`.
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, Expr, Model};
+    /// # #[derive(Model)] struct Product { id: i64, name: String, fields: serde_json::Value, price: i64 }
+    /// # async fn run(db: Db) -> axeon_orm::Result<()> {
+    /// let certified = Product::query()
+    ///     .filter(Expr::raw("fields @> ?::jsonb", (serde_json::json!({ "certs": ["CE"] }),)))
+    ///     .filter(Expr::raw("fields ?? 'moq'", ()))
+    ///     .filter(Product::PRICE.lt(100))
+    ///     .all(&db)
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// When the number of `?` placeholders differs from the number of
+    /// values.
+    ///
+    /// # Safety of values
+    ///
+    /// Values are always sent as bound parameters. Never build `sql` from
+    /// user input; pass it through `args` instead.
+    pub fn raw(sql: &str, args: impl RawArgs) -> Expr<M> {
+        Expr::new(Cond::Raw(Fragment::new(sql, args.into_values())))
+    }
+
+    #[cfg(feature = "pgvector")]
+    pub(crate) fn distance(distance: crate::vector::Distance<M>, compare: &'static str, limit: f64) -> Expr<M> {
+        Expr::new(Cond::Distance(distance.column, distance.metric.operator(), Value::Vector(distance.target), compare, limit))
     }
 
     /// Both conditions.
@@ -204,18 +418,118 @@ impl<M> std::ops::Not for Expr<M> {
     }
 }
 
-/// An `ORDER BY` term, from [`Column::asc`] or [`Column::desc`].
+/// An `ORDER BY` term, from [`Column::asc`], [`Column::desc`],
+/// [`Order::raw`] or [`Order::raw_desc`].
 pub struct Order<M> {
-    column: &'static str,
-    descending: bool,
+    sort: Sort,
     _marker: PhantomData<fn() -> M>,
 }
 
 impl<M> Clone for Order<M> {
     fn clone(&self) -> Self {
-        Order { column: self.column, descending: self.descending, _marker: PhantomData }
+        Order { sort: self.sort.clone(), _marker: PhantomData }
     }
 }
+
+impl<M> std::fmt::Debug for Order<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.sort.fmt(f)
+    }
+}
+
+impl<M> Order<M> {
+    fn new(term: SortTerm, descending: bool) -> Self {
+        Order { sort: Sort { term, descending, qualifier: None }, _marker: PhantomData }
+    }
+
+    #[cfg(feature = "postgres")]
+    pub(crate) fn score(term: SortTerm, descending: bool) -> Order<M> {
+        Order::new(term, descending)
+    }
+
+    #[cfg(feature = "pgvector")]
+    pub(crate) fn distance(distance: crate::vector::Distance<M>, descending: bool) -> Order<M> {
+        let term = SortTerm::Distance(distance.column, distance.metric.operator(), Value::Vector(distance.target));
+        Order::new(term, descending)
+    }
+
+    /// Ascending order by an SQL expression, such as a vector distance or a
+    /// full-text rank. Placeholders work as in [`Expr::raw`].
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, Model, Order};
+    /// # #[derive(Model)] struct Product { id: i64, category: String }
+    /// # async fn run(db: Db) -> axeon_orm::Result<()> {
+    /// // Nearest products in a category, with pgvector.
+    /// let nearest = Product::query()
+    ///     .filter(Product::CATEGORY.eq("lighting"))
+    ///     .order_by(Order::raw("embedding <=> ?::vector", ("[0.12,0.5,0.33]",)))
+    ///     .limit(20)
+    ///     .all(&db)
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// When the number of `?` placeholders differs from the number of
+    /// values.
+    pub fn raw(sql: &str, args: impl RawArgs) -> Order<M> {
+        Order::new(SortTerm::Raw(Fragment::new(sql, args.into_values())), false)
+    }
+
+    /// Descending order by an SQL expression; see [`Order::raw`].
+    ///
+    /// # Panics
+    ///
+    /// When the number of `?` placeholders differs from the number of
+    /// values.
+    pub fn raw_desc(sql: &str, args: impl RawArgs) -> Order<M> {
+        Order::new(SortTerm::Raw(Fragment::new(sql, args.into_values())), true)
+    }
+}
+
+/// The values bound to [`Expr::raw`] and [`Order::raw`]: `()` for none, a
+/// tuple of up to eight values of different types, or an array or `Vec`
+/// of one type. Each value converts [`Into<Value>`](Value).
+pub trait RawArgs {
+    /// The values, in placeholder order.
+    fn into_values(self) -> Vec<Value>;
+}
+
+impl<T: Into<Value>> RawArgs for Vec<T> {
+    fn into_values(self) -> Vec<Value> {
+        self.into_iter().map(Into::into).collect()
+    }
+}
+
+impl<T: Into<Value>, const N: usize> RawArgs for [T; N] {
+    fn into_values(self) -> Vec<Value> {
+        self.into_iter().map(Into::into).collect()
+    }
+}
+
+macro_rules! raw_args_tuple {
+    ($($name:ident),*) => {
+        impl<$($name: Into<Value>),*> RawArgs for ($($name,)*) {
+            #[allow(non_snake_case)]
+            fn into_values(self) -> Vec<Value> {
+                let ($($name,)*) = self;
+                vec![$($name.into()),*]
+            }
+        }
+    };
+}
+
+raw_args_tuple!();
+raw_args_tuple!(A);
+raw_args_tuple!(A, B);
+raw_args_tuple!(A, B, C);
+raw_args_tuple!(A, B, C, D);
+raw_args_tuple!(A, B, C, D, E);
+raw_args_tuple!(A, B, C, D, E, F);
+raw_args_tuple!(A, B, C, D, E, F, G);
+raw_args_tuple!(A, B, C, D, E, F, G, H);
 
 /// A `SET column = value` term, from [`Column::set`].
 pub struct Assignment<M> {
@@ -256,9 +570,10 @@ pub struct Page<T> {
 /// ```
 pub struct Query<M> {
     conds: Vec<Cond>,
-    order: Vec<(&'static str, bool)>,
+    order: Vec<Sort>,
     limit: Option<u64>,
     offset: Option<u64>,
+    lock: Option<Lock>,
     _marker: PhantomData<fn() -> M>,
 }
 
@@ -269,6 +584,7 @@ impl<M> Clone for Query<M> {
             order: self.order.clone(),
             limit: self.limit,
             offset: self.offset,
+            lock: self.lock,
             _marker: PhantomData,
         }
     }
@@ -281,6 +597,7 @@ impl<M> std::fmt::Debug for Query<M> {
             .field("order", &self.order)
             .field("limit", &self.limit)
             .field("offset", &self.offset)
+            .field("lock", &self.lock)
             .finish()
     }
 }
@@ -294,7 +611,7 @@ impl<M: Model> Default for Query<M> {
 impl<M: Model> Query<M> {
     /// Every row of the table.
     pub fn new() -> Self {
-        Self { conds: Vec::new(), order: Vec::new(), limit: None, offset: None, _marker: PhantomData }
+        Self { conds: Vec::new(), order: Vec::new(), limit: None, offset: None, lock: None, _marker: PhantomData }
     }
 
     /// Keeps rows matching `expr`. Several filters must all match.
@@ -308,9 +625,16 @@ impl<M: Model> Query<M> {
         self
     }
 
-    /// Sorts by a column; call again for tie-breakers.
+    #[cfg(feature = "mysql")]
+    pub(crate) fn order_by_column(mut self, column: &'static str) -> Self {
+        self.order.push(Sort { term: SortTerm::Column(column), descending: false, qualifier: None });
+        self
+    }
+
+    /// Sorts by a column (or an [`Order::raw`] expression); call again for
+    /// tie-breakers.
     pub fn order_by(mut self, order: Order<M>) -> Self {
-        self.order.push((order.column, order.descending));
+        self.order.push(order.sort);
         self
     }
 
@@ -323,6 +647,59 @@ impl<M: Model> Query<M> {
     /// Skips the first `n` rows.
     pub fn offset(mut self, n: u64) -> Self {
         self.offset = Some(n);
+        self
+    }
+
+    /// Locks the selected rows (`FOR UPDATE`) until the transaction ends,
+    /// waiting for rows another transaction has locked. Run it in a
+    /// [transaction](crate::Db::begin): outside one, the lock is released
+    /// as soon as the statement finishes.
+    ///
+    /// The lock applies to the rows read by [`all`](Query::all),
+    /// [`first`](Query::first), [`paginate`](Query::paginate) and
+    /// [`with`](Query::with); `count`, `exists` and aggregates don't lock.
+    /// In a [join](Query::join), only rows of the main table are locked.
+    ///
+    /// SQLite has no row locks (a write transaction locks the whole
+    /// database), so there the query runs without one.
+    pub fn for_update(mut self) -> Self {
+        self.lock = Some(Lock::Wait);
+        self
+    }
+
+    /// Locks the selected rows like [`for_update`](Query::for_update), but
+    /// leaves out rows another transaction has locked instead of waiting
+    /// (`FOR UPDATE SKIP LOCKED`). This lets several workers claim
+    /// different rows of a queue at once:
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, Model};
+    /// # #[derive(Model)] struct Job { id: i64, status: String }
+    /// # async fn run(db: Db) -> axeon_orm::Result<()> {
+    /// let mut tx = db.begin().await?;
+    /// let next = Job::query()
+    ///     .filter(Job::STATUS.eq("pending"))
+    ///     .order_by(Job::ID.asc())
+    ///     .skip_locked()
+    ///     .first(&mut tx)
+    ///     .await?;
+    /// if let Some(job) = next {
+    ///     Job::query().filter(Job::ID.eq(job.id)).update(&mut tx, [Job::STATUS.set("running")]).await?;
+    /// }
+    /// tx.commit().await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn skip_locked(mut self) -> Self {
+        self.lock = Some(Lock::SkipLocked);
+        self
+    }
+
+    /// Locks the selected rows like [`for_update`](Query::for_update), but
+    /// fails with [`Error::LockNotAvailable`] instead of waiting when
+    /// another transaction holds a lock on one (`FOR UPDATE NOWAIT`). In
+    /// PostgreSQL the failure aborts the transaction, so roll it back.
+    pub fn nowait(mut self) -> Self {
+        self.lock = Some(Lock::NoWait);
         self
     }
 
@@ -372,17 +749,72 @@ impl<M: Model> Query<M> {
         let mut sql = Sql::new(backend);
         sql.push("SELECT ").push(&column_list::<M>(backend)).push(" FROM ").ident(M::TABLE);
         sql.where_clause(&self.conds);
-        for (i, (column, descending)) in self.order.iter().enumerate() {
-            sql.push(if i == 0 { " ORDER BY " } else { ", " });
-            sql.ident(column).push(if *descending { " DESC" } else { " ASC" });
-        }
+        sql.order_by(&self.order);
         sql.limit_offset(self.limit, self.offset);
+        sql.lock(self.lock, None);
         sql.finish()
+    }
+
+    /// The `SELECT` this query runs on `backend`, and its parameters: for
+    /// logging, or for `EXPLAIN` to check which indexes it uses.
+    pub fn to_sql(&self, backend: Backend) -> (String, Vec<Value>) {
+        self.select(backend)
     }
 
     pub(crate) async fn fetch(&self, conn: &mut Conn<'_>) -> Result<Vec<M>> {
         let (sql, args) = self.select(conn.backend());
         conn.fetch_all(sql, args).await?.iter().map(M::from_row).collect()
+    }
+
+    /// The `k` matching rows nearest by `distance`, nearest first, with
+    /// their distances (feature `pgvector`). With an index on the same
+    /// distance, PostgreSQL doesn't compare every row; filters on other
+    /// columns apply to the index's candidates, so with a selective filter
+    /// raise `hnsw.ef_search` or use iterative scans to keep `k` results.
+    #[cfg(feature = "pgvector")]
+    pub async fn nearest<'c>(self, ex: impl Executor<'c>, distance: crate::vector::Distance<M>, k: u64) -> Result<Vec<(M, f64)>> {
+        let mut conn = ex.into_conn();
+        let backend = conn.backend();
+        if backend != Backend::Postgres {
+            return Err(Error::Config("vector search needs PostgreSQL with pgvector".into()));
+        }
+        let mut sql = Sql::new(backend);
+        sql.push("SELECT ").push(&column_list::<M>(backend)).push(", ");
+        sql.ident(distance.column).push(" ").push(distance.metric.operator()).push(" ").arg(Value::Vector(distance.target.clone()));
+        sql.push(" AS ").ident("__axeon_distance").push(" FROM ").ident(M::TABLE);
+        sql.where_clause(&self.conds);
+        sql.push(" ORDER BY ").ident("__axeon_distance").push(" LIMIT ").push(&k.to_string());
+        let (sql, args) = sql.finish();
+        conn.fetch_all(sql, args)
+            .await?
+            .iter()
+            .map(|row| Ok((M::from_row(row)?, row.get::<f64>("__axeon_distance")?)))
+            .collect()
+    }
+
+    /// The `k` matching rows with the highest `score`, best first, with
+    /// their scores: for full-text and hybrid search (see
+    /// [`search`](crate::search)). PostgreSQL only.
+    #[cfg(feature = "postgres")]
+    pub async fn ranked<'c>(self, ex: impl Executor<'c>, score: impl Into<crate::search::Score<M>>, k: u64) -> Result<Vec<(M, f64)>> {
+        let score = score.into();
+        let mut conn = ex.into_conn();
+        let backend = conn.backend();
+        if backend != Backend::Postgres {
+            return Err(Error::Config("full-text search needs PostgreSQL".into()));
+        }
+        let mut sql = Sql::new(backend);
+        sql.push("SELECT ").push(&column_list::<M>(backend)).push(", ");
+        sql.score(&score.terms);
+        sql.push(" AS ").ident("__axeon_score").push(" FROM ").ident(M::TABLE);
+        sql.where_clause(&self.conds);
+        sql.push(" ORDER BY ").ident("__axeon_score").push(" DESC LIMIT ").push(&k.to_string());
+        let (sql, args) = sql.finish();
+        conn.fetch_all(sql, args)
+            .await?
+            .iter()
+            .map(|row| Ok((M::from_row(row)?, row.get::<f64>("__axeon_score")?)))
+            .collect()
     }
 
     /// Every matching row.
@@ -624,14 +1056,14 @@ const RIGHT_ALIAS: &str = "t1";
 pub struct JoinQuery<M, T, O> {
     query: Query<M>,
     related: Vec<Cond>,
-    order: Vec<(&'static str, &'static str, bool)>,
+    order: Vec<Sort>,
     on: (&'static str, &'static str),
     _marker: PhantomData<fn() -> (T, O)>,
 }
 
 impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
     fn new(query: Query<M>, on: (&'static str, &'static str)) -> Self {
-        let order = query.order.iter().map(|(column, desc)| (LEFT_ALIAS, *column, *desc)).collect();
+        let order = query.order.iter().cloned().map(|sort| Sort { qualifier: Some(LEFT_ALIAS), ..sort }).collect();
         Self { query, related: Vec::new(), order, on, _marker: PhantomData }
     }
 
@@ -649,13 +1081,13 @@ impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
 
     /// Sorts by a column of the main model.
     pub fn order_by(mut self, order: Order<M>) -> Self {
-        self.order.push((LEFT_ALIAS, order.column, order.descending));
+        self.order.push(Sort { qualifier: Some(LEFT_ALIAS), ..order.sort });
         self
     }
 
     /// Sorts by a column of the joined model.
     pub fn order_by_related(mut self, order: Order<T>) -> Self {
-        self.order.push((RIGHT_ALIAS, order.column, order.descending));
+        self.order.push(Sort { qualifier: Some(RIGHT_ALIAS), ..order.sort });
         self
     }
 
@@ -668,6 +1100,27 @@ impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
     /// Skips the first `n` rows.
     pub fn offset(mut self, n: u64) -> Self {
         self.query.offset = Some(n);
+        self
+    }
+
+    /// Locks the selected rows of the main table; see
+    /// [`Query::for_update`].
+    pub fn for_update(mut self) -> Self {
+        self.query.lock = Some(Lock::Wait);
+        self
+    }
+
+    /// Locks the selected rows of the main table, leaving out rows locked
+    /// elsewhere; see [`Query::skip_locked`].
+    pub fn skip_locked(mut self) -> Self {
+        self.query.lock = Some(Lock::SkipLocked);
+        self
+    }
+
+    /// Locks the selected rows of the main table, failing if one is locked
+    /// elsewhere; see [`Query::nowait`].
+    pub fn nowait(mut self) -> Self {
+        self.query.lock = Some(Lock::NoWait);
         self
     }
 
@@ -694,11 +1147,10 @@ impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
             sql.ident(alias).push(".").ident(column).push(" AS ").ident(&format!("{}_{}", alias, column));
         }
         self.write_from(&mut sql);
-        for (i, (alias, column, descending)) in self.order.iter().enumerate() {
-            sql.push(if i == 0 { " ORDER BY " } else { ", " });
-            sql.ident(alias).push(".").ident(column).push(if *descending { " DESC" } else { " ASC" });
-        }
+        sql.order_by(&self.order);
         sql.limit_offset(self.query.limit, self.query.offset);
+        // `OF`, since the nullable side of a left join can't be locked.
+        sql.lock(self.query.lock, Some(LEFT_ALIAS));
         let (sql, args) = sql.finish();
         let left = format!("{}_", LEFT_ALIAS);
         let right = format!("{}_", RIGHT_ALIAS);

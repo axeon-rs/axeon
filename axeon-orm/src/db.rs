@@ -366,6 +366,39 @@ impl Transaction {
     pub async fn execute(&mut self, sql: &str) -> Result<()> {
         Conn::Tx(self).execute_raw(sql.to_string()).await
     }
+
+    /// The underlying sqlx connection, for queries the ORM can't express,
+    /// run inside this transaction. [`commit`](Transaction::commit) doesn't
+    /// see whether statements run here failed: after an error on
+    /// PostgreSQL, which aborts the transaction, roll back.
+    #[cfg(feature = "postgres")]
+    pub fn postgres(&mut self) -> Option<&mut sqlx::PgConnection> {
+        match &mut self.inner {
+            Tx::Postgres(tx) => Some(&mut **tx),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// The underlying sqlx connection; see [`postgres`](Transaction::postgres).
+    #[cfg(feature = "sqlite")]
+    pub fn sqlite(&mut self) -> Option<&mut sqlx::SqliteConnection> {
+        match &mut self.inner {
+            Tx::Sqlite(tx) => Some(&mut **tx),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// The underlying sqlx connection; see [`postgres`](Transaction::postgres).
+    #[cfg(feature = "mysql")]
+    pub fn mysql(&mut self) -> Option<&mut sqlx::MySqlConnection> {
+        match &mut self.inner {
+            Tx::MySql(tx) => Some(&mut **tx),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
 }
 
 /// A row returned by the database.
@@ -424,6 +457,8 @@ impl Row {
             Kind::Uuid => Value::Uuid(self.get(column)?),
             #[cfg(feature = "json")]
             Kind::Json => Value::Json(self.get(column)?),
+            #[cfg(feature = "pgvector")]
+            Kind::Vector => Value::Vector(self.get(column)?),
         })
     }
 }
@@ -484,6 +519,8 @@ macro_rules! bind_all {
                     Kind::Uuid => query.bind(None::<uuid::Uuid>),
                     #[cfg(feature = "json")]
                     Kind::Json => query.bind(None::<serde_json::Value>),
+                    #[cfg(feature = "pgvector")]
+                    Kind::Vector => query.bind(None::<crate::vector::Vector>),
                 },
                 Value::Bool(v) => query.bind(v),
                 Value::I32(v) => query.bind(v),
@@ -501,6 +538,8 @@ macro_rules! bind_all {
                 Value::Uuid(v) => query.bind(v),
                 #[cfg(feature = "json")]
                 Value::Json(v) => query.bind(v),
+                #[cfg(feature = "pgvector")]
+                Value::Vector(v) => query.bind(v),
             };
         }
         query
@@ -588,6 +627,23 @@ impl Conn<'_> {
     /// auto-increment id it assigned.
     #[cfg(feature = "mysql")]
     pub(crate) async fn insert_mysql(&mut self, sql: String, args: Vec<Value>) -> Result<u64> {
+        let result = self.insert_mysql_inner(sql, args).await;
+        self.track(result)
+    }
+
+    /// Like [`insert_mysql`](Conn::insert_mysql), but a unique violation
+    /// is `None`. It doesn't fail a transaction: MySQL rolls back only the
+    /// failed statement.
+    #[cfg(feature = "mysql")]
+    pub(crate) async fn insert_mysql_unless_duplicate(&mut self, sql: String, args: Vec<Value>) -> Result<Option<u64>> {
+        match self.insert_mysql_inner(sql, args).await {
+            Err(Error::UniqueViolation(_)) => Ok(None),
+            result => self.track(result).map(Some),
+        }
+    }
+
+    #[cfg(feature = "mysql")]
+    async fn insert_mysql_inner(&mut self, sql: String, args: Vec<Value>) -> Result<u64> {
         let query = bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe(sql)), args);
         let result = match self {
             Conn::Db(Db { inner: Pool::MySql(pool) }) => query.execute(pool).await.map_err(Error::from),
@@ -595,7 +651,7 @@ impl Conn<'_> {
             #[allow(unreachable_patterns)]
             _ => Err(Error::Config("insert_mysql on another database".into())),
         };
-        self.track(result.map(|r| r.last_insert_id()))
+        result.map(|r| r.last_insert_id())
     }
 
     /// Runs SQL without parameters; may hold several statements.

@@ -8,7 +8,7 @@
 #![cfg(all(feature = "chrono", feature = "json"))]
 
 use axeon_orm::migrate::{Migration, Migrator};
-use axeon_orm::{schema, Backend, Db, Error, Expr, Model};
+use axeon_orm::{schema, Backend, Db, Error, Expr, Model, OnConflict, Order, SqlEnum};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
@@ -431,6 +431,488 @@ async fn relation_filters_and_joins(db: &Db) {
     assert_eq!(cy.posts().count(db).await.unwrap(), 0);
 }
 
+async fn raw_expressions(db: &Db) {
+    setup(db).await;
+    let mut users = Vec::new();
+    for (name, age) in [("Ada", 36), ("bob", 41), ("Cy", 25)] {
+        users.push(user(name, age).insert(db).await.unwrap());
+    }
+    post(&users[0], "a?b").insert(db).await.unwrap();
+    post(&users[1], "plain").insert(db).await.unwrap();
+
+    let names = |users: Vec<User>| users.into_iter().map(|u| u.name).collect::<Vec<_>>();
+    let by_id = || User::query().order_by(User::ID.asc());
+    assert_eq!(names(by_id().filter(Expr::raw("age * 2 > ?", (75,))).all(db).await.unwrap()), ["bob"]);
+    assert_eq!(names(by_id().filter(Expr::raw("LOWER(name) IN (?, ?)", ["ada", "bob"])).all(db).await.unwrap()), ["Ada", "bob"]);
+    assert_eq!(User::query().filter(Expr::raw("1 = 1", ())).count(db).await.unwrap(), 3);
+
+    // The fragment is parenthesized: its OR must not escape the AND.
+    let q = by_id().filter(User::AGE.lt(40)).filter(Expr::raw("name = ? OR name = ?", ("bob", "Cy")));
+    assert_eq!(names(q.all(db).await.unwrap()), ["Cy"]);
+    let q = by_id().filter(!Expr::raw("age > ? OR age < ?", (40, 30)) & User::AGE.gt(0));
+    assert_eq!(names(q.all(db).await.unwrap()), ["Ada"]);
+
+    // Placeholders keep their numbering after typed conditions (PostgreSQL's $n).
+    let q = by_id().filter(User::AGE.gt(20)).filter(Expr::raw("age < ?", (40,))).filter(User::NAME.ne("Cy"));
+    assert_eq!(names(q.all(db).await.unwrap()), ["Ada"]);
+
+    // `??` is a literal question mark.
+    assert_eq!(Post::query().filter(Expr::raw("title = 'a??b'", ())).count(db).await.unwrap(), 1);
+    assert_eq!(Post::query().filter(Expr::raw("title <> ? AND title <> 'x??'", ("plain",))).count(db).await.unwrap(), 1);
+
+    // Ordering by an expression, with tie-breakers.
+    let q = User::query().order_by(Order::raw("ABS(age - ?)", (40,))).order_by(User::NAME.asc());
+    assert_eq!(names(q.all(db).await.unwrap()), ["bob", "Ada", "Cy"]);
+    let q = User::query().filter(Expr::raw("age > ?", (20,))).order_by(Order::raw_desc("age % ?", (10,))).limit(2);
+    assert_eq!(names(q.all(db).await.unwrap()), ["Ada", "Cy"]);
+
+    // Inside relation subqueries, and in joins with t0 / t1.
+    assert_eq!(names(by_id().where_has(User::POSTS, Expr::raw("title LIKE ?", ("a%",))).all(db).await.unwrap()), ["Ada"]);
+    let rows = Post::query()
+        .join(Post::USER)
+        .filter_related(Expr::raw("t1.age > ?", (40,)))
+        .order_by(Order::raw("LENGTH(t0.title)", ()))
+        .all(db)
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|(p, u)| (p.title.as_str(), u.name.as_str())).collect::<Vec<_>>(), [("plain", "bob")]);
+    assert_eq!(User::query().filter(Expr::raw("age < ?", (30,))).update(db, [User::ACTIVE.set(false)]).await.unwrap(), 1);
+    assert_eq!(Post::query().filter(Expr::raw("score >= ?", (0.0,))).delete(db).await.unwrap(), 2);
+
+    if db.backend() == Backend::Postgres {
+        let meta = json!({ "certs": ["CE", "RoHS"], "moq": 100 });
+        Post { meta: Some(meta), ..post(&users[0], "jsonb") }.insert(db).await.unwrap();
+        Post { meta: Some(json!({ "certs": ["CE"] })), ..post(&users[1], "jsonb2") }.insert(db).await.unwrap();
+        let count = |e: Expr<Post>| Post::query().filter(e).count(db);
+        assert_eq!(count(Expr::raw("meta @> ?", (json!({ "certs": ["RoHS"] }),))).await.unwrap(), 1);
+        assert_eq!(count(Expr::raw("meta ?? 'moq'", ())).await.unwrap(), 1);
+        assert_eq!(count(Expr::raw("meta ?? ?", ("certs",))).await.unwrap(), 2);
+        assert_eq!(count(Expr::raw("(meta->>'moq')::int <= ?", (100,))).await.unwrap(), 1);
+    }
+}
+
+async fn row_locks(db: &Db) {
+    setup(db).await;
+    let mut users = Vec::new();
+    for (name, age) in [("Ada", 36), ("Bob", 41), ("Cy", 25)] {
+        users.push(user(name, age).insert(db).await.unwrap());
+    }
+    post(&users[0], "Rust").insert(db).await.unwrap();
+    let names = |users: Vec<User>| users.into_iter().map(|u| u.name).collect::<Vec<_>>();
+    let by_id = || User::query().order_by(User::ID.asc());
+
+    // Without contention, every lock kind reads like a plain query.
+    let mut tx = db.begin().await.unwrap();
+    assert_eq!(names(by_id().for_update().all(&mut tx).await.unwrap()), ["Ada", "Bob", "Cy"]);
+    assert_eq!(names(by_id().filter(User::AGE.gt(30)).skip_locked().limit(1).all(&mut tx).await.unwrap()), ["Ada"]);
+    assert_eq!(by_id().nowait().first(&mut tx).await.unwrap().unwrap().name, "Ada");
+    let page = by_id().for_update().paginate(&mut tx, 2, 2).await.unwrap();
+    assert_eq!((names(page.items), page.total), (vec!["Cy".to_string()], 3));
+    assert_eq!(by_id().for_update().count(&mut tx).await.unwrap(), 3, "count ignores the lock");
+    assert!(by_id().for_update().exists(&mut tx).await.unwrap());
+    assert_eq!(by_id().for_update().with(User::POSTS).all(&mut tx).await.unwrap()[0].1.len(), 1);
+    // Left joins lock only the main table; its nullable side can't be locked.
+    let rows = by_id().for_update().left_join(User::PROFILE).all(&mut tx).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(Post::query().join(Post::USER).skip_locked().all(&mut tx).await.unwrap().len(), 1);
+    tx.commit().await.unwrap();
+
+    if db.backend() == Backend::Sqlite {
+        return; // One writer at a time: there are no row locks to contend for.
+    }
+    let mut holder = db.begin().await.unwrap();
+    let ada = User::query().filter(User::ID.eq(users[0].id)).for_update().first_or_fail(&mut holder).await.unwrap();
+    assert_eq!(ada.name, "Ada");
+
+    // Another transaction skips the locked row, or fails at once with NOWAIT.
+    let mut other = db.begin().await.unwrap();
+    assert_eq!(names(by_id().skip_locked().all(&mut other).await.unwrap()), ["Bob", "Cy"]);
+    let next = by_id().skip_locked().first(&mut other).await.unwrap().unwrap();
+    assert_eq!(next.name, "Bob");
+    let err = User::query().filter(User::ID.eq(ada.id)).nowait().all(&mut other).await.unwrap_err();
+    assert!(matches!(err, Error::LockNotAvailable(_)), "{:?}", err);
+    other.rollback().await.unwrap();
+
+    // Plain reads don't take locks, so they aren't blocked.
+    assert_eq!(User::find_or_fail(db, ada.id).await.unwrap().name, "Ada");
+    holder.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    assert_eq!(User::query().filter(User::ID.eq(ada.id)).nowait().all(&mut tx).await.unwrap().len(), 1, "released on commit");
+    tx.rollback().await.unwrap();
+}
+
+#[derive(SqlEnum, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Status {
+    Pending,
+    InReview,
+    #[sql_enum(rename = "o'k")]
+    Approved,
+}
+
+#[derive(SqlEnum, Clone, Copy, Debug, PartialEq)]
+#[sql_enum(rename_all = "SCREAMING_SNAKE_CASE")]
+enum Priority {
+    Low,
+    VeryHigh,
+}
+
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Ticket {
+    id: i64,
+    #[model(index)]
+    status: Status,
+    priority: Priority,
+    previous: Option<Status>,
+}
+
+/// The `tickets` table seen as plain text, without the `CHECK`.
+#[derive(Model)]
+#[model(table = "tickets")]
+struct RawTicket {
+    id: i64,
+    status: String,
+    priority: String,
+    previous: Option<String>,
+}
+
+async fn enums(db: &Db) {
+    db.create_table::<Ticket>().await.unwrap();
+    let ticket = |status, priority, previous| Ticket { id: 0, status, priority, previous };
+    let a = ticket(Status::Pending, Priority::Low, None).insert(db).await.unwrap();
+    ticket(Status::InReview, Priority::VeryHigh, Some(Status::Pending)).insert(db).await.unwrap();
+    ticket(Status::Approved, Priority::Low, Some(Status::InReview)).insert(db).await.unwrap();
+
+    assert_eq!(Ticket::find_or_fail(db, a.id).await.unwrap(), a);
+    let count = |e: Expr<Ticket>| Ticket::query().filter(e).count(db);
+    assert_eq!(count(Ticket::STATUS.eq(Status::Approved)).await.unwrap(), 1);
+    assert_eq!(count(Ticket::STATUS.is_in([Status::Pending, Status::InReview])).await.unwrap(), 2);
+    assert_eq!(count(Ticket::PREVIOUS.is_null()).await.unwrap(), 1);
+    assert_eq!(count(Ticket::PREVIOUS.eq(Status::Pending)).await.unwrap(), 1);
+    assert_eq!(count(Expr::raw("status <> ?", (Status::Pending,))).await.unwrap(), 2);
+    let by_priority = Ticket::query().count_by(db, Ticket::PRIORITY).await.unwrap();
+    assert_eq!(by_priority, [(Priority::Low, 2), (Priority::VeryHigh, 1)]);
+
+    // Stored as text, as named.
+    let raw = RawTicket::query().order_by(RawTicket::ID.asc()).all(db).await.unwrap();
+    let stored: Vec<_> = raw.iter().map(|t| (t.status.as_str(), t.priority.as_str(), t.previous.as_deref())).collect();
+    assert_eq!(stored, [("pending", "LOW", None), ("in_review", "VERY_HIGH", Some("pending")), ("o'k", "LOW", Some("in_review"))]);
+
+    Ticket::query().filter(Ticket::ID.eq(a.id)).update(db, [Ticket::STATUS.set(Status::Approved), Ticket::PREVIOUS.set(Status::Pending)]).await.unwrap();
+    let mut a = Ticket::find_or_fail(db, a.id).await.unwrap();
+    assert_eq!((a.status, a.previous), (Status::Approved, Some(Status::Pending)));
+    a.status = Status::InReview;
+    a.previous = None;
+    a.update(db).await.unwrap();
+    assert_eq!(Ticket::find_or_fail(db, a.id).await.unwrap(), a);
+
+    // The CHECK constraint refuses other values.
+    let bad = RawTicket { id: 0, status: "lost".into(), priority: "LOW".into(), previous: None }.insert(db).await;
+    assert!(bad.is_err(), "CHECK let an unknown value in");
+
+    // Reading an unknown value is an error, not a panic.
+    db.drop_table::<Ticket>().await.unwrap();
+    db.create_table::<RawTicket>().await.unwrap();
+    RawTicket { id: 0, status: "archived".into(), priority: "LOW".into(), previous: None }.insert(db).await.unwrap();
+    match Ticket::query().first(db).await {
+        Err(Error::Decode { column, message }) => {
+            assert_eq!(column, "status");
+            assert!(message.contains(r#""archived" is not a Status value"#), "{}", message);
+        }
+        other => panic!("expected a decode error, got {:?}", other),
+    }
+}
+
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Product {
+    id: i64,
+    #[model(unique)]
+    sku: String,
+    name: String,
+    price: i64,
+    #[model(created_at)]
+    created_at: DateTime<Utc>,
+    #[model(updated_at)]
+    updated_at: DateTime<Utc>,
+}
+
+/// Unique on (warehouse, sku) together.
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Stock {
+    id: i32,
+    #[model(index)]
+    warehouse: String,
+    #[model(index)]
+    sku: String,
+    qty: i32,
+}
+
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Setting {
+    #[model(primary_key)]
+    key: String,
+    value: String,
+}
+
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Flag {
+    #[model(primary_key)]
+    name: String,
+}
+
+async fn upserts(db: &Db) {
+    db.create_table::<Product>().await.unwrap();
+    db.create_table::<Stock>().await.unwrap();
+    db.create_table::<Setting>().await.unwrap();
+    db.create_table::<Flag>().await.unwrap();
+    db.execute("CREATE UNIQUE INDEX stock_key ON stocks (warehouse, sku)").await.unwrap();
+    let now = Utc::now();
+    let product = |sku: &str, name: &str, price| Product {
+        id: 0,
+        sku: sku.into(),
+        name: name.into(),
+        price,
+        created_at: now,
+        updated_at: now,
+    };
+    let by_sku = || OnConflict::on(Product::SKU);
+
+    // Inserts when new, updates the same row when the SKU exists.
+    let lamp = product("L-1", "Lamp", 100).upsert(db, by_sku()).await.unwrap();
+    assert!(lamp.id > 0);
+    let other = product("C-1", "Chair", 300).upsert(db, by_sku()).await.unwrap();
+    assert_ne!(other.id, lamp.id);
+    let updated = product("L-1", "Desk lamp", 120).upsert(db, by_sku()).await.unwrap();
+    assert_eq!((updated.id, updated.name.as_str(), updated.price), (lamp.id, "Desk lamp", 120));
+    assert_eq!(updated.created_at, lamp.created_at, "created_at is kept");
+    assert!(updated.updated_at >= lamp.updated_at);
+    assert_eq!(Product::find_or_fail(db, lamp.id).await.unwrap(), updated);
+    // Unchanged values still give the row back (MySQL then affects no rows).
+    assert_eq!(product("L-1", "Desk lamp", 120).upsert(db, by_sku()).await.unwrap().id, lamp.id);
+    assert_eq!(Product::query().count(db).await.unwrap(), 2);
+
+    // `update` limits what an upsert overwrites.
+    let priced = product("L-1", "Ignored", 99).upsert(db, by_sku().update(Product::PRICE)).await.unwrap();
+    assert_eq!((priced.id, priced.name.as_str(), priced.price), (lamp.id, "Desk lamp", 99));
+
+    // insert_or_ignore leaves an existing row alone.
+    assert!(product("L-1", "Nope", 1).insert_or_ignore(db, by_sku()).await.unwrap().is_none());
+    assert_eq!(Product::find_or_fail(db, lamp.id).await.unwrap().price, 99);
+    let fresh = product("T-1", "Table", 500).insert_or_ignore(db, by_sku()).await.unwrap().unwrap();
+    assert_eq!((fresh.sku.as_str(), fresh.price), ("T-1", 500));
+    assert_eq!(Product::find_or_fail(db, fresh.id).await.unwrap(), fresh);
+    assert_eq!(Product::query().count(db).await.unwrap(), 3);
+
+    // A conflict on two columns together.
+    let stock = |warehouse: &str, sku: &str, qty| Stock { id: 0, warehouse: warehouse.into(), sku: sku.into(), qty };
+    let key = || OnConflict::on(Stock::WAREHOUSE).and(Stock::SKU);
+    let a = stock("sz", "L-1", 5).upsert(db, key()).await.unwrap();
+    let b = stock("gz", "L-1", 7).upsert(db, key()).await.unwrap();
+    assert_ne!(a.id, b.id);
+    let a2 = stock("sz", "L-1", 9).upsert(db, key()).await.unwrap();
+    assert_eq!((a2.id, a2.qty), (a.id, 9));
+    assert_eq!(Stock::query().count(db).await.unwrap(), 2);
+
+    // A primary key that isn't auto-increment, as the conflict.
+    let setting = |value: &str| Setting { key: "theme".into(), value: value.into() };
+    assert_eq!(setting("dark").upsert(db, OnConflict::on(Setting::KEY)).await.unwrap().value, "dark");
+    assert_eq!(setting("light").upsert(db, OnConflict::on(Setting::KEY)).await.unwrap().value, "light");
+    assert!(setting("blue").insert_or_ignore(db, OnConflict::on(Setting::KEY)).await.unwrap().is_none());
+    assert_eq!(Setting::find_or_fail(db, "theme".to_string()).await.unwrap().value, "light");
+    let other = Setting { key: "lang".into(), value: "zh".into() };
+    assert_eq!(other.clone().insert_or_ignore(db, OnConflict::on(Setting::KEY)).await.unwrap(), Some(other));
+
+    // Nothing to update besides the key.
+    let flag = || Flag { name: "beta".into() };
+    assert_eq!(flag().upsert(db, OnConflict::on(Flag::NAME)).await.unwrap(), flag());
+    assert_eq!(flag().upsert(db, OnConflict::on(Flag::NAME)).await.unwrap(), flag());
+    assert_eq!(Flag::query().count(db).await.unwrap(), 1);
+
+    // Inside a transaction, and rolled back with it.
+    let mut tx = db.begin().await.unwrap();
+    product("L-1", "In tx", 1).upsert(&mut tx, by_sku()).await.unwrap();
+    assert!(product("X-1", "In tx", 1).insert_or_ignore(&mut tx, by_sku()).await.unwrap().is_some());
+    assert_eq!(Product::find_or_fail(&mut tx, lamp.id).await.unwrap().name, "In tx");
+    tx.rollback().await.unwrap();
+    assert_eq!(Product::find_or_fail(db, lamp.id).await.unwrap().name, "Desk lamp");
+    assert_eq!(Product::query().count(db).await.unwrap(), 3);
+
+    // A conflict that is ignored doesn't spoil the transaction.
+    let mut tx = db.begin().await.unwrap();
+    assert!(product("L-1", "Dup", 1).insert_or_ignore(&mut tx, by_sku()).await.unwrap().is_none());
+    product("Y-1", "Kept", 1).insert(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(Product::query().filter(Product::SKU.eq("Y-1")).count(db).await.unwrap(), 1);
+
+}
+
+#[derive(Model, Clone, Debug)]
+struct Item {
+    id: i64,
+    name: String,
+    fields: serde_json::Value,
+    extra: Option<sqlx::types::Json<serde_json::Value>>,
+}
+
+async fn json_filters(db: &Db) {
+    db.create_table::<Item>().await.unwrap();
+    let rows = [
+        ("lamp", json!({ "specs": { "color": "red", "watts": 40 }, "price": { "min": 12.5 }, "certs": ["CE", "RoHS"], "moq": 100, "eco": true, "sizes": ["S", "M"] })),
+        ("chair", json!({ "specs": { "color": "Red", "watts": null }, "price": { "min": 30 }, "certs": ["CE"], "eco": false, "sizes": ["L"] })),
+        ("desk", json!({ "specs": { "color": "blue" }, "price": { "min": "n/a" }, "certs": [], "a,b}": { "q\"uote": "odd" } })),
+        ("rug", json!({ "specs": { "color": "red", "watts": 7 }, "price": { "min": 9 }, "moq": null })),
+    ];
+    for (name, fields) in rows {
+        Item { id: 0, name: name.into(), fields, extra: None }.insert(db).await.unwrap();
+    }
+    Item { id: 0, name: "typed".into(), fields: json!({}), extra: Some(sqlx::types::Json(json!({ "k": "v" }))) }.insert(db).await.unwrap();
+
+    let names = |items: Vec<Item>| items.into_iter().map(|i| i.name).collect::<Vec<_>>();
+    let find = |e: Expr<Item>| Item::query().filter(e).order_by(Item::ID.asc()).all(db);
+    let f = || Item::FIELDS;
+
+    // Strings: case-sensitive, only JSON strings.
+    assert_eq!(names(find(f().key("specs").key("color").text_eq("red")).await.unwrap()), ["lamp", "rug"]);
+    assert_eq!(names(find(f().key("specs").key("color").text_ne("red")).await.unwrap()), ["chair", "desk"], "missing isn't 'not red'");
+    assert_eq!(names(find(f().key("specs").key("color").text_in(["blue", "Red"])).await.unwrap()), ["chair", "desk"]);
+    assert!(find(f().key("specs").key("color").text_in(Vec::<String>::new())).await.unwrap().is_empty());
+    assert_eq!(names(find(f().key("specs").key("color").text_like("b%")).await.unwrap()), ["desk"]);
+    assert!(find(f().key("moq").text_eq("100")).await.unwrap().is_empty(), "a number isn't text");
+
+    // Numbers: strings and nulls just don't match.
+    assert_eq!(names(find(f().key("price").key("min").lte(12.5)).await.unwrap()), ["lamp", "rug"]);
+    assert_eq!(names(find(f().key("price").key("min").gt(10)).await.unwrap()), ["lamp", "chair"]);
+    assert_eq!(names(find(f().key("price").key("min").num_eq(30)).await.unwrap()), ["chair"]);
+    assert_eq!(names(find(f().key("specs").key("watts").gte(0)).await.unwrap()), ["lamp", "rug"]);
+    assert_eq!(names(find(f().key("price").key("min").lt(1000)).await.unwrap()), ["lamp", "chair", "rug"], "\"n/a\" doesn't fail the query");
+
+    // Booleans, arrays, existence.
+    assert_eq!(names(find(f().key("eco").bool_eq(true)).await.unwrap()), ["lamp"]);
+    assert_eq!(names(find(f().key("eco").bool_eq(false)).await.unwrap()), ["chair"]);
+    assert_eq!(names(find(f().key("sizes").index(1).text_eq("M")).await.unwrap()), ["lamp"]);
+    assert_eq!(names(find(f().key("certs").index(0).exists()).await.unwrap()), ["lamp", "chair"]);
+    assert_eq!(names(find(f().key("moq").exists()).await.unwrap()), ["lamp", "rug"], "null still exists");
+    assert_eq!(names(find(f().has_key("moq")).await.unwrap()), ["lamp", "rug"]);
+    assert_eq!(names(find(!f().has_key("moq") & f().has_key("specs")).await.unwrap()), ["chair", "desk"]);
+    assert_eq!(names(find(f().key("specs").key("watts").exists() & !f().key("specs").key("watts").gte(0)).await.unwrap()), ["chair"]);
+    // Keys with special characters are bound, not spliced into the SQL. (This
+    // also follows an index path of the same shape: a regression test for
+    // PostgreSQL statement caching with differently typed parameters.)
+    assert_eq!(names(find(f().key("a,b}").key("q\"uote").text_eq("odd")).await.unwrap()), ["desk"]);
+    assert_eq!(names(find(Item::EXTRA.key("k").text_eq("v")).await.unwrap()), ["typed"], "Json<T> columns too");
+
+    // Sorting by a path.
+    let by_price = Item::query().filter(f().key("price").key("min").gte(0)).order_by(f().key("price").key("min").desc()).all(db).await.unwrap();
+    assert_eq!(names(by_price), ["chair", "lamp", "rug"]);
+    let by_color = Item::query().filter(f().key("specs").key("color").exists()).order_by(f().key("specs").key("color").asc()).order_by(Item::ID.asc());
+    let colors: Vec<String> = by_color.all(db).await.unwrap().into_iter().map(|i| i.fields["specs"]["color"].as_str().unwrap().to_string()).collect();
+    let mut sorted = colors.clone();
+    sorted.sort();
+    assert_eq!(colors, sorted);
+
+    // A NULL column matches neither a filter nor its negation's opposite.
+    assert_eq!(names(find(!Item::EXTRA.has_key("k")).await.unwrap()), ["lamp", "chair", "desk", "rug"]);
+    if db.backend() != Backend::Sqlite {
+        assert_eq!(names(find(!Item::EXTRA.contains(json!({ "k": "v" }))).await.unwrap()), ["lamp", "chair", "desk", "rug"]);
+    }
+
+    // Containment: PostgreSQL and MySQL only.
+    let contains = find(f().contains(json!({ "certs": ["RoHS"] }))).await;
+    let nested = find(f().contains(json!({ "specs": { "color": "red" } }))).await;
+    if db.backend() == Backend::Sqlite {
+        let error = contains.unwrap_err().to_string();
+        assert!(error.contains("axeon_orm_json_contains_needs_postgres_or_mysql"), "{}", error);
+    } else {
+        assert_eq!(names(contains.unwrap()), ["lamp"]);
+        assert_eq!(names(nested.unwrap()), ["lamp", "rug"]);
+        assert_eq!(names(find(f().contains(json!({ "certs": ["CE"] })) & f().key("price").key("min").lt(20)).await.unwrap()), ["lamp"]);
+    }
+
+    // With joins and updates too.
+    assert_eq!(Item::query().filter(f().key("eco").exists()).update(db, [Item::NAME.set("eco-tagged")]).await.unwrap(), 2);
+    assert_eq!(Item::query().filter(Item::NAME.eq("eco-tagged")).count(db).await.unwrap(), 2);
+}
+
+async fn bulk_inserts(db: &Db) {
+    db.create_table::<Product>().await.unwrap();
+    db.create_table::<Setting>().await.unwrap();
+    db.create_table::<Flag>().await.unwrap();
+    let now = Utc::now();
+    let product = |i: usize| Product { id: 0, sku: format!("SKU-{:05}", i), name: format!("Product {}", i), price: i as i64, created_at: now, updated_at: now };
+
+    assert!(Product::insert_many(db, &[]).await.unwrap().is_empty());
+
+    // 2500 rows: several statements, all in one transaction.
+    let rows: Vec<Product> = (0..2500).map(product).collect();
+    let started = std::time::Instant::now();
+    let stored = Product::insert_many(db, &rows).await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(stored.len(), 2500);
+    assert!(stored.iter().zip(&rows).all(|(s, r)| s.sku == r.sku && s.name == r.name), "same order as the input");
+    assert!(stored.windows(2).all(|w| w[0].id < w[1].id), "new IDs, increasing");
+    assert!(stored[0].id > 0);
+    assert_eq!(Product::query().count(db).await.unwrap(), 2500);
+    assert_eq!(Product::find_or_fail(db, stored[1234].id).await.unwrap(), stored[1234]);
+    eprintln!("{:?}: 2500 rows in {:?}", db.backend(), elapsed);
+
+    // All or nothing: a duplicate SKU in the third chunk rolls back the rest.
+    let mut batch: Vec<Product> = (2500..4000).map(product).collect();
+    batch[1300].sku = "SKU-00007".into();
+    let failed = Product::insert_many(db, &batch).await;
+    assert!(matches!(failed, Err(Error::UniqueViolation(_))), "{:?}", failed.map(|r| r.len()));
+    assert_eq!(Product::query().count(db).await.unwrap(), 2500);
+    // Inside the caller's transaction, it's the caller's to commit.
+    let mut tx = db.begin().await.unwrap();
+    Product::insert_many(&mut tx, &[product(5000), product(5001)]).await.unwrap();
+    assert_eq!(Product::query().count(&mut tx).await.unwrap(), 2502);
+    tx.rollback().await.unwrap();
+    assert_eq!(Product::query().count(db).await.unwrap(), 2500);
+
+    // Keys that aren't generated.
+    let settings: Vec<Setting> = ["b", "a", "c"].iter().map(|k| Setting { key: k.to_string(), value: format!("v{}", k) }).collect();
+    let stored = Setting::insert_many(db, &settings).await.unwrap();
+    assert_eq!(stored, settings);
+    // Only a primary key: one statement per row, still fine.
+    let flags = vec![Flag { name: "x".into() }, Flag { name: "y".into() }];
+    assert_eq!(Flag::insert_many(db, &flags).await.unwrap(), flags);
+
+    // Bulk upsert: existing SKUs are updated (keeping their IDs and
+    // created_at), new ones inserted, all in input order.
+    let existing = Product::query().filter(Product::SKU.is_in(["SKU-00002", "SKU-00001"])).order_by(Product::SKU.desc()).all(db).await.unwrap();
+    let later = Utc::now() + chrono::Duration::seconds(5);
+    let mut changes = vec![
+        Product { name: "renamed 2".into(), price: 999, ..existing[0].clone() },
+        Product { sku: "NEW-1".into(), name: "new".into(), ..product(0) },
+        Product { name: "renamed 1".into(), ..existing[1].clone() },
+    ];
+    for change in &mut changes {
+        change.created_at = later;
+    }
+    let upserted = Product::upsert_many(db, &changes, OnConflict::on(Product::SKU)).await.unwrap();
+    assert_eq!(upserted.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["renamed 2", "new", "renamed 1"]);
+    assert_eq!((upserted[0].id, upserted[0].price), (existing[0].id, 999));
+    assert_eq!(upserted[2].id, existing[1].id);
+    assert_eq!(upserted[0].created_at, existing[0].created_at, "created_at is kept");
+    assert!(upserted[1].id > 0 && upserted[1].id != existing[0].id);
+    assert_eq!(Product::query().count(db).await.unwrap(), 2501);
+    // Limiting the update.
+    let price_only = vec![Product { name: "ignored".into(), price: 1, ..existing[0].clone() }];
+    let updated = Product::upsert_many(db, &price_only, OnConflict::on(Product::SKU).update(Product::PRICE)).await.unwrap();
+    assert_eq!((updated[0].name.as_str(), updated[0].price), ("renamed 2", 1));
+    // Many rows across chunks.
+    let refresh: Vec<Product> = (0..2100).map(|i| Product { price: -1, ..product(i) }).collect();
+    let refreshed = Product::upsert_many(db, &refresh, OnConflict::on(Product::SKU)).await.unwrap();
+    assert_eq!(refreshed.len(), 2100);
+    assert!(refreshed.iter().zip(&refresh).all(|(s, r)| s.sku == r.sku && s.price == -1));
+    assert_eq!(Product::query().count(db).await.unwrap(), 2501);
+
+    // The same key twice in one call is refused before anything is written.
+    let twice = vec![Product { price: 7, ..product(10) }, Product { price: 8, ..product(10) }, product(9000)];
+    let refused = Product::upsert_many(db, &twice, OnConflict::on(Product::SKU)).await;
+    assert!(matches!(&refused, Err(Error::Config(m)) if m.contains("same conflict key")), "{:?}", refused.map(|r| r.len()));
+    assert_eq!(Product::query().filter(Product::PRICE.eq(7)).count(db).await.unwrap(), 0);
+    assert_eq!(Product::query().count(db).await.unwrap(), 2501);
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -510,7 +992,43 @@ backend_tests!(
     many_to_many,
     aggregates,
     relation_filters_and_joins,
+    raw_expressions,
+    row_locks,
+    enums,
+    upserts,
+    json_filters,
+    bulk_inserts,
 );
+
+#[test]
+fn enum_helpers() {
+    assert_eq!(Status::VALUES, ["pending", "in_review", "o'k"]);
+    assert_eq!(Priority::VALUES, ["LOW", "VERY_HIGH"]);
+    assert_eq!(Status::InReview.as_str(), "in_review");
+    assert_eq!(Priority::VeryHigh.to_string(), "VERY_HIGH");
+    assert_eq!("o'k".parse::<Status>(), Ok(Status::Approved));
+    let err = "Pending".parse::<Status>().unwrap_err();
+    assert_eq!((err.value(), err.to_string().as_str()), ("Pending", r#""Pending" is not a Status value"#));
+
+    let pg = schema::create_table::<Ticket>(Backend::Postgres);
+    assert!(pg.contains(r#""status" TEXT NOT NULL CHECK ("status" IN ('pending', 'in_review', 'o''k'))"#), "{}", pg);
+    assert!(pg.contains(r#""previous" TEXT CHECK ("previous" IN ('pending', 'in_review', 'o''k'))"#), "{}", pg);
+    let my = schema::create_table::<Ticket>(Backend::MySql);
+    assert!(my.contains("`status` VARCHAR(255) NOT NULL CHECK (`status` IN ('pending', 'in_review', 'o''k'))"), "{}", my);
+    assert!(my.contains("`priority` TEXT NOT NULL CHECK (`priority` IN ('LOW', 'VERY_HIGH'))"), "{}", my);
+}
+
+
+#[test]
+#[should_panic(expected = "has 2 placeholder(s) but 1 value(s)")]
+fn raw_placeholder_count_must_match() {
+    let _ = Expr::<User>::raw("age > ? AND age < ?", (1,));
+}
+
+#[test]
+fn raw_literal_question_marks_are_not_placeholders() {
+    let _ = Expr::<User>::raw("meta ?? 'a' AND name = ?", ("x",));
+}
 
 #[test]
 fn generated_schema() {

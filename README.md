@@ -437,6 +437,20 @@ app.route("/upload").body_limit(1 << 30).stream_body().post(|req| async move {
     }
     Ok::<_, ServerError>("uploaded")
 });
+
+// Untrusted files: a per-field cap, the real type from the first bytes
+// (not the client's Content-Type), and SHA-256 while streaming to any
+// AsyncWrite, such as an object-store upload.
+app.route("/documents").body_limit(60 << 20).stream_body().post(|req| async move {
+    let mut form = req.multipart()?;
+    let Some(field) = form.next_field().await? else { return Err(ServerError::BadRequest("no file".into())) };
+    let upload = field
+        .limit(50 << 20)                              // 413 above 50 MiB
+        .accept(&["application/pdf", "image/*"])      // 415 for anything else
+        .save(std::env::temp_dir().join("doc.bin"))   // or .write_to(&mut writer)
+        .await?;
+    Ok(json!({ "sha256": upload.sha256_hex(), "size": upload.size(), "type": upload.content_type() }))
+});
 ```
 
 ### Realtime
@@ -472,6 +486,34 @@ app.get("/ws", |mut req| async move {
 });
 ```
 
+With several instances, publish through a `broadcast::Hub` instead: every
+instance streams the messages, and a browser that reconnects with
+`Last-Event-ID` gets what it missed from whichever instance it reaches.
+
+```rust
+use axeon::broadcast::{BoxError, Hub, MemoryBackend, Message};
+use axeon::Server;
+
+// One process: MemoryBackend. Several: axeon_redis::RedisBroadcast or
+// axeon_orm::broadcast::PgBroadcast.
+let hub = Hub::new(MemoryBackend::new());
+let mut app = Server::new();
+app.state(hub.clone());
+app.get("/runs/:run/events", |req| async move {
+    let run: u64 = req.param("run")?;
+    req.state::<Hub>().unwrap().sse(&format!("run:{}", run), req.last_event_id()).await
+});
+
+// Anywhere, on any instance, e.g. in a background job:
+async fn step_done(hub: &Hub) -> Result<(), BoxError> {
+    hub.publish("run:42", Message::new(r#"{"step":3}"#).event("step")).await?;
+    Ok(())
+}
+```
+
+If the client's last message is no longer kept, the stream starts with a
+`reset` event so the client can reload its state.
+
 ## Running in Production
 
 ### Settings
@@ -484,12 +526,23 @@ let mut app = Server::new();
 app.max_connections(10_000)                    // default 1024; extra clients wait
     .keep_alive(Duration::from_secs(15))       // idle connections, default 5s
     .request_timeout(Duration::from_secs(10))  // headers, body, TLS handshake; default 30s
+    .handler_timeout(Duration::from_secs(15))  // 503 if a handler takes longer; default none
     .write_timeout(Duration::from_secs(10))    // clients that stop reading; default 30s
     .shutdown_delay(Duration::from_secs(5))    // stay up but not-ready after SIGTERM
     .shutdown_timeout(Duration::from_secs(20)) // then wait this long for requests
     .max_body_size(1024 * 1024)                // 413 above this; default 2 MiB
     .max_header_size(16 * 1024);               // 431 above this; default 16 KiB
+
+// Routes can override the handler timeout, longer or shorter, or opt out.
+app.route("/v1/products").timeout(Duration::from_secs(2)).get(|_req| async { "[]" });
+app.route("/documents").stream_body().timeout(Duration::from_secs(300)).post(|_req| async { "stored" });
+app.route("/assistant").no_timeout().post(|_req| async { "streamed" });
 ```
+
+A timed-out handler is cancelled at its next `.await` (an open transaction
+rolls back) and the client gets 503. Global middleware such as logging and
+metrics still sees the response. A streamed response only has to start in
+time; a `stream_body` handler reads its body within the limit.
 
 HTTPS is `app.with_tls("cert.pem", "key.pem")`; HTTP/2 is negotiated
 automatically.
@@ -517,6 +570,23 @@ app.middleware(SetRequestId::new())
         .check("database", || async { Ok::<_, std::io::Error>(()) })
         .router());
 ```
+
+Application metrics go on the same registry and endpoint:
+
+```rust
+use axeon::metrics::{Metrics, DEFAULT_BUCKETS};
+
+let metrics = Metrics::new(); // the one passed to `app.middleware` above
+let tokens = metrics.counter_vec("llm_tokens_total", "LLM tokens used.", &["model"]);
+let queue = metrics.gauge_vec("queue_depth", "Jobs waiting.", &["queue"]);
+let step = metrics.histogram("workflow_step_seconds", "Step duration.", &DEFAULT_BUCKETS);
+
+tokens.with(&["qwen-max"]).inc_by(812.0);
+queue.with(&["onboarding"]).set(17.0);
+let timer = step.start_timer(); // records when observed or dropped
+```
+
+Keep label values to a small, fixed set (a model, a queue name), never IDs.
 
 Inside your own Tokio runtime (e.g. to connect to a database first), use
 `app.serve_with_shutdown(listener, axeon::shutdown_signal())`.

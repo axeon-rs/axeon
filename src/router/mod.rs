@@ -2,14 +2,28 @@ use crate::handler::{ErrorHandler, Handler, IntoResponse};
 use crate::message::request::Params;
 use crate::message::{Method, Request};
 use crate::middleware::{Chain, Middleware, MiddlewareManager, MiddlewareResult, Next};
+use crate::ServerError;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub(crate) struct Route {
     pub(crate) chain: Arc<Chain>,
     pub(crate) body: BodyConfig,
+    /// How long the route's middleware and handler may take.
+    pub(crate) timeout: Option<Duration>,
+}
+
+/// A route's own timeout setting.
+#[derive(Clone, Copy, Debug, Default)]
+enum RouteTimeout {
+    /// The server's `handler_timeout`.
+    #[default]
+    Inherit,
+    After(Duration),
+    Never,
 }
 
 /// How a route reads its request body.
@@ -23,7 +37,14 @@ pub(crate) struct BodyConfig {
 
 impl Route {
     pub fn handle(&self, req: Request) -> MiddlewareResult {
-        Next::start(Arc::clone(&self.chain)).handle(req)
+        let response = Next::start(Arc::clone(&self.chain)).handle(req);
+        match self.timeout {
+            // Dropping the future cancels the handler at its next `.await`.
+            Some(limit) => Box::pin(async move {
+                tokio::time::timeout(limit, response).await.unwrap_or(Err(ServerError::HandlerTimeout))
+            }),
+            None => response,
+        }
     }
 }
 
@@ -34,6 +55,36 @@ pub(crate) struct Endpoint {
     /// Outermost first: mounted routers' middleware, then the route's own.
     middlewares: Vec<Arc<dyn Middleware>>,
     body: BodyConfig,
+    timeout: RouteTimeout,
+    /// Values from [`RouteBuilder::meta`], e.g. API documentation.
+    meta: http::Extensions,
+}
+
+/// A registered route, from [`Router::routes`] or
+/// [`Server::routes`](crate::Server::routes): for tools that describe the
+/// API, such as OpenAPI generators.
+#[derive(Clone, Copy, Debug)]
+pub struct RouteInfo<'a> {
+    method: Method,
+    path: &'a str,
+    meta: &'a http::Extensions,
+}
+
+impl<'a> RouteInfo<'a> {
+    /// The HTTP method.
+    pub fn method(&self) -> Method {
+        self.method
+    }
+
+    /// The path pattern, e.g. `/users/:id`.
+    pub fn path(&self) -> &'a str {
+        self.path
+    }
+
+    /// A value attached with [`RouteBuilder::meta`].
+    pub fn meta<T: Send + Sync + 'static>(&self) -> Option<&'a T> {
+        self.meta.get::<T>()
+    }
 }
 
 /// A group of routes with shared middleware. Paths use `:name` for a
@@ -53,6 +104,20 @@ impl Router {
     /// An empty router.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Every registered route, including those of mounted routers, sorted
+    /// by path, then method.
+    pub fn routes(&self) -> Vec<RouteInfo<'_>> {
+        let mut routes: Vec<RouteInfo<'_>> = self
+            .routes
+            .iter()
+            .flat_map(|(path, endpoints)| {
+                endpoints.iter().map(move |(method, endpoint)| RouteInfo { method: *method, path, meta: &endpoint.meta })
+            })
+            .collect();
+        routes.sort_by(|a, b| (a.path, a.method.as_str()).cmp(&(b.path, b.method.as_str())));
+        routes
     }
 
     /// Registers a GET handler for `path`.
@@ -160,7 +225,13 @@ impl Router {
         R: Future + Send + 'static,
         R::Output: IntoResponse,
     {
-        let endpoint = Endpoint { handler: Arc::new(handler), middlewares: Vec::new(), body: BodyConfig::default() };
+        let endpoint = Endpoint {
+            handler: Arc::new(handler),
+            middlewares: Vec::new(),
+            body: BodyConfig::default(),
+            timeout: RouteTimeout::default(),
+            meta: http::Extensions::new(),
+        };
         self.routes.entry(normalize(path)).or_default().insert(method, endpoint);
     }
 
@@ -199,6 +270,8 @@ impl Router {
             methods: Vec::new(),
             middlewares: Vec::new(),
             body: BodyConfig::default(),
+            timeout: RouteTimeout::default(),
+            meta: http::Extensions::new(),
         }
     }
 
@@ -233,7 +306,7 @@ impl Router {
                     .chain(endpoint.middlewares.iter())
                     .cloned()
                     .collect();
-                entry.insert(method, Endpoint { handler: endpoint.handler, middlewares, body: endpoint.body });
+                entry.insert(method, Endpoint { middlewares, ..endpoint });
             }
         }
         self
@@ -241,7 +314,7 @@ impl Router {
 
     /// Builds the radix-tree matcher and the route chains used to serve
     /// requests.
-    pub(crate) fn compile(&self, on_error: Option<ErrorHandler>) -> Result<CompiledRouter, String> {
+    pub(crate) fn compile(&self, on_error: Option<ErrorHandler>, default_timeout: Option<Duration>) -> Result<CompiledRouter, String> {
         if !self.middlewares.errors.is_empty() {
             return Err(format!("invalid middleware configuration: {}", self.middlewares.errors.join("; ")));
         }
@@ -271,7 +344,12 @@ impl Router {
                         handler: Arc::clone(&endpoint.handler),
                         on_error: on_error.clone(),
                     };
-                    (*method, Route { chain: Arc::new(chain), body: endpoint.body })
+                    let timeout = match endpoint.timeout {
+                        RouteTimeout::Inherit => default_timeout,
+                        RouteTimeout::After(limit) => Some(limit),
+                        RouteTimeout::Never => None,
+                    };
+                    (*method, Route { chain: Arc::new(chain), body: endpoint.body, timeout })
                 })
                 .collect();
             routes.push(methods);
@@ -299,6 +377,8 @@ pub struct RouteBuilder<'a> {
     methods: Vec<Method>,
     middlewares: Vec<Arc<dyn Middleware>>,
     body: BodyConfig,
+    timeout: RouteTimeout,
+    meta: http::Extensions,
 }
 
 macro_rules! route_methods {
@@ -331,7 +411,13 @@ impl RouteBuilder<'_> {
     }
 
     fn add(&mut self, method: Method, handler: Arc<dyn Handler>) -> &mut Self {
-        let endpoint = Endpoint { handler, middlewares: self.middlewares.clone(), body: self.body };
+        let endpoint = Endpoint {
+            handler,
+            middlewares: self.middlewares.clone(),
+            body: self.body,
+            timeout: self.timeout,
+            meta: self.meta.clone(),
+        };
         self.router.routes.entry(self.path.clone()).or_default().insert(method, endpoint);
         if !self.methods.contains(&method) {
             self.methods.push(method);
@@ -384,6 +470,55 @@ impl RouteBuilder<'_> {
     pub fn stream_body(&mut self) -> &mut Self {
         self.body.stream = true;
         self.update(|endpoint| endpoint.body.stream = true);
+        self
+    }
+
+    /// How long these handlers, with their route and router middleware,
+    /// may take to produce a response, overriding
+    /// [`Server::handler_timeout`](crate::Server::handler_timeout). After
+    /// that the handler is cancelled and the client gets 503
+    /// ([`ServerError::HandlerTimeout`]).
+    ///
+    /// The time runs from when routing hands over the request: a buffered
+    /// body has already been read (under `request_timeout`), while a
+    /// [`stream_body`](RouteBuilder::stream_body) handler reads the body
+    /// within it. A streamed response, such as [`sse`](crate::sse), only
+    /// has to *start* in time.
+    ///
+    /// ```rust
+    /// use axeon::Server;
+    /// use std::time::Duration;
+    ///
+    /// let mut app = Server::new();
+    /// app.handler_timeout(Duration::from_secs(10));
+    /// app.route("/v1/products").timeout(Duration::from_secs(2)).get(|_req| async { "[]" });
+    /// app.route("/documents").stream_body().timeout(Duration::from_secs(300)).post(|_req| async { "stored" });
+    /// ```
+    pub fn timeout(&mut self, limit: Duration) -> &mut Self {
+        self.set_timeout(RouteTimeout::After(limit))
+    }
+
+    /// No time limit for these handlers, even with a
+    /// [`Server::handler_timeout`](crate::Server::handler_timeout).
+    pub fn no_timeout(&mut self) -> &mut Self {
+        self.set_timeout(RouteTimeout::Never)
+    }
+
+    /// Attaches a value to these handlers, replacing one of the same type,
+    /// for tools that read [`Router::routes`]: e.g. axeon-openapi stores
+    /// each route's API documentation this way. It doesn't change how
+    /// requests are handled.
+    pub fn meta<T: Clone + Send + Sync + 'static>(&mut self, value: T) -> &mut Self {
+        self.meta.insert(value.clone());
+        self.update(|endpoint| {
+            endpoint.meta.insert(value.clone());
+        });
+        self
+    }
+
+    fn set_timeout(&mut self, timeout: RouteTimeout) -> &mut Self {
+        self.timeout = timeout;
+        self.update(|endpoint| endpoint.timeout = timeout);
         self
     }
 }
@@ -489,7 +624,7 @@ mod tests {
         let mut router = Router::new();
         router.get("/users/:id", |_req| async { crate::Response::text("param") });
         router.get("/users/new", |_req| async { crate::Response::text("static") });
-        let compiled = router.compile(None).unwrap();
+        let compiled = router.compile(None, None).unwrap();
         let (_, params, pattern) = compiled.lookup("/users/new").unwrap();
         assert_eq!(&*pattern, "/users/new");
         assert!(params.is_empty());
@@ -504,7 +639,7 @@ mod tests {
         let mut router = Router::new();
         router.get("/users/:id", |_req| async { crate::Response::text("a") });
         router.get("/users/:name", |_req| async { crate::Response::text("b") });
-        assert!(router.compile(None).is_err());
+        assert!(router.compile(None, None).is_err());
     }
 
     mod properties {
@@ -525,7 +660,7 @@ mod tests {
                 for pattern in &patterns {
                     router.get(pattern, |_req| async { "ok" });
                 }
-                if let Ok(compiled) = router.compile(None) {
+                if let Ok(compiled) = router.compile(None, None) {
                     for path in &paths {
                         let _ = compiled.lookup(path);
                         let _ = compiled.body_config(path, Method::GET);

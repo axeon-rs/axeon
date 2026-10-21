@@ -123,6 +123,7 @@ pub(crate) mod handler;
 mod lifecycle;
 mod static_files;
 pub(crate) mod message;
+pub mod broadcast;
 pub mod health;
 pub mod metrics;
 pub mod middleware;
@@ -145,7 +146,7 @@ mod tls;
 pub use app::{shutdown_signal, App, Server};
 pub use crate::tower::AppService;
 pub use lifecycle::Shutdown;
-pub use router::{RouteBuilder, Router};
+pub use router::{RouteBuilder, RouteInfo, Router};
 
 pub use crate::error::{ServerError, ServerResult};
 pub use crate::handler::{Html, IntoResponse, Json};

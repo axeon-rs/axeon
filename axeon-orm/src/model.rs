@@ -2,9 +2,11 @@
 
 use crate::db::{Backend, Conn, Executor, Row};
 use crate::error::{Error, Result};
+use crate::query::Column;
 use crate::sql::{column_list, Sql};
 use crate::value::{Kind, Value};
 use std::borrow::Cow;
+use std::marker::PhantomData;
 
 /// A Rust struct mapped to a database table.
 ///
@@ -18,6 +20,10 @@ use std::borrow::Cow;
 /// | `User::find_or_fail(&db, id)` | Same, but [`Error::NotFound`] when missing |
 /// | `User::all(&db)` | Every row |
 /// | `user.insert(&db)` | Inserts, returning the stored row (with its new id) |
+/// | `User::insert_many(&db, &users)` | Inserts many rows in a few statements, returning them in order |
+/// | `User::upsert_many(&db, &users, OnConflict::on(User::EMAIL))` | The same, updating existing rows |
+/// | `user.upsert(&db, OnConflict::on(User::EMAIL))` | Inserts, or updates the row with the same email; returns the stored row |
+/// | `user.insert_or_ignore(&db, OnConflict::on(User::EMAIL))` | Inserts unless that row exists: `Option<User>` |
 /// | `user.update(&db)` | Saves every column and reloads the row |
 /// | `user.delete(&db)` | Deletes by primary key |
 ///
@@ -89,6 +95,11 @@ pub struct ColumnDef {
     pub timestamp: Option<Timestamp>,
     /// A foreign key.
     pub references: Option<Reference>,
+    /// The only values allowed, for a [`SqlEnum`](derive@crate::SqlEnum)
+    /// column.
+    pub values: Option<&'static [&'static str]>,
+    /// The size of a vector column, from `#[model(dimensions = n)]`.
+    pub dimensions: Option<u32>,
 }
 
 impl ColumnDef {
@@ -106,6 +117,8 @@ impl ColumnDef {
             default_sql: None,
             timestamp: None,
             references: None,
+            values: None,
+            dimensions: None,
         }
     }
 
@@ -138,6 +151,18 @@ impl ColumnDef {
     #[doc(hidden)]
     pub const fn timestamp(mut self, timestamp: Timestamp) -> Self {
         self.timestamp = Some(timestamp);
+        self
+    }
+
+    #[doc(hidden)]
+    pub const fn dimensions(mut self, dimensions: u32) -> Self {
+        self.dimensions = Some(dimensions);
+        self
+    }
+
+    #[doc(hidden)]
+    pub const fn values(mut self, values: Option<&'static [&'static str]>) -> Self {
+        self.values = values;
         self
     }
 
@@ -191,34 +216,34 @@ pub async fn find<'c, M: Model>(ex: impl Executor<'c>, key: Value) -> Result<Opt
     fetch_one_where(&mut ex.into_conn(), M::PRIMARY_KEY, key).await
 }
 
-#[doc(hidden)]
-pub async fn insert<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M> {
-    let mut conn = ex.into_conn();
-    let mut columns = Vec::new();
-    let mut values = Vec::new();
-    for column in M::COLUMNS {
+/// The columns an `INSERT` writes and their values: all but
+/// auto-increment keys and `default` columns, with timestamps set to now.
+fn insert_values<M: Model>(model: &M) -> Vec<(&'static ColumnDef, Value)> {
+    M::COLUMNS
+        .iter()
         // The database fills auto-increment keys and `default` columns.
-        if column.auto_increment || column.has_default {
-            continue;
-        }
-        let value = match column.timestamp {
-            Some(_) => now(column.kind).unwrap_or_else(|| value_of(model, column.name)),
-            None => value_of(model, column.name),
-        };
-        columns.push(crate::sql::ident(conn.backend(), column.name));
-        values.push(value);
-    }
+        .filter(|column| !column.auto_increment && !column.has_default)
+        .map(|column| {
+            let value = match column.timestamp {
+                Some(_) => now(column.kind).unwrap_or_else(|| value_of(model, column.name)),
+                None => value_of(model, column.name),
+            };
+            (column, value)
+        })
+        .collect()
+}
 
-    let backend = conn.backend();
-    let mut sql = Sql::new(backend);
+/// `INSERT INTO table (columns) VALUES (values)`.
+fn write_insert<M: Model>(sql: &mut Sql, backend: Backend, values: Vec<(&'static ColumnDef, Value)>) {
     sql.push("INSERT INTO ").ident(M::TABLE);
-    if columns.is_empty() && backend == Backend::MySql {
+    if values.is_empty() && backend == Backend::MySql {
         sql.push(" () VALUES ()");
-    } else if columns.is_empty() {
+    } else if values.is_empty() {
         sql.push(" DEFAULT VALUES");
     } else {
+        let columns: Vec<String> = values.iter().map(|(c, _)| crate::sql::ident(backend, c.name)).collect();
         sql.push(" (").push(&columns.join(", ")).push(") VALUES (");
-        for (i, value) in values.into_iter().enumerate() {
+        for (i, (_, value)) in values.into_iter().enumerate() {
             if i > 0 {
                 sql.push(", ");
             }
@@ -226,6 +251,14 @@ pub async fn insert<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M>
         }
         sql.push(")");
     }
+}
+
+#[doc(hidden)]
+pub async fn insert<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M> {
+    let mut conn = ex.into_conn();
+    let backend = conn.backend();
+    let mut sql = Sql::new(backend);
+    write_insert::<M>(&mut sql, backend, insert_values(model));
     if backend == Backend::MySql {
         return insert_mysql(&mut conn, sql, model).await;
     }
@@ -240,17 +273,185 @@ pub async fn insert<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M>
 async fn insert_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, model: &M) -> Result<M> {
     let (sql, args) = sql.finish();
     let id = conn.insert_mysql(sql, args).await?;
-    let pk = primary_key::<M>();
-    let key = match (pk.auto_increment, pk.kind) {
-        (true, Kind::I32) => Value::I32(id as i32),
-        (true, _) => Value::I64(id as i64),
-        (false, _) => value_of(model, pk.name),
-    };
-    fetch_one_where(conn, pk.name, key).await?.ok_or(Error::NotFound)
+    let key = mysql_key(model, id);
+    fetch_one_where(conn, M::PRIMARY_KEY, key).await?.ok_or(Error::NotFound)
 }
 
 #[cfg(not(feature = "mysql"))]
 async fn insert_mysql<M: Model>(_: &mut Conn<'_>, _: Sql, _: &M) -> Result<M> {
+    unreachable!("MySQL connections need the `mysql` feature")
+}
+
+/// The primary key of a row MySQL just wrote: `id` from `LAST_INSERT_ID()`
+/// for an auto-increment key, else the model's own key.
+#[cfg(feature = "mysql")]
+fn mysql_key<M: Model>(model: &M, id: u64) -> Value {
+    let pk = primary_key::<M>();
+    match (pk.auto_increment, pk.kind) {
+        (true, Kind::I32) => Value::I32(id as i32),
+        (true, _) => Value::I64(id as i64),
+        (false, _) => value_of(model, pk.name),
+    }
+}
+
+/// What [`upsert`](crate::Model) and `insert_or_ignore` do when a row with
+/// the same unique columns already exists: `OnConflict::on(Product::SKU)`.
+///
+/// The columns must have a unique constraint or index together
+/// (`#[model(unique)]` for one column). MySQL ignores them and reacts to a
+/// conflict on any unique key.
+pub struct OnConflict<M> {
+    target: Vec<&'static str>,
+    update: Option<Vec<&'static str>>,
+    _marker: PhantomData<fn() -> M>,
+}
+
+impl<M> Clone for OnConflict<M> {
+    fn clone(&self) -> Self {
+        Self { target: self.target.clone(), update: self.update.clone(), _marker: PhantomData }
+    }
+}
+
+impl<M> std::fmt::Debug for OnConflict<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnConflict").field("target", &self.target).field("update", &self.update).finish()
+    }
+}
+
+impl<M: Model> OnConflict<M> {
+    /// A conflict on `column`.
+    pub fn on<T>(column: Column<M, T>) -> Self {
+        Self { target: vec![column.name()], update: None, _marker: PhantomData }
+    }
+
+    /// A conflict on several columns together: add another one.
+    pub fn and<T>(mut self, column: Column<M, T>) -> Self {
+        self.target.push(column.name());
+        self
+    }
+
+    /// On conflict, [`upsert`](crate::Model) overwrites only the columns
+    /// named this way (call again for more), instead of every column but
+    /// the primary key, the conflict columns and `created_at`.
+    pub fn update<T>(mut self, column: Column<M, T>) -> Self {
+        self.update.get_or_insert_with(Vec::new).push(column.name());
+        self
+    }
+
+    /// The columns an upsert overwrites, from those the insert writes.
+    fn update_columns(&self, inserted: &[(&'static ColumnDef, Value)]) -> Vec<&'static str> {
+        match &self.update {
+            Some(columns) => columns.clone(),
+            None => inserted
+                .iter()
+                .map(|(c, _)| *c)
+                .filter(|c| !c.primary_key && c.timestamp != Some(Timestamp::CreatedAt) && !self.target.contains(&c.name))
+                .map(|c| c.name)
+                .collect(),
+        }
+    }
+}
+
+/// `ON CONFLICT (target)`, or nothing on MySQL.
+fn write_conflict_target<M>(sql: &mut Sql, backend: Backend, conflict: &OnConflict<M>) {
+    if backend != Backend::MySql {
+        let target: Vec<String> = conflict.target.iter().map(|c| crate::sql::ident(backend, c)).collect();
+        sql.push(" ON CONFLICT (").push(&target.join(", ")).push(")");
+    }
+}
+
+#[doc(hidden)]
+pub async fn upsert<'c, M: Model>(ex: impl Executor<'c>, model: &M, conflict: &OnConflict<M>) -> Result<M> {
+    let mut conn = ex.into_conn();
+    let backend = conn.backend();
+    let inserted = insert_values(model);
+    let mut update = conflict.update_columns(&inserted);
+    if update.is_empty() {
+        // Every column is a key: a no-op update, so the row still comes back.
+        update.push(conflict.target[0]);
+    }
+    let mut sql = Sql::new(backend);
+    write_insert::<M>(&mut sql, backend, inserted);
+    let pk = primary_key::<M>();
+    if backend == Backend::MySql {
+        // `LAST_INSERT_ID(id)` makes an update report the existing row's id.
+        let new = crate::sql::ident(backend, "excluded");
+        sql.push(" AS ").push(&new).push(" ON DUPLICATE KEY UPDATE ");
+        for (i, column) in update.iter().enumerate() {
+            if i > 0 {
+                sql.push(", ");
+            }
+            sql.ident(column).push(" = ").push(&new).push(".").ident(column);
+        }
+        if pk.auto_increment {
+            sql.push(", ").ident(pk.name).push(" = LAST_INSERT_ID(").ident(pk.name).push(")");
+        }
+        return upsert_mysql(&mut conn, sql, model, conflict).await;
+    }
+    write_conflict_target(&mut sql, backend, conflict);
+    sql.push(" DO UPDATE SET ");
+    for (i, column) in update.iter().enumerate() {
+        if i > 0 {
+            sql.push(", ");
+        }
+        sql.ident(column).push(" = ").ident("excluded").push(".").ident(column);
+    }
+    sql.push(" RETURNING ").push(&column_list::<M>(backend));
+    let (sql, args) = sql.finish();
+    let row = conn.fetch_optional(sql, args).await?.ok_or(Error::NotFound)?;
+    M::from_row(&row)
+}
+
+/// Reads the upserted row back: by `LAST_INSERT_ID()` for an
+/// auto-increment key, else by the conflict columns, which the update
+/// leaves alone.
+#[cfg(feature = "mysql")]
+async fn upsert_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, model: &M, conflict: &OnConflict<M>) -> Result<M> {
+    let (sql, args) = sql.finish();
+    let id = conn.insert_mysql(sql, args).await?;
+    let pk = primary_key::<M>();
+    if pk.auto_increment {
+        return fetch_one_where(conn, pk.name, mysql_key(model, id)).await?.ok_or(Error::NotFound);
+    }
+    let conds = conflict.target.iter().map(|c| crate::sql::Cond::Compare(c, "=", value_of(model, c))).collect();
+    crate::Query::<M>::new().cond(crate::sql::Cond::And(conds)).fetch(conn).await?.into_iter().next().ok_or(Error::NotFound)
+}
+
+#[cfg(not(feature = "mysql"))]
+async fn upsert_mysql<M: Model>(_: &mut Conn<'_>, _: Sql, _: &M, _: &OnConflict<M>) -> Result<M> {
+    unreachable!("MySQL connections need the `mysql` feature")
+}
+
+#[doc(hidden)]
+pub async fn insert_or_ignore<'c, M: Model>(ex: impl Executor<'c>, model: &M, conflict: &OnConflict<M>) -> Result<Option<M>> {
+    let mut conn = ex.into_conn();
+    let backend = conn.backend();
+    let mut sql = Sql::new(backend);
+    write_insert::<M>(&mut sql, backend, insert_values(model));
+    if backend == Backend::MySql {
+        return insert_or_ignore_mysql(&mut conn, sql, model).await;
+    }
+    write_conflict_target(&mut sql, backend, conflict);
+    sql.push(" DO NOTHING RETURNING ").push(&column_list::<M>(backend));
+    let (sql, args) = sql.finish();
+    conn.fetch_optional(sql, args).await?.map(|row| M::from_row(&row)).transpose()
+}
+
+/// A plain insert, where a unique violation means the row exists. Not
+/// `INSERT IGNORE`, which also turns other errors into warnings, nor a
+/// no-op `ON DUPLICATE KEY UPDATE`: sqlx reports found rows, so that
+/// counts 1 whether or not it inserted.
+#[cfg(feature = "mysql")]
+async fn insert_or_ignore_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, model: &M) -> Result<Option<M>> {
+    let (sql, args) = sql.finish();
+    match conn.insert_mysql_unless_duplicate(sql, args).await? {
+        None => Ok(None),
+        Some(id) => fetch_one_where(conn, M::PRIMARY_KEY, mysql_key(model, id)).await,
+    }
+}
+
+#[cfg(not(feature = "mysql"))]
+async fn insert_or_ignore_mysql<M: Model>(_: &mut Conn<'_>, _: Sql, _: &M) -> Result<Option<M>> {
     unreachable!("MySQL connections need the `mysql` feature")
 }
 
@@ -302,6 +503,202 @@ pub async fn delete<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<()
         0 => Err(Error::NotFound),
         _ => Ok(()),
     }
+}
+
+/// Rows per bulk `INSERT`: under the database's limit on bound parameters
+/// (32766 in SQLite, 65535 elsewhere), and at most 1000.
+fn rows_per_statement(backend: Backend, columns: usize) -> usize {
+    let limit = match backend {
+        Backend::Sqlite => 32_766,
+        _ => 65_535,
+    };
+    (limit / columns.max(1)).clamp(1, 1000)
+}
+
+#[doc(hidden)]
+pub async fn insert_many<'c, M: Model>(ex: impl Executor<'c>, models: &[M]) -> Result<Vec<M>> {
+    bulk(ex, models, None).await
+}
+
+#[doc(hidden)]
+pub async fn upsert_many<'c, M: Model>(ex: impl Executor<'c>, models: &[M], conflict: &OnConflict<M>) -> Result<Vec<M>> {
+    if conflict.target.is_empty() {
+        return Err(Error::Config("upsert_many needs at least one conflict column".into()));
+    }
+    // Checked first, so a bad batch writes nothing on any database.
+    let mut seen = std::collections::HashSet::new();
+    if !models.iter().all(|model| seen.insert(key_of(model, &conflict.target))) {
+        return Err(Error::Config("two rows in one upsert_many have the same conflict key".into()));
+    }
+    bulk(ex, models, Some(conflict)).await
+}
+
+/// Inserts (or upserts) in chunks; several chunks on a bare pool run in one
+/// transaction, so a failure inserts nothing.
+async fn bulk<'c, M: Model>(ex: impl Executor<'c>, models: &[M], conflict: Option<&OnConflict<M>>) -> Result<Vec<M>> {
+    let Some(first) = models.first() else { return Ok(Vec::new()) };
+    let mut conn = ex.into_conn();
+    let backend = conn.backend();
+    let columns = insert_values(first).len();
+    if columns == 0 {
+        // Only database-filled columns: rows can't share a statement.
+        let mut stored = Vec::with_capacity(models.len());
+        for model in models {
+            stored.push(match conflict {
+                None => insert(&mut conn, model).await?,
+                Some(conflict) => upsert(&mut conn, model, conflict).await?,
+            });
+        }
+        return Ok(stored);
+    }
+    let per_statement = rows_per_statement(backend, columns);
+    match &mut conn {
+        Conn::Db(db) if models.len() > per_statement => {
+            let mut tx = db.begin().await?;
+            let stored = bulk_chunks(&mut Conn::Tx(&mut tx), models, conflict, per_statement).await?;
+            tx.commit().await?;
+            Ok(stored)
+        }
+        _ => bulk_chunks(&mut conn, models, conflict, per_statement).await,
+    }
+}
+
+async fn bulk_chunks<M: Model>(conn: &mut Conn<'_>, models: &[M], conflict: Option<&OnConflict<M>>, per_statement: usize) -> Result<Vec<M>> {
+    let backend = conn.backend();
+    let pk = primary_key::<M>();
+    let mut stored = Vec::with_capacity(models.len());
+    for chunk in models.chunks(per_statement) {
+        let rows: Vec<Vec<(&'static ColumnDef, Value)>> = chunk.iter().map(insert_values).collect();
+        let mut sql = Sql::new(backend);
+        sql.push("INSERT INTO ").ident(M::TABLE).push(" (");
+        for (i, (column, _)) in rows[0].iter().enumerate() {
+            if i > 0 {
+                sql.push(", ");
+            }
+            sql.ident(column.name);
+        }
+        sql.push(") VALUES ");
+        let update = conflict.map(|conflict| {
+            let mut update = conflict.update_columns(&rows[0]);
+            if update.is_empty() {
+                update.push(conflict.target[0]);
+            }
+            update
+        });
+        for (i, row) in rows.into_iter().enumerate() {
+            sql.push(if i == 0 { "(" } else { ", (" });
+            for (j, (_, value)) in row.into_iter().enumerate() {
+                if j > 0 {
+                    sql.push(", ");
+                }
+                sql.arg(value);
+            }
+            sql.push(")");
+        }
+        if let (Some(conflict), Some(update)) = (conflict, &update) {
+            if backend == Backend::MySql {
+                let new = crate::sql::ident(backend, "excluded");
+                sql.push(" AS ").push(&new).push(" ON DUPLICATE KEY UPDATE ");
+                for (i, column) in update.iter().enumerate() {
+                    if i > 0 {
+                        sql.push(", ");
+                    }
+                    sql.ident(column).push(" = ").push(&new).push(".").ident(column);
+                }
+            } else {
+                write_conflict_target(&mut sql, backend, conflict);
+                sql.push(" DO UPDATE SET ");
+                for (i, column) in update.iter().enumerate() {
+                    if i > 0 {
+                        sql.push(", ");
+                    }
+                    sql.ident(column).push(" = ").ident("excluded").push(".").ident(column);
+                }
+            }
+        }
+
+        let fetched: Vec<M> = if backend == Backend::MySql {
+            bulk_mysql(conn, sql, chunk, conflict, pk).await?
+        } else {
+            sql.push(" RETURNING ").push(&column_list::<M>(backend));
+            let (text, args) = sql.finish();
+            conn.fetch_all(text, args).await?.iter().map(M::from_row).collect::<Result<_>>()?
+        };
+        stored.extend(in_input_order(chunk, fetched, conflict, pk)?);
+    }
+    Ok(stored)
+}
+
+/// MySQL has no `RETURNING`: insert, then read the rows back.
+#[cfg(feature = "mysql")]
+async fn bulk_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, chunk: &[M], conflict: Option<&OnConflict<M>>, pk: &ColumnDef) -> Result<Vec<M>> {
+    let (text, args) = sql.finish();
+    let first_id = conn.insert_mysql(text, args).await?;
+    match conflict {
+        // A multi-row INSERT gets consecutive auto-increment IDs.
+        None if pk.auto_increment => {
+            let first = match pk.kind {
+                Kind::I32 => Value::I32(first_id as i32),
+                _ => Value::I64(first_id as i64),
+            };
+            let rows = crate::Query::<M>::new()
+                .cond(crate::sql::Cond::Compare(pk.name, ">=", first))
+                .order_by_column(pk.name)
+                .limit(chunk.len() as u64)
+                .fetch(conn)
+                .await?;
+            if rows.len() != chunk.len() {
+                return Err(Error::Config("MySQL didn't assign consecutive IDs to a bulk insert".into()));
+            }
+            Ok(rows)
+        }
+        None => fetch_by_keys(conn, chunk, &[pk.name]).await,
+        Some(conflict) => fetch_by_keys(conn, chunk, &conflict.target).await,
+    }
+}
+
+#[cfg(not(feature = "mysql"))]
+async fn bulk_mysql<M: Model>(_: &mut Conn<'_>, _: Sql, _: &[M], _: Option<&OnConflict<M>>, _: &ColumnDef) -> Result<Vec<M>> {
+    unreachable!("MySQL connections need the `mysql` feature")
+}
+
+/// Rows whose `keys` columns match one of `models`.
+#[cfg(feature = "mysql")]
+async fn fetch_by_keys<M: Model>(conn: &mut Conn<'_>, models: &[M], keys: &[&'static str]) -> Result<Vec<M>> {
+    use crate::sql::Cond;
+    let any = models
+        .iter()
+        .map(|model| Cond::And(keys.iter().map(|key| Cond::Compare(key, "=", value_of(model, key))).collect()))
+        .collect();
+    crate::Query::<M>::new().cond(Cond::Or(any)).fetch(conn).await
+}
+
+/// Puts stored rows in the order of the input: by the generated key for a
+/// plain insert (IDs follow insertion order), else by key values. SQLite
+/// doesn't promise `RETURNING` order.
+fn in_input_order<M: Model>(input: &[M], mut stored: Vec<M>, conflict: Option<&OnConflict<M>>, pk: &ColumnDef) -> Result<Vec<M>> {
+    if conflict.is_none() && pk.auto_increment {
+        stored.sort_by_key(|row| match value_of(row, pk.name) {
+            Value::I32(id) => i64::from(id),
+            Value::I64(id) => id,
+            _ => 0,
+        });
+        return Ok(stored);
+    }
+    let keys: Vec<&'static str> = match conflict {
+        Some(conflict) => conflict.target.clone(),
+        None => vec![pk.name],
+    };
+    let mut by_key: std::collections::HashMap<Vec<Value>, M> = stored.into_iter().map(|row| (key_of(&row, &keys), row)).collect();
+    input
+        .iter()
+        .map(|model| by_key.remove(&key_of(model, &keys)).ok_or(Error::NotFound))
+        .collect::<Result<Vec<M>>>()
+        .map_err(|_| Error::Config("two rows in one bulk upsert have the same key".into()))
+}
+
+fn key_of<M: Model>(model: &M, keys: &[&'static str]) -> Vec<Value> {
+    keys.iter().map(|key| value_of(model, key).key()).collect()
 }
 
 /// Compile-time check used by the derive for relation foreign keys.

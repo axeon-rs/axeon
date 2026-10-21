@@ -31,6 +31,7 @@ struct FieldAttrs {
     belongs_to: Option<Path>,
     on_delete: Option<LitStr>,
     skip: bool,
+    dimensions: Option<syn::LitInt>,
 }
 
 struct Field {
@@ -138,9 +139,16 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                     attrs.on_delete = Some(action);
                 } else if path.is_ident("skip") {
                     attrs.skip = true;
+                } else if path.is_ident("dimensions") {
+                    let lit: syn::LitInt = meta.value()?.parse()?;
+                    let n: u32 = lit.base10_parse()?;
+                    if !(1..=16000).contains(&n) {
+                        return Err(Error::new_spanned(&lit, "a vector has 1 to 16000 dimensions"));
+                    }
+                    attrs.dimensions = Some(lit);
                 } else {
                     return Err(meta.error(
-                        "expected primary_key, column, unique, index, default, created_at, updated_at, belongs_to, on_delete or skip",
+                        "expected primary_key, column, unique, index, default, created_at, updated_at, belongs_to, on_delete, skip or dimensions",
                     ));
                 }
                 Ok(())
@@ -182,6 +190,7 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         let (col, ty) = (&f.column, &f.ty);
         let mut def = quote! {
             ::axeon_orm::ColumnDef::new(#col, <#ty as ::axeon_orm::SqlType>::KIND, <#ty as ::axeon_orm::SqlType>::NULLABLE)
+                .values(<#ty as ::axeon_orm::SqlType>::VALUES)
         };
         if std::ptr::eq(*f, pk) {
             def = quote! { #def.primary_key() };
@@ -191,6 +200,9 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         }
         if f.attrs.index {
             def = quote! { #def.index() };
+        }
+        if let Some(dimensions) = &f.attrs.dimensions {
+            def = quote! { #def.dimensions(#dimensions) };
         }
         if let Some(default) = &f.attrs.default {
             let sql = match default {
@@ -374,6 +386,46 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                 ::axeon_orm::__private::insert(ex, &self).await
             }
 
+            /// Inserts `rows` with as few statements as possible (one per 1000 rows or so),
+            /// returning the stored rows, with database-assigned values, in the same order.
+            /// Several statements on a pool run in one transaction: all rows or none.
+            pub async fn insert_many<'c>(
+                ex: impl ::axeon_orm::Executor<'c>,
+                rows: &[Self],
+            ) -> ::axeon_orm::Result<::std::vec::Vec<Self>> {
+                ::axeon_orm::__private::insert_many(ex, rows).await
+            }
+
+            /// Like `insert_many`, updating rows whose `conflict` columns already exist (see
+            /// `upsert`). A key may appear only once per call.
+            pub async fn upsert_many<'c>(
+                ex: impl ::axeon_orm::Executor<'c>,
+                rows: &[Self],
+                conflict: ::axeon_orm::OnConflict<Self>,
+            ) -> ::axeon_orm::Result<::std::vec::Vec<Self>> {
+                ::axeon_orm::__private::upsert_many(ex, rows, &conflict).await
+            }
+
+            /// Inserts this record or, if a row with the same `conflict` columns exists, updates
+            /// it; returns the stored row.
+            pub async fn upsert<'c>(
+                self,
+                ex: impl ::axeon_orm::Executor<'c>,
+                conflict: ::axeon_orm::OnConflict<Self>,
+            ) -> ::axeon_orm::Result<Self> {
+                ::axeon_orm::__private::upsert(ex, &self, &conflict).await
+            }
+
+            /// Inserts this record unless a row with the same `conflict` columns exists; returns
+            /// the stored row, or `None` if nothing was inserted.
+            pub async fn insert_or_ignore<'c>(
+                self,
+                ex: impl ::axeon_orm::Executor<'c>,
+                conflict: ::axeon_orm::OnConflict<Self>,
+            ) -> ::axeon_orm::Result<::core::option::Option<Self>> {
+                ::axeon_orm::__private::insert_or_ignore(ex, &self, &conflict).await
+            }
+
             /// Saves every column by primary key and reloads the row.
             pub async fn update<'c>(&mut self, ex: impl ::axeon_orm::Executor<'c>) -> ::axeon_orm::Result<()> {
                 *self = ::axeon_orm::__private::update(ex, &*self).await?;
@@ -410,7 +462,7 @@ fn unraw(ident: &Ident) -> String {
 }
 
 /// `UserProfile` → `user_profile`, `HTTPLog` → `http_log`.
-fn snake_case(name: &str) -> String {
+pub(crate) fn snake_case(name: &str) -> String {
     let chars: Vec<char> = name.chars().collect();
     let mut out = String::new();
     for (i, c) in chars.iter().enumerate() {

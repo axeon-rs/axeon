@@ -1,0 +1,21 @@
+[package]
+name = "axeon-openapi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "OpenAPI 3.1 documents for Axeon routes, from your Rust types"
+license = "MIT"
+repository = "https://github.com/axeon-rs/axeon"
+documentation = "https://docs.rs/axeon-openapi"
+readme = "README.md"
+keywords = ["openapi", "swagger", "api", "axeon", "documentation"]
+categories = ["web-programming", "development-tools"]
+
+[dependencies]
+axeon = { version = "1.0", path = "..", default-features = false }
+utoipa = { version = "6", features = ["debug"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }

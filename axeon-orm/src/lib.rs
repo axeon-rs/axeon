@@ -93,6 +93,57 @@
 //! and with features `chrono`, `uuid` and `json` their types. Match the
 //! integer width to the column: `i32` for `INTEGER`, `i64` for `BIGINT`.
 //!
+//! # Enums
+//!
+//! `#[derive(SqlEnum)]` lets a fieldless enum be a column. It is stored as
+//! text, as the variant name in snake case unless renamed, so it works the
+//! same on every database:
+//!
+//! ```
+//! use axeon_orm::{Db, Model, SqlEnum};
+//!
+//! #[derive(SqlEnum, Clone, Copy, Debug, PartialEq)]
+//! enum Status {
+//!     Pending,                 // "pending"
+//!     InReview,                // "in_review"
+//!     #[sql_enum(rename = "ok")]
+//!     Approved,                // "ok"
+//! }
+//!
+//! #[derive(Model)]
+//! struct Case {
+//!     id: i64,
+//!     status: Status,
+//!     previous: Option<Status>,
+//! }
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> axeon_orm::Result<()> {
+//! # let db = Db::connect("sqlite::memory:").await?;
+//! # db.create_table::<Case>().await?;
+//! Case { id: 0, status: Status::InReview, previous: None }.insert(&db).await?;
+//! let open = Case::query()
+//!     .filter(Case::STATUS.is_in([Status::Pending, Status::InReview]))
+//!     .count(&db)
+//!     .await?;
+//! assert_eq!(open, 1);
+//! assert_eq!(Status::InReview.as_str(), "in_review");
+//! assert_eq!("ok".parse::<Status>().unwrap(), Status::Approved);
+//! # Ok(()) }
+//! ```
+//!
+//! `#[sql_enum(rename_all = "...")]` on the enum picks another case:
+//! `SCREAMING_SNAKE_CASE`, `kebab-case`, `lowercase`, `UPPERCASE`,
+//! `camelCase` or `PascalCase`. The derive also gives `Status::VALUES`,
+//! `as_str()`, `Display` and `FromStr`. [`schema::create_table`] adds a
+//! `CHECK` constraint listing the values. Reading a value the enum doesn't
+//! have (say, written by a newer release) is an [`Error::Decode`], not a
+//! panic.
+//!
+//! Native PostgreSQL enum types (`CREATE TYPE ... AS ENUM`) aren't
+//! supported: use a `TEXT` column, where adding a value is a code change
+//! (and a new `CHECK`), not an `ALTER TYPE`.
+//!
 //! # Features
 //!
 //! | Feature | Default | Enables |
@@ -105,6 +156,7 @@
 //! | `json` | yes | `serde_json::Value` and `sqlx::types::Json<T>` columns |
 //! | `axeon` | yes | The [`server`] module |
 //! | `uuid` | no | `Uuid` columns |
+//! | `pgvector` | no | [`vector`] columns, distances and indexes (PostgreSQL) |
 //!
 //! # Beyond simple queries
 //!
@@ -114,6 +166,21 @@
 //!   and [`where_has`](Query::where_has).
 //! - **Joins:** [`Query::join`] and [`left_join`](Query::left_join) give
 //!   `(Post, User)` pairs from one query, filtered and sorted by either side.
+//! - **Full-text and hybrid search:** [`search`] (PostgreSQL), with
+//!   [`Query::ranked`].
+//! - **Vector search:** [`vector::Vector`] columns, distances to sort and
+//!   filter by, and [`Query::nearest`] (feature `pgvector`).
+//! - **JSON filters:** [`Column::contains`], [`has_key`](Column::has_key)
+//!   and [`key`](Column::key) paths on JSON columns.
+//! - **Raw SQL fragments:** [`Expr::raw`] and [`Order::raw`] mix SQL
+//!   (JSONB, full-text search, pgvector) into a typed query, with bound
+//!   parameters.
+//! - **Upserts:** `upsert` and `insert_or_ignore` with an [`OnConflict`]
+//!   target, for idempotent writes.
+//! - **Row locks:** [`Query::for_update`], [`skip_locked`](Query::skip_locked)
+//!   and [`nowait`](Query::nowait), for claiming rows in a transaction.
+//! - **LISTEN / NOTIFY:** [`Db::notify`] and [`Db::listen`] on PostgreSQL;
+//!   see [`notify`].
 //! - **Migrations:** [`migrate`], and the `axeon-orm` command-line tool
 //!   (`cargo install axeon-orm-cli`).
 //!
@@ -131,6 +198,14 @@ mod sql;
 mod value;
 
 pub mod migrate;
+#[cfg(feature = "postgres")]
+pub mod search;
+#[cfg(feature = "pgvector")]
+pub mod vector;
+#[cfg(all(feature = "axeon", feature = "postgres"))]
+pub mod broadcast;
+#[cfg(feature = "postgres")]
+pub mod notify;
 pub mod relation;
 pub mod schema;
 #[cfg(feature = "axeon")]
@@ -138,13 +213,19 @@ pub mod server;
 
 pub use crate::db::{Backend, Db, DbOptions, Executor, Row, Transaction};
 pub use crate::error::{Error, Result};
-pub use crate::model::{ColumnDef, Model, Reference, Timestamp};
-pub use crate::query::{Assignment, Column, Expr, JoinQuery, Numeric, Order, Page, Query};
+pub use crate::model::{ColumnDef, Model, OnConflict, Reference, Timestamp};
+pub use crate::query::{Assignment, Column, Expr, JoinQuery, Numeric, Order, Page, Query, RawArgs};
+#[cfg(feature = "json")]
+pub use crate::query::{JsonColumn, JsonPath};
 pub use crate::relation::{BelongsTo, BelongsToMany, HasMany, HasOne, Join, Related, Relation};
-pub use crate::value::{Kind, SqlType, Value};
+pub use crate::value::{Kind, SqlType, UnknownVariant, Value};
 
 /// Derives [`Model`](trait@Model); see the [crate docs](crate#defining-models).
 pub use axeon_orm_macros::Model;
+
+/// Derives [`SqlType`] for a fieldless enum, stored as text; see the
+/// [crate docs](crate#enums).
+pub use axeon_orm_macros::SqlEnum;
 
 /// Embeds a folder of migrations in the binary at compile time and returns
 /// a [`Migrator`](migrate::Migrator). The path is relative to the crate's
@@ -160,10 +241,23 @@ pub mod prelude {
     pub use crate::server::{DbRequest, HealthExt, Transactional};
 }
 
+#[cfg(feature = "json")]
+mod sealed {
+    pub trait Sealed {}
+    #[cfg(feature = "json")]
+    impl Sealed for serde_json::Value {}
+    #[cfg(feature = "json")]
+    impl<T> Sealed for sqlx::types::Json<T> {}
+}
+
 #[doc(hidden)]
 pub mod __private {
     pub use crate::db::Conn;
-    pub use crate::model::{column_name, delete, find, has_column, insert, update};
+    pub use crate::model::{column_name, delete, find, has_column, insert, insert_many, insert_or_ignore, update, upsert, upsert_many};
+
+    pub fn decode_error(column: &str, error: impl std::fmt::Display) -> crate::Error {
+        crate::Error::decode(column, error)
+    }
 }
 
 /// Mistakes the derive and the typed API reject at compile time.
@@ -208,6 +302,38 @@ pub mod __private {
 /// ```compile_fail
 /// #[derive(axeon_orm::Model)]
 /// struct User { id: i64, tags: std::collections::HashMap<String, String> }
+/// ```
+///
+/// An enum variant holding data:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::SqlEnum)]
+/// enum Status { Open, Closed(String) }
+/// ```
+///
+/// Two variants stored as the same value:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::SqlEnum)]
+/// enum Status { Open, #[sql_enum(rename = "open")] Reopened }
+/// ```
+///
+/// An unknown case:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::SqlEnum)]
+/// #[sql_enum(rename_all = "Title Case")]
+/// enum Status { Open }
+/// ```
+///
+/// Comparing an enum column with a string:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::SqlEnum)]
+/// enum Status { Open }
+/// #[derive(axeon_orm::Model)]
+/// struct Case { id: i64, status: Status }
+/// let _ = Case::query().filter(Case::STATUS.eq("open"));
 /// ```
 #[doc(hidden)]
 pub mod compile_fail_tests {}

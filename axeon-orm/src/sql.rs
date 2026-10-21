@@ -38,6 +38,164 @@ pub(crate) enum Cond {
     And(Vec<Cond>),
     Or(Vec<Cond>),
     Not(Box<Cond>),
+    Raw(Fragment),
+    #[cfg(feature = "json")]
+    Json(&'static str, JsonPath, JsonTest),
+    /// `column <op> vector <compare> limit`, e.g. `embedding <=> $1 < 0.3`.
+    #[cfg(feature = "pgvector")]
+    Distance(&'static str, &'static str, Value, &'static str, f64),
+    /// Full-text match: source, configuration, query text.
+    #[cfg(feature = "postgres")]
+    FullText(FtsSource, String, Value),
+}
+
+/// What full-text search searches.
+#[cfg(feature = "postgres")]
+#[derive(Clone, Debug)]
+pub(crate) enum FtsSource {
+    /// Text columns, made into a `tsvector` per query.
+    Columns(Vec<&'static str>),
+    /// A stored `tsvector` column.
+    Stored(&'static str),
+}
+
+/// One part of a [`Score`](crate::search::Score).
+#[cfg(feature = "postgres")]
+#[derive(Clone, Debug)]
+pub(crate) enum ScoreTerm {
+    /// `ts_rank(..., 32)`: source, configuration, query text.
+    TextRank(FtsSource, String, Value),
+    /// A similarity from a vector distance: column, operator, vector.
+    #[cfg(feature = "pgvector")]
+    Similarity(&'static str, &'static str, Value),
+}
+
+/// A step into a JSON document: an object key or an array index.
+#[cfg(feature = "json")]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PathStep {
+    Key(String),
+    Index(i32),
+}
+
+/// A path into a JSON column, from the document's root.
+#[cfg(feature = "json")]
+pub(crate) type JsonPath = Vec<PathStep>;
+
+/// What a JSON condition checks.
+#[cfg(feature = "json")]
+#[derive(Clone, Debug)]
+pub(crate) enum JsonTest {
+    /// The document contains this JSON (PostgreSQL `@>`).
+    Contains(Value),
+    /// The top-level object has this key (PostgreSQL `?`).
+    HasKey(String),
+    /// The path exists (its value may be JSON `null`).
+    Exists,
+    /// The string at the path compared with `op`.
+    Text(&'static str, Value),
+    /// The string at the path is (not) one of these.
+    TextIn(Vec<Value>, bool),
+    /// The number at the path compared with `op`; non-numbers don't match.
+    Number(&'static str, f64),
+    /// The value at the path is this boolean.
+    Bool(bool),
+}
+
+/// A SQL/JSON path string for SQLite and MySQL: `$."a"[0]."b"`.
+#[cfg(feature = "json")]
+fn json_path_string(path: &[PathStep]) -> String {
+    let mut out = String::from("$");
+    for step in path {
+        match step {
+            PathStep::Key(key) => {
+                out.push_str(".\"");
+                for c in key.chars() {
+                    if c == '"' || c == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(c);
+                }
+                out.push('"');
+            }
+            PathStep::Index(i) => {
+                let _ = write!(out, "[{}]", i);
+            }
+        }
+    }
+    out
+}
+
+/// Raw SQL from [`Expr::raw`](crate::Expr::raw) or
+/// [`Order::raw`](crate::Order::raw): the text between `?` placeholders,
+/// and the values bound to them.
+#[derive(Clone, Debug)]
+pub(crate) struct Fragment {
+    pieces: Vec<String>,
+    args: Vec<Value>,
+}
+
+impl Fragment {
+    /// Splits `sql` at each `?`; `??` is a literal `?`.
+    ///
+    /// Panics when the number of placeholders differs from `args`.
+    pub fn new(sql: &str, args: Vec<Value>) -> Self {
+        let mut pieces = vec![String::new()];
+        let mut chars = sql.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '?' if chars.peek() == Some(&'?') => {
+                    chars.next();
+                    pieces.last_mut().unwrap().push('?');
+                }
+                '?' => pieces.push(String::new()),
+                c => pieces.last_mut().unwrap().push(c),
+            }
+        }
+        assert!(
+            pieces.len() - 1 == args.len(),
+            "raw SQL {:?} has {} placeholder(s) but {} value(s)",
+            sql,
+            pieces.len() - 1,
+            args.len()
+        );
+        Self { pieces, args }
+    }
+}
+
+/// A row lock: `FOR UPDATE`, and what to do about rows another
+/// transaction has locked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lock {
+    /// Wait for them.
+    Wait,
+    /// Leave them out (`SKIP LOCKED`).
+    SkipLocked,
+    /// Fail at once (`NOWAIT`).
+    NoWait,
+}
+
+/// An `ORDER BY` term.
+#[derive(Clone, Debug)]
+pub(crate) struct Sort {
+    pub term: SortTerm,
+    pub descending: bool,
+    /// A table alias to qualify a column with, in joins.
+    pub qualifier: Option<&'static str>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SortTerm {
+    Column(&'static str),
+    Raw(Fragment),
+    #[cfg(feature = "json")]
+    Json(&'static str, JsonPath),
+    /// `column <op> vector`.
+    #[cfg(feature = "pgvector")]
+    Distance(&'static str, &'static str, Value),
+    /// A weighted sum of scores.
+    #[cfg(feature = "postgres")]
+    Score(Vec<(f64, ScoreTerm)>),
 }
 
 /// SQL text with its parameters, numbered for the target database.
@@ -87,6 +245,54 @@ impl Sql {
         self
     }
 
+    /// Appends raw SQL, binding its values.
+    pub fn fragment(&mut self, fragment: &Fragment) -> &mut Self {
+        for (i, piece) in fragment.pieces.iter().enumerate() {
+            if i > 0 {
+                self.arg(fragment.args[i - 1].clone());
+            }
+            self.push(piece);
+        }
+        self
+    }
+
+    /// Appends `ORDER BY` and the terms, if there are any.
+    pub fn order_by(&mut self, sorts: &[Sort]) -> &mut Self {
+        for (i, sort) in sorts.iter().enumerate() {
+            self.push(if i == 0 { " ORDER BY " } else { ", " });
+            match &sort.term {
+                SortTerm::Column(column) => {
+                    let previous = std::mem::replace(&mut self.qualifier, sort.qualifier);
+                    self.column(column);
+                    self.qualifier = previous;
+                }
+                SortTerm::Raw(fragment) => {
+                    self.push("(").fragment(fragment).push(")");
+                }
+                #[cfg(feature = "postgres")]
+                SortTerm::Score(terms) => {
+                    let previous = std::mem::replace(&mut self.qualifier, sort.qualifier);
+                    self.score(terms);
+                    self.qualifier = previous;
+                }
+                #[cfg(feature = "pgvector")]
+                SortTerm::Distance(column, op, target) => {
+                    let previous = std::mem::replace(&mut self.qualifier, sort.qualifier);
+                    self.column(column).push(" ").push(op).push(" ").arg(target.clone());
+                    self.qualifier = previous;
+                }
+                #[cfg(feature = "json")]
+                SortTerm::Json(column, path) => {
+                    let previous = std::mem::replace(&mut self.qualifier, sort.qualifier);
+                    self.json_value(column, path);
+                    self.qualifier = previous;
+                }
+            }
+            self.push(if sort.descending { " DESC" } else { " ASC" });
+        }
+        self
+    }
+
     /// Appends `LIMIT` and `OFFSET`; SQLite and MySQL need a `LIMIT` before
     /// an `OFFSET`.
     pub fn limit_offset(&mut self, limit: Option<u64>, offset: Option<u64>) -> &mut Self {
@@ -102,6 +308,25 @@ impl Sql {
             let _ = write!(self.text, " OFFSET {}", offset);
         }
         self
+    }
+
+    /// Appends `FOR UPDATE`, locking only the rows of table alias `of` in a
+    /// join. SQLite has no row locks (a write transaction locks the whole
+    /// database), so nothing is written there.
+    pub fn lock(&mut self, lock: Option<Lock>, of: Option<&'static str>) -> &mut Self {
+        let Some(lock) = lock else { return self };
+        if self.backend == Backend::Sqlite {
+            return self;
+        }
+        self.push(" FOR UPDATE");
+        if let Some(alias) = of {
+            self.push(" OF ").ident(alias);
+        }
+        match lock {
+            Lock::Wait => self,
+            Lock::SkipLocked => self.push(" SKIP LOCKED"),
+            Lock::NoWait => self.push(" NOWAIT"),
+        }
     }
 
     /// Appends `WHERE` (or `AND`, after an earlier `where_clause`) and the
@@ -184,7 +409,289 @@ impl Sql {
                 self.cond(cond);
                 self.push(")");
             }
+            // Parenthesized, so `OR` inside the fragment can't escape it.
+            Cond::Raw(fragment) => {
+                self.push("(").fragment(fragment).push(")");
+            }
+            #[cfg(feature = "postgres")]
+            Cond::FullText(source, config, query) => {
+                if self.backend != Backend::Postgres {
+                    self.push("axeon_orm_full_text_search_needs_postgres()");
+                    return;
+                }
+                self.push("(");
+                self.fts_vector(source, config);
+                self.push(" @@ ");
+                self.fts_query(config, query);
+                self.push(")");
+            }
+            #[cfg(feature = "pgvector")]
+            Cond::Distance(column, op, target, compare, limit) => {
+                self.push("(").column(column).push(" ").push(op).push(" ").arg(target.clone());
+                self.push(" ").push(compare).push(" ").arg(Value::F64(*limit)).push(")");
+            }
+            // Never NULL (a missing key would make it unknown), so `!` gives
+            // exactly the other rows. PostgreSQL's `@>` and `?` stay bare
+            // so a GIN index can serve them; only a NULL column makes them
+            // NULL, which `AND column IS NOT NULL` turns into false.
+            #[cfg(feature = "json")]
+            Cond::Json(column, path, test) => {
+                if self.backend == Backend::Postgres && matches!(test, JsonTest::Contains(_) | JsonTest::HasKey(_)) {
+                    self.push("(");
+                    self.json_cond(column, path, test);
+                    self.push(" AND ").column(column).push(" IS NOT NULL)");
+                } else {
+                    self.push("COALESCE((");
+                    self.json_cond(column, path, test);
+                    self.push("), FALSE)");
+                }
+            }
         }
+    }
+
+    /// The JSON value at `path` (path keys are bound, never inlined):
+    /// jsonb in PostgreSQL, JSON in MySQL, an SQL value in SQLite.
+    #[cfg(feature = "json")]
+    fn json_value(&mut self, column: &str, path: &[PathStep]) {
+        match self.backend {
+            Backend::Postgres => {
+                self.column(column);
+                for step in path {
+                    self.push(" -> ");
+                    self.path_step(step);
+                }
+            }
+            Backend::MySql => {
+                self.push("JSON_EXTRACT(").column(column).push(", ").arg(Value::Text(json_path_string(path))).push(")");
+            }
+            Backend::Sqlite => {
+                self.push("json_extract(").column(column).push(", ").arg(Value::Text(json_path_string(path))).push(")");
+            }
+        }
+    }
+
+    /// A PostgreSQL path step, cast so that `->` picks the right overload,
+    /// and so key and index paths never share a cached statement.
+    #[cfg(feature = "json")]
+    fn path_step(&mut self, step: &PathStep) {
+        match step {
+            PathStep::Key(key) => self.arg(Value::Text(key.clone())).push("::text"),
+            PathStep::Index(i) => self.arg(Value::I32(*i)).push("::int"),
+        };
+    }
+
+    /// The string at `path` as text; other JSON values give their text in
+    /// PostgreSQL and MySQL.
+    #[cfg(feature = "json")]
+    fn json_text(&mut self, column: &str, path: &[PathStep]) {
+        match (self.backend, path.split_last()) {
+            (Backend::Postgres, Some((last, init))) => {
+                self.push("(");
+                self.json_value(column, init);
+                self.push(" ->> ");
+                self.path_step(last);
+                self.push(")");
+            }
+            (Backend::MySql, _) => {
+                self.push("JSON_UNQUOTE(");
+                self.json_value(column, path);
+                self.push(")");
+            }
+            _ => self.json_value(column, path),
+        }
+    }
+
+    /// The JSON type of the value at `path`, lower-case in every database
+    /// (`number` / `integer` / `real` / `double` vary), or NULL if missing.
+    #[cfg(feature = "json")]
+    fn json_type(&mut self, column: &str, path: &[PathStep]) {
+        match self.backend {
+            Backend::Postgres => {
+                self.push("jsonb_typeof(");
+                self.json_value(column, path);
+                self.push(")");
+            }
+            Backend::MySql => {
+                self.push("LOWER(JSON_TYPE(");
+                self.json_value(column, path);
+                self.push("))");
+            }
+            Backend::Sqlite => {
+                self.push("json_type(").column(column).push(", ").arg(Value::Text(json_path_string(path))).push(")");
+            }
+        }
+    }
+
+    /// `= <the JSON string type>`: SQLite's `json_type` calls it `text`.
+    #[cfg(feature = "json")]
+    fn json_string_type(&self) -> &'static str {
+        match self.backend {
+            Backend::Sqlite => " = 'text' AND ",
+            _ => " = 'string' AND ",
+        }
+    }
+
+    #[cfg(feature = "json")]
+    fn json_cond(&mut self, column: &str, path: &[PathStep], test: &JsonTest) {
+        match (test, self.backend) {
+            (JsonTest::Contains(value), Backend::Postgres) => {
+                self.column(column).push(" @> ").arg(value.clone());
+            }
+            (JsonTest::Contains(value), Backend::MySql) => {
+                self.push("JSON_CONTAINS(").column(column).push(", ").arg(value.clone()).push(")");
+            }
+            (JsonTest::Contains(_), Backend::Sqlite) => {
+                // SQLite has no JSON containment: fail with a clear error.
+                self.push("axeon_orm_json_contains_needs_postgres_or_mysql()");
+            }
+            (JsonTest::HasKey(key), Backend::Postgres) => {
+                self.column(column).push(" ? ").arg(Value::Text(key.clone()));
+            }
+            (JsonTest::HasKey(key), _) => {
+                let path = [PathStep::Key(key.clone())];
+                self.json_type(column, &path);
+                self.push(" IS NOT NULL");
+            }
+            (JsonTest::Exists, _) => {
+                self.json_type(column, path);
+                self.push(" IS NOT NULL");
+            }
+            (JsonTest::Text(op, value), _) => {
+                self.json_type(column, path);
+                self.push(self.json_string_type());
+                self.json_text(column, path);
+                self.push(" ").push(op).push(" ").arg(value.clone());
+            }
+            (JsonTest::TextIn(values, negated), _) => {
+                self.json_type(column, path);
+                self.push(self.json_string_type());
+                self.json_text(column, path);
+                self.push(if *negated { " NOT IN (" } else { " IN (" });
+                for (i, value) in values.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    self.arg(value.clone());
+                }
+                self.push(")");
+            }
+            (JsonTest::Number(op, number), backend) => {
+                // Only JSON numbers take part: no cast of a string can fail.
+                let numeric = match backend {
+                    Backend::Postgres => "('number')",
+                    Backend::MySql => "('integer', 'double', 'decimal', 'unsigned integer')",
+                    Backend::Sqlite => "('integer', 'real')",
+                };
+                self.push("CASE WHEN ");
+                self.json_type(column, path);
+                self.push(" IN ").push(numeric).push(" THEN ");
+                match backend {
+                    Backend::Postgres => {
+                        self.push("(");
+                        self.json_value(column, path);
+                        self.push(")::numeric");
+                    }
+                    Backend::MySql => {
+                        self.push("CAST(");
+                        self.json_value(column, path);
+                        self.push(" AS DOUBLE)");
+                    }
+                    Backend::Sqlite => self.json_value(column, path),
+                }
+                self.push(" END ").push(op).push(" ").arg(Value::F64(*number));
+            }
+            (JsonTest::Bool(expected), _) => {
+                self.json_type(column, path);
+                self.push(match self.backend {
+                    Backend::Sqlite => " = ",
+                    _ => " = 'boolean' AND ",
+                });
+                match self.backend {
+                    Backend::Sqlite => {
+                        self.arg(Value::Text(expected.to_string()));
+                    }
+                    _ => {
+                        self.json_text(column, path);
+                        self.push(" = ").arg(Value::Text(expected.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `tsvector` searched: `to_tsvector('config'::regconfig,
+    /// coalesce(a, '') || ' ' || coalesce(b, ''))`, or the stored column.
+    /// The configuration is a literal so expression indexes can match.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn fts_vector(&mut self, source: &FtsSource, config: &str) {
+        match source {
+            FtsSource::Stored(column) => {
+                self.column(column);
+            }
+            FtsSource::Columns(columns) => {
+                self.push("to_tsvector('").push(config).push("'::regconfig, ");
+                for (i, column) in columns.iter().enumerate() {
+                    if i > 0 {
+                        self.push(" || ' ' || ");
+                    }
+                    self.push("coalesce(").column(column).push(", '')");
+                }
+                if columns.is_empty() {
+                    self.push("''");
+                }
+                self.push(")");
+            }
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    fn fts_query(&mut self, config: &str, query: &Value) {
+        self.push("websearch_to_tsquery('").push(config).push("'::regconfig, ").arg(query.clone()).push(")");
+    }
+
+    /// `(w1 * term1 + w2 * term2)`, as `double precision`.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn score(&mut self, terms: &[(f64, ScoreTerm)]) {
+        if self.backend != Backend::Postgres {
+            self.push("axeon_orm_scores_need_postgres()");
+            return;
+        }
+        self.push("(");
+        if terms.is_empty() {
+            self.push("0");
+        }
+        for (i, (weight, term)) in terms.iter().enumerate() {
+            if i > 0 {
+                self.push(" + ");
+            }
+            self.arg(Value::F64(*weight)).push(" * ");
+            match term {
+                ScoreTerm::TextRank(source, config, query) => {
+                    self.push("ts_rank(");
+                    self.fts_vector(source, config);
+                    self.push(", ");
+                    self.fts_query(config, query);
+                    self.push(", 32)::float8");
+                }
+                #[cfg(feature = "pgvector")]
+                ScoreTerm::Similarity(column, op, target) => {
+                    // Larger is closer: 1 - cosine distance, 1 / (1 + L2
+                    // distance), or the inner product.
+                    match *op {
+                        "<=>" => {
+                            self.push("(1 - (").column(column).push(" <=> ").arg(target.clone()).push("))");
+                        }
+                        "<->" => {
+                            self.push("(1 / (1 + (").column(column).push(" <-> ").arg(target.clone()).push(")))");
+                        }
+                        _ => {
+                            self.push("(-(").column(column).push(" ").push(op).push(" ").arg(target.clone()).push("))");
+                        }
+                    }
+                }
+            }
+        }
+        self.push(")");
     }
 
     pub fn finish(self) -> (String, Vec<Value>) {

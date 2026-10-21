@@ -35,6 +35,9 @@ pub enum Kind {
     /// `JSONB`; `TEXT` in SQLite. Feature `json`.
     #[cfg(feature = "json")]
     Json,
+    /// pgvector `vector(n)`. Feature `pgvector`.
+    #[cfg(feature = "pgvector")]
+    Vector,
 }
 
 impl Kind {
@@ -78,6 +81,9 @@ pub enum Value {
     /// A JSON document.
     #[cfg(feature = "json")]
     Json(serde_json::Value),
+    /// A pgvector vector.
+    #[cfg(feature = "pgvector")]
+    Vector(crate::vector::Vector),
 }
 
 impl Value {
@@ -120,6 +126,8 @@ impl Hash for Value {
             Value::Uuid(v) => v.hash(state),
             #[cfg(feature = "json")]
             Value::Json(v) => v.to_string().hash(state),
+            #[cfg(feature = "pgvector")]
+            Value::Vector(v) => v.as_slice().iter().for_each(|x| x.to_bits().hash(state)),
         }
     }
 }
@@ -135,6 +143,10 @@ pub trait SqlType: Sized {
     const KIND: Kind;
     /// Whether the column allows `NULL`.
     const NULLABLE: bool = false;
+    /// The only values a text column may hold, for an enum from
+    /// [`SqlEnum`](derive@crate::SqlEnum); generated tables get a `CHECK`
+    /// constraint.
+    const VALUES: Option<&'static [&'static str]> = None;
     /// This value as a query parameter.
     fn to_value(&self) -> Value;
     /// Reads the named column from a row.
@@ -195,6 +207,7 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> SqlType for sqlx::types:
 impl<T: SqlType> SqlType for Option<T> {
     const KIND: Kind = T::KIND;
     const NULLABLE: bool = true;
+    const VALUES: Option<&'static [&'static str]> = T::VALUES;
     fn to_value(&self) -> Value {
         match self {
             Some(value) => value.to_value(),
@@ -221,3 +234,41 @@ macro_rules! from_value {
 }
 
 from_value!(bool => Bool, i32 => I32, i64 => I64, f64 => F64, String => Text, &str => Text, Vec<u8> => Bytes);
+#[cfg(feature = "chrono")]
+from_value!(
+    chrono::DateTime<chrono::Utc> => DateTime,
+    chrono::NaiveDateTime => NaiveDateTime,
+    chrono::NaiveDate => Date,
+);
+#[cfg(feature = "uuid")]
+from_value!(uuid::Uuid => Uuid);
+#[cfg(feature = "json")]
+from_value!(serde_json::Value => Json);
+
+/// A string that isn't one of a [`SqlEnum`](derive@crate::SqlEnum)'s
+/// values, from its `FromStr`, or when a row holds one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownVariant {
+    type_name: &'static str,
+    value: String,
+}
+
+impl UnknownVariant {
+    #[doc(hidden)]
+    pub fn new(type_name: &'static str, value: &str) -> Self {
+        Self { type_name, value: value.to_string() }
+    }
+
+    /// The string that didn't match.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl std::fmt::Display for UnknownVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} is not a {} value", self.value, self.type_name)
+    }
+}
+
+impl std::error::Error for UnknownVariant {}
