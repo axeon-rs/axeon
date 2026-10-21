@@ -8,7 +8,7 @@
 #![cfg(all(feature = "chrono", feature = "json"))]
 
 use axeon_orm::migrate::{Migration, Migrator};
-use axeon_orm::{schema, Backend, Db, Error, Expr, Model, Order, SqlEnum};
+use axeon_orm::{schema, Backend, Db, Error, Expr, Model, OnConflict, Order, SqlEnum};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
@@ -622,6 +622,129 @@ async fn enums(db: &Db) {
     }
 }
 
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Product {
+    id: i64,
+    #[model(unique)]
+    sku: String,
+    name: String,
+    price: i64,
+    #[model(created_at)]
+    created_at: DateTime<Utc>,
+    #[model(updated_at)]
+    updated_at: DateTime<Utc>,
+}
+
+/// Unique on (warehouse, sku) together.
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Stock {
+    id: i32,
+    #[model(index)]
+    warehouse: String,
+    #[model(index)]
+    sku: String,
+    qty: i32,
+}
+
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Setting {
+    #[model(primary_key)]
+    key: String,
+    value: String,
+}
+
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Flag {
+    #[model(primary_key)]
+    name: String,
+}
+
+async fn upserts(db: &Db) {
+    db.create_table::<Product>().await.unwrap();
+    db.create_table::<Stock>().await.unwrap();
+    db.create_table::<Setting>().await.unwrap();
+    db.create_table::<Flag>().await.unwrap();
+    db.execute("CREATE UNIQUE INDEX stock_key ON stocks (warehouse, sku)").await.unwrap();
+    let now = Utc::now();
+    let product = |sku: &str, name: &str, price| Product {
+        id: 0,
+        sku: sku.into(),
+        name: name.into(),
+        price,
+        created_at: now,
+        updated_at: now,
+    };
+    let by_sku = || OnConflict::on(Product::SKU);
+
+    // Inserts when new, updates the same row when the SKU exists.
+    let lamp = product("L-1", "Lamp", 100).upsert(db, by_sku()).await.unwrap();
+    assert!(lamp.id > 0);
+    let other = product("C-1", "Chair", 300).upsert(db, by_sku()).await.unwrap();
+    assert_ne!(other.id, lamp.id);
+    let updated = product("L-1", "Desk lamp", 120).upsert(db, by_sku()).await.unwrap();
+    assert_eq!((updated.id, updated.name.as_str(), updated.price), (lamp.id, "Desk lamp", 120));
+    assert_eq!(updated.created_at, lamp.created_at, "created_at is kept");
+    assert!(updated.updated_at >= lamp.updated_at);
+    assert_eq!(Product::find_or_fail(db, lamp.id).await.unwrap(), updated);
+    // Unchanged values still give the row back (MySQL then affects no rows).
+    assert_eq!(product("L-1", "Desk lamp", 120).upsert(db, by_sku()).await.unwrap().id, lamp.id);
+    assert_eq!(Product::query().count(db).await.unwrap(), 2);
+
+    // `update` limits what an upsert overwrites.
+    let priced = product("L-1", "Ignored", 99).upsert(db, by_sku().update(Product::PRICE)).await.unwrap();
+    assert_eq!((priced.id, priced.name.as_str(), priced.price), (lamp.id, "Desk lamp", 99));
+
+    // insert_or_ignore leaves an existing row alone.
+    assert!(product("L-1", "Nope", 1).insert_or_ignore(db, by_sku()).await.unwrap().is_none());
+    assert_eq!(Product::find_or_fail(db, lamp.id).await.unwrap().price, 99);
+    let fresh = product("T-1", "Table", 500).insert_or_ignore(db, by_sku()).await.unwrap().unwrap();
+    assert_eq!((fresh.sku.as_str(), fresh.price), ("T-1", 500));
+    assert_eq!(Product::find_or_fail(db, fresh.id).await.unwrap(), fresh);
+    assert_eq!(Product::query().count(db).await.unwrap(), 3);
+
+    // A conflict on two columns together.
+    let stock = |warehouse: &str, sku: &str, qty| Stock { id: 0, warehouse: warehouse.into(), sku: sku.into(), qty };
+    let key = || OnConflict::on(Stock::WAREHOUSE).and(Stock::SKU);
+    let a = stock("sz", "L-1", 5).upsert(db, key()).await.unwrap();
+    let b = stock("gz", "L-1", 7).upsert(db, key()).await.unwrap();
+    assert_ne!(a.id, b.id);
+    let a2 = stock("sz", "L-1", 9).upsert(db, key()).await.unwrap();
+    assert_eq!((a2.id, a2.qty), (a.id, 9));
+    assert_eq!(Stock::query().count(db).await.unwrap(), 2);
+
+    // A primary key that isn't auto-increment, as the conflict.
+    let setting = |value: &str| Setting { key: "theme".into(), value: value.into() };
+    assert_eq!(setting("dark").upsert(db, OnConflict::on(Setting::KEY)).await.unwrap().value, "dark");
+    assert_eq!(setting("light").upsert(db, OnConflict::on(Setting::KEY)).await.unwrap().value, "light");
+    assert!(setting("blue").insert_or_ignore(db, OnConflict::on(Setting::KEY)).await.unwrap().is_none());
+    assert_eq!(Setting::find_or_fail(db, "theme".to_string()).await.unwrap().value, "light");
+    let other = Setting { key: "lang".into(), value: "zh".into() };
+    assert_eq!(other.clone().insert_or_ignore(db, OnConflict::on(Setting::KEY)).await.unwrap(), Some(other));
+
+    // Nothing to update besides the key.
+    let flag = || Flag { name: "beta".into() };
+    assert_eq!(flag().upsert(db, OnConflict::on(Flag::NAME)).await.unwrap(), flag());
+    assert_eq!(flag().upsert(db, OnConflict::on(Flag::NAME)).await.unwrap(), flag());
+    assert_eq!(Flag::query().count(db).await.unwrap(), 1);
+
+    // Inside a transaction, and rolled back with it.
+    let mut tx = db.begin().await.unwrap();
+    product("L-1", "In tx", 1).upsert(&mut tx, by_sku()).await.unwrap();
+    assert!(product("X-1", "In tx", 1).insert_or_ignore(&mut tx, by_sku()).await.unwrap().is_some());
+    assert_eq!(Product::find_or_fail(&mut tx, lamp.id).await.unwrap().name, "In tx");
+    tx.rollback().await.unwrap();
+    assert_eq!(Product::find_or_fail(db, lamp.id).await.unwrap().name, "Desk lamp");
+    assert_eq!(Product::query().count(db).await.unwrap(), 3);
+
+    // A conflict that is ignored doesn't spoil the transaction.
+    let mut tx = db.begin().await.unwrap();
+    assert!(product("L-1", "Dup", 1).insert_or_ignore(&mut tx, by_sku()).await.unwrap().is_none());
+    product("Y-1", "Kept", 1).insert(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(Product::query().filter(Product::SKU.eq("Y-1")).count(db).await.unwrap(), 1);
+
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -704,6 +827,7 @@ backend_tests!(
     raw_expressions,
     row_locks,
     enums,
+    upserts,
 );
 
 #[test]

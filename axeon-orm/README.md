@@ -111,6 +111,30 @@ Post::query().filter(Post::PUBLISHED.eq(false)).delete(&db).await?;
 Columns are typed constants, so `User::EMAIL.eq(42)` or filtering users by
 a post column doesn't compile.
 
+### Upserts
+
+Insert a row, or update the one that already has the same unique columns,
+in one statement, and get the stored row back:
+
+```rust
+use axeon_orm::OnConflict;
+
+let product = Product { id: 0, sku: "L-1".into(), name: "Lamp".into(), price: 120, .. }
+    .upsert(&db, OnConflict::on(Product::SKU))
+    .await?;
+
+// Only overwrite some columns; conflict on several columns together.
+row.upsert(&db, OnConflict::on(Stock::WAREHOUSE).and(Stock::SKU).update(Stock::QTY)).await?;
+
+// Insert unless it exists: `None` when it was already there.
+let inserted: Option<Event> = event.insert_or_ignore(&db, OnConflict::on(Event::EXTERNAL_ID)).await?;
+```
+
+By default an upsert overwrites every column except the primary key, the
+conflict columns and `created_at`. The conflict columns need a unique
+constraint or index. MySQL ignores them and reacts to a conflict on any
+unique key of the table.
+
 ## Relations
 
 ```rust

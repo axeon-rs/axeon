@@ -37,6 +37,14 @@
   derive also adds `VALUES`, `as_str()`, `Display` and `FromStr` (with
   the new `UnknownVariant` error). `SqlType` gains a `VALUES` constant
   and `ColumnDef` a `values` field.
+- **Upserts:** `model.upsert(&db, OnConflict::on(Product::SKU))` inserts
+  or updates the row with the same unique columns and returns the stored
+  row; `.and(column)` adds conflict columns and `.update(column)` limits
+  what is overwritten (by default all but the primary key, the conflict
+  columns and `created_at`). `model.insert_or_ignore(..)` returns `None`
+  when the row exists. `ON CONFLICT` on PostgreSQL and SQLite, `ON
+  DUPLICATE KEY UPDATE` on MySQL (8.0.19+), where an ignored insert
+  doesn't fail the transaction.
 - `From` conversions into `Value` for `serde_json::Value`, `Uuid` and the
   chrono types.
 - **Joins:** `join` and `left_join` over `belongs_to`, `has_one` and

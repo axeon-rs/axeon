@@ -168,6 +168,8 @@
 //! - **Raw SQL fragments:** [`Expr::raw`] and [`Order::raw`] mix SQL
 //!   (JSONB, full-text search, pgvector) into a typed query, with bound
 //!   parameters.
+//! - **Upserts:** `upsert` and `insert_or_ignore` with an [`OnConflict`]
+//!   target, for idempotent writes.
 //! - **Row locks:** [`Query::for_update`], [`skip_locked`](Query::skip_locked)
 //!   and [`nowait`](Query::nowait), for claiming rows in a transaction.
 //! - **LISTEN / NOTIFY:** [`Db::notify`] and [`Db::listen`] on PostgreSQL;
@@ -198,7 +200,7 @@ pub mod server;
 
 pub use crate::db::{Backend, Db, DbOptions, Executor, Row, Transaction};
 pub use crate::error::{Error, Result};
-pub use crate::model::{ColumnDef, Model, Reference, Timestamp};
+pub use crate::model::{ColumnDef, Model, OnConflict, Reference, Timestamp};
 pub use crate::query::{Assignment, Column, Expr, JoinQuery, Numeric, Order, Page, Query, RawArgs};
 pub use crate::relation::{BelongsTo, BelongsToMany, HasMany, HasOne, Join, Related, Relation};
 pub use crate::value::{Kind, SqlType, UnknownVariant, Value};
@@ -227,7 +229,7 @@ pub mod prelude {
 #[doc(hidden)]
 pub mod __private {
     pub use crate::db::Conn;
-    pub use crate::model::{column_name, delete, find, has_column, insert, update};
+    pub use crate::model::{column_name, delete, find, has_column, insert, insert_or_ignore, update, upsert};
 
     pub fn decode_error(column: &str, error: impl std::fmt::Display) -> crate::Error {
         crate::Error::decode(column, error)

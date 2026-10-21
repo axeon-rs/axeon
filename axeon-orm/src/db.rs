@@ -588,6 +588,23 @@ impl Conn<'_> {
     /// auto-increment id it assigned.
     #[cfg(feature = "mysql")]
     pub(crate) async fn insert_mysql(&mut self, sql: String, args: Vec<Value>) -> Result<u64> {
+        let result = self.insert_mysql_inner(sql, args).await;
+        self.track(result)
+    }
+
+    /// Like [`insert_mysql`](Conn::insert_mysql), but a unique violation
+    /// is `None`. It doesn't fail a transaction: MySQL rolls back only the
+    /// failed statement.
+    #[cfg(feature = "mysql")]
+    pub(crate) async fn insert_mysql_unless_duplicate(&mut self, sql: String, args: Vec<Value>) -> Result<Option<u64>> {
+        match self.insert_mysql_inner(sql, args).await {
+            Err(Error::UniqueViolation(_)) => Ok(None),
+            result => self.track(result).map(Some),
+        }
+    }
+
+    #[cfg(feature = "mysql")]
+    async fn insert_mysql_inner(&mut self, sql: String, args: Vec<Value>) -> Result<u64> {
         let query = bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe(sql)), args);
         let result = match self {
             Conn::Db(Db { inner: Pool::MySql(pool) }) => query.execute(pool).await.map_err(Error::from),
@@ -595,7 +612,7 @@ impl Conn<'_> {
             #[allow(unreachable_patterns)]
             _ => Err(Error::Config("insert_mysql on another database".into())),
         };
-        self.track(result.map(|r| r.last_insert_id()))
+        result.map(|r| r.last_insert_id())
     }
 
     /// Runs SQL without parameters; may hold several statements.

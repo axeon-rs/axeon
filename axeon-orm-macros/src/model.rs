@@ -375,6 +375,26 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                 ::axeon_orm::__private::insert(ex, &self).await
             }
 
+            /// Inserts this record or, if a row with the same `conflict` columns exists, updates
+            /// it; returns the stored row.
+            pub async fn upsert<'c>(
+                self,
+                ex: impl ::axeon_orm::Executor<'c>,
+                conflict: ::axeon_orm::OnConflict<Self>,
+            ) -> ::axeon_orm::Result<Self> {
+                ::axeon_orm::__private::upsert(ex, &self, &conflict).await
+            }
+
+            /// Inserts this record unless a row with the same `conflict` columns exists; returns
+            /// the stored row, or `None` if nothing was inserted.
+            pub async fn insert_or_ignore<'c>(
+                self,
+                ex: impl ::axeon_orm::Executor<'c>,
+                conflict: ::axeon_orm::OnConflict<Self>,
+            ) -> ::axeon_orm::Result<::core::option::Option<Self>> {
+                ::axeon_orm::__private::insert_or_ignore(ex, &self, &conflict).await
+            }
+
             /// Saves every column by primary key and reloads the row.
             pub async fn update<'c>(&mut self, ex: impl ::axeon_orm::Executor<'c>) -> ::axeon_orm::Result<()> {
                 *self = ::axeon_orm::__private::update(ex, &*self).await?;
