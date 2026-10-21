@@ -145,6 +145,31 @@ let rows: Vec<(Post, User)> = Post::query()
 let rows: Vec<(User, Option<Profile>)> = User::query().left_join(User::PROFILE).all(&db).await?;
 ```
 
+## Raw SQL in queries
+
+For what typed columns can't express (JSONB, full-text search, pgvector,
+functions), write a condition or ordering in SQL and keep the rest typed.
+Each `?` binds the next value (a tuple, array or `Vec`; `()` for none),
+and `??` is a literal `?`, as in PostgreSQL's JSONB `?` operator:
+
+```rust
+use axeon_orm::{Expr, Order};
+
+let products = Product::query()
+    .filter(Product::CATEGORY.eq("lighting"))
+    .filter(Expr::raw("fields @> ?", (json!({ "certs": ["CE"] }),)))
+    .filter(Expr::raw("fields ?? 'moq'", ()))
+    .order_by(Order::raw("embedding <=> ?::vector", ("[0.12,0.5,0.33]",)))
+    .limit(20)
+    .all(&db)
+    .await?;
+```
+
+Values are always bound as parameters, never spliced into the SQL; don't
+build the SQL text from user input. Fragments are parenthesized, so an
+`OR` inside one can't escape it. Column names inside them aren't quoted or
+qualified; in a join, the main table is `t0` and the joined one `t1`.
+
 ## Transactions
 
 ```rust

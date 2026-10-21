@@ -15,6 +15,14 @@
   integers is `i64`, `avg` is `f64`).
 - **Filtering by relations:** `has`, `doesnt_have`, `where_has` and
   `where_doesnt_have`, for every relation type.
+- **Raw SQL in queries:** `Expr::raw(sql, args)` for conditions and
+  `Order::raw` / `Order::raw_desc` for orderings, combined with typed
+  filters, relation filters and joins. `?` placeholders are bound to
+  values (`RawArgs`: `()`, tuples of up to eight, arrays, `Vec`), numbered
+  `$n` on PostgreSQL, and `??` is a literal `?` for PostgreSQL's JSONB
+  operators. A placeholder/value count mismatch panics.
+- `From` conversions into `Value` for `serde_json::Value`, `Uuid` and the
+  chrono types.
 - **Joins:** `join` and `left_join` over `belongs_to`, `has_one` and
   `has_many`, returning `(Model, Related)` or `(Model, Option<Related>)`
   pairs from one query, with `filter_related` and `order_by_related`.

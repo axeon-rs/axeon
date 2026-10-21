@@ -38,6 +38,59 @@ pub(crate) enum Cond {
     And(Vec<Cond>),
     Or(Vec<Cond>),
     Not(Box<Cond>),
+    Raw(Fragment),
+}
+
+/// Raw SQL from [`Expr::raw`](crate::Expr::raw) or
+/// [`Order::raw`](crate::Order::raw): the text between `?` placeholders,
+/// and the values bound to them.
+#[derive(Clone, Debug)]
+pub(crate) struct Fragment {
+    pieces: Vec<String>,
+    args: Vec<Value>,
+}
+
+impl Fragment {
+    /// Splits `sql` at each `?`; `??` is a literal `?`.
+    ///
+    /// Panics when the number of placeholders differs from `args`.
+    pub fn new(sql: &str, args: Vec<Value>) -> Self {
+        let mut pieces = vec![String::new()];
+        let mut chars = sql.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '?' if chars.peek() == Some(&'?') => {
+                    chars.next();
+                    pieces.last_mut().unwrap().push('?');
+                }
+                '?' => pieces.push(String::new()),
+                c => pieces.last_mut().unwrap().push(c),
+            }
+        }
+        assert!(
+            pieces.len() - 1 == args.len(),
+            "raw SQL {:?} has {} placeholder(s) but {} value(s)",
+            sql,
+            pieces.len() - 1,
+            args.len()
+        );
+        Self { pieces, args }
+    }
+}
+
+/// An `ORDER BY` term.
+#[derive(Clone, Debug)]
+pub(crate) struct Sort {
+    pub term: SortTerm,
+    pub descending: bool,
+    /// A table alias to qualify a column with, in joins.
+    pub qualifier: Option<&'static str>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SortTerm {
+    Column(&'static str),
+    Raw(Fragment),
 }
 
 /// SQL text with its parameters, numbered for the target database.
@@ -83,6 +136,36 @@ impl Sql {
                 let _ = write!(self.text, "${}", self.args.len());
             }
             _ => self.text.push('?'),
+        }
+        self
+    }
+
+    /// Appends raw SQL, binding its values.
+    pub fn fragment(&mut self, fragment: &Fragment) -> &mut Self {
+        for (i, piece) in fragment.pieces.iter().enumerate() {
+            if i > 0 {
+                self.arg(fragment.args[i - 1].clone());
+            }
+            self.push(piece);
+        }
+        self
+    }
+
+    /// Appends `ORDER BY` and the terms, if there are any.
+    pub fn order_by(&mut self, sorts: &[Sort]) -> &mut Self {
+        for (i, sort) in sorts.iter().enumerate() {
+            self.push(if i == 0 { " ORDER BY " } else { ", " });
+            match &sort.term {
+                SortTerm::Column(column) => {
+                    let previous = std::mem::replace(&mut self.qualifier, sort.qualifier);
+                    self.column(column);
+                    self.qualifier = previous;
+                }
+                SortTerm::Raw(fragment) => {
+                    self.push("(").fragment(fragment).push(")");
+                }
+            }
+            self.push(if sort.descending { " DESC" } else { " ASC" });
         }
         self
     }
@@ -183,6 +266,10 @@ impl Sql {
                 self.push("NOT (");
                 self.cond(cond);
                 self.push(")");
+            }
+            // Parenthesized, so `OR` inside the fragment can't escape it.
+            Cond::Raw(fragment) => {
+                self.push("(").fragment(fragment).push(")");
             }
         }
     }

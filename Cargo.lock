@@ -188,7 +188,7 @@ dependencies = [
 name = "axeon"
 version = "1.0.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "cookie",
  "criterion",

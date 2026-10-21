@@ -4,7 +4,7 @@ use crate::db::{Backend, Conn, Executor, Row};
 use crate::error::{Error, Result};
 use crate::model::{primary_key, Model};
 use crate::relation::{Join, Related, Relation, WithQuery};
-use crate::sql::{column_list, Cond, Sql};
+use crate::sql::{column_list, Cond, Fragment, Sort, SortTerm, Sql};
 use crate::value::{SqlType, Value};
 use serde::Serialize;
 use std::marker::PhantomData;
@@ -57,12 +57,12 @@ impl<M, T> Column<M, T> {
 
     /// Ascending order.
     pub fn asc(&self) -> Order<M> {
-        Order { column: self.name, descending: false, _marker: PhantomData }
+        Order::new(SortTerm::Column(self.name), false)
     }
 
     /// Descending order.
     pub fn desc(&self) -> Order<M> {
-        Order { column: self.name, descending: true, _marker: PhantomData }
+        Order::new(SortTerm::Column(self.name), true)
     }
 }
 
@@ -156,6 +156,42 @@ impl<M> Expr<M> {
         Self { cond, _marker: PhantomData }
     }
 
+    /// A condition written in SQL, for what the typed columns can't
+    /// express: JSONB and full-text operators, functions, casts. Each `?`
+    /// is bound to the next value of `args` (a tuple, array or `Vec`; `()`
+    /// for none), and `??` writes a literal `?`, such as PostgreSQL's JSONB
+    /// `?` operator. The fragment is parenthesized, so it combines safely
+    /// with other conditions.
+    ///
+    /// Column names are not quoted or qualified. In a
+    /// [join](Query::join), the main table is `t0` and the joined one `t1`.
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, Expr, Model};
+    /// # #[derive(Model)] struct Product { id: i64, name: String, fields: serde_json::Value, price: i64 }
+    /// # async fn run(db: Db) -> axeon_orm::Result<()> {
+    /// let certified = Product::query()
+    ///     .filter(Expr::raw("fields @> ?::jsonb", (serde_json::json!({ "certs": ["CE"] }),)))
+    ///     .filter(Expr::raw("fields ?? 'moq'", ()))
+    ///     .filter(Product::PRICE.lt(100))
+    ///     .all(&db)
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// When the number of `?` placeholders differs from the number of
+    /// values.
+    ///
+    /// # Safety of values
+    ///
+    /// Values are always sent as bound parameters. Never build `sql` from
+    /// user input; pass it through `args` instead.
+    pub fn raw(sql: &str, args: impl RawArgs) -> Expr<M> {
+        Expr::new(Cond::Raw(Fragment::new(sql, args.into_values())))
+    }
+
     /// Both conditions.
     pub fn and(self, other: Expr<M>) -> Expr<M> {
         Expr::new(Cond::And(vec![self.cond, other.cond]))
@@ -204,18 +240,107 @@ impl<M> std::ops::Not for Expr<M> {
     }
 }
 
-/// An `ORDER BY` term, from [`Column::asc`] or [`Column::desc`].
+/// An `ORDER BY` term, from [`Column::asc`], [`Column::desc`],
+/// [`Order::raw`] or [`Order::raw_desc`].
 pub struct Order<M> {
-    column: &'static str,
-    descending: bool,
+    sort: Sort,
     _marker: PhantomData<fn() -> M>,
 }
 
 impl<M> Clone for Order<M> {
     fn clone(&self) -> Self {
-        Order { column: self.column, descending: self.descending, _marker: PhantomData }
+        Order { sort: self.sort.clone(), _marker: PhantomData }
     }
 }
+
+impl<M> std::fmt::Debug for Order<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.sort.fmt(f)
+    }
+}
+
+impl<M> Order<M> {
+    fn new(term: SortTerm, descending: bool) -> Self {
+        Order { sort: Sort { term, descending, qualifier: None }, _marker: PhantomData }
+    }
+
+    /// Ascending order by an SQL expression, such as a vector distance or a
+    /// full-text rank. Placeholders work as in [`Expr::raw`].
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, Model, Order};
+    /// # #[derive(Model)] struct Product { id: i64, category: String }
+    /// # async fn run(db: Db) -> axeon_orm::Result<()> {
+    /// // Nearest products in a category, with pgvector.
+    /// let nearest = Product::query()
+    ///     .filter(Product::CATEGORY.eq("lighting"))
+    ///     .order_by(Order::raw("embedding <=> ?::vector", ("[0.12,0.5,0.33]",)))
+    ///     .limit(20)
+    ///     .all(&db)
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// When the number of `?` placeholders differs from the number of
+    /// values.
+    pub fn raw(sql: &str, args: impl RawArgs) -> Order<M> {
+        Order::new(SortTerm::Raw(Fragment::new(sql, args.into_values())), false)
+    }
+
+    /// Descending order by an SQL expression; see [`Order::raw`].
+    ///
+    /// # Panics
+    ///
+    /// When the number of `?` placeholders differs from the number of
+    /// values.
+    pub fn raw_desc(sql: &str, args: impl RawArgs) -> Order<M> {
+        Order::new(SortTerm::Raw(Fragment::new(sql, args.into_values())), true)
+    }
+}
+
+/// The values bound to [`Expr::raw`] and [`Order::raw`]: `()` for none, a
+/// tuple of up to eight values of different types, or an array or `Vec`
+/// of one type. Each value converts [`Into<Value>`](Value).
+pub trait RawArgs {
+    /// The values, in placeholder order.
+    fn into_values(self) -> Vec<Value>;
+}
+
+impl<T: Into<Value>> RawArgs for Vec<T> {
+    fn into_values(self) -> Vec<Value> {
+        self.into_iter().map(Into::into).collect()
+    }
+}
+
+impl<T: Into<Value>, const N: usize> RawArgs for [T; N] {
+    fn into_values(self) -> Vec<Value> {
+        self.into_iter().map(Into::into).collect()
+    }
+}
+
+macro_rules! raw_args_tuple {
+    ($($name:ident),*) => {
+        impl<$($name: Into<Value>),*> RawArgs for ($($name,)*) {
+            #[allow(non_snake_case)]
+            fn into_values(self) -> Vec<Value> {
+                let ($($name,)*) = self;
+                vec![$($name.into()),*]
+            }
+        }
+    };
+}
+
+raw_args_tuple!();
+raw_args_tuple!(A);
+raw_args_tuple!(A, B);
+raw_args_tuple!(A, B, C);
+raw_args_tuple!(A, B, C, D);
+raw_args_tuple!(A, B, C, D, E);
+raw_args_tuple!(A, B, C, D, E, F);
+raw_args_tuple!(A, B, C, D, E, F, G);
+raw_args_tuple!(A, B, C, D, E, F, G, H);
 
 /// A `SET column = value` term, from [`Column::set`].
 pub struct Assignment<M> {
@@ -256,7 +381,7 @@ pub struct Page<T> {
 /// ```
 pub struct Query<M> {
     conds: Vec<Cond>,
-    order: Vec<(&'static str, bool)>,
+    order: Vec<Sort>,
     limit: Option<u64>,
     offset: Option<u64>,
     _marker: PhantomData<fn() -> M>,
@@ -308,9 +433,10 @@ impl<M: Model> Query<M> {
         self
     }
 
-    /// Sorts by a column; call again for tie-breakers.
+    /// Sorts by a column (or an [`Order::raw`] expression); call again for
+    /// tie-breakers.
     pub fn order_by(mut self, order: Order<M>) -> Self {
-        self.order.push((order.column, order.descending));
+        self.order.push(order.sort);
         self
     }
 
@@ -372,10 +498,7 @@ impl<M: Model> Query<M> {
         let mut sql = Sql::new(backend);
         sql.push("SELECT ").push(&column_list::<M>(backend)).push(" FROM ").ident(M::TABLE);
         sql.where_clause(&self.conds);
-        for (i, (column, descending)) in self.order.iter().enumerate() {
-            sql.push(if i == 0 { " ORDER BY " } else { ", " });
-            sql.ident(column).push(if *descending { " DESC" } else { " ASC" });
-        }
+        sql.order_by(&self.order);
         sql.limit_offset(self.limit, self.offset);
         sql.finish()
     }
@@ -624,14 +747,14 @@ const RIGHT_ALIAS: &str = "t1";
 pub struct JoinQuery<M, T, O> {
     query: Query<M>,
     related: Vec<Cond>,
-    order: Vec<(&'static str, &'static str, bool)>,
+    order: Vec<Sort>,
     on: (&'static str, &'static str),
     _marker: PhantomData<fn() -> (T, O)>,
 }
 
 impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
     fn new(query: Query<M>, on: (&'static str, &'static str)) -> Self {
-        let order = query.order.iter().map(|(column, desc)| (LEFT_ALIAS, *column, *desc)).collect();
+        let order = query.order.iter().cloned().map(|sort| Sort { qualifier: Some(LEFT_ALIAS), ..sort }).collect();
         Self { query, related: Vec::new(), order, on, _marker: PhantomData }
     }
 
@@ -649,13 +772,13 @@ impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
 
     /// Sorts by a column of the main model.
     pub fn order_by(mut self, order: Order<M>) -> Self {
-        self.order.push((LEFT_ALIAS, order.column, order.descending));
+        self.order.push(Sort { qualifier: Some(LEFT_ALIAS), ..order.sort });
         self
     }
 
     /// Sorts by a column of the joined model.
     pub fn order_by_related(mut self, order: Order<T>) -> Self {
-        self.order.push((RIGHT_ALIAS, order.column, order.descending));
+        self.order.push(Sort { qualifier: Some(RIGHT_ALIAS), ..order.sort });
         self
     }
 
@@ -694,10 +817,7 @@ impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
             sql.ident(alias).push(".").ident(column).push(" AS ").ident(&format!("{}_{}", alias, column));
         }
         self.write_from(&mut sql);
-        for (i, (alias, column, descending)) in self.order.iter().enumerate() {
-            sql.push(if i == 0 { " ORDER BY " } else { ", " });
-            sql.ident(alias).push(".").ident(column).push(if *descending { " DESC" } else { " ASC" });
-        }
+        sql.order_by(&self.order);
         sql.limit_offset(self.query.limit, self.query.offset);
         let (sql, args) = sql.finish();
         let left = format!("{}_", LEFT_ALIAS);

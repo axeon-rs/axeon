@@ -8,7 +8,7 @@
 #![cfg(all(feature = "chrono", feature = "json"))]
 
 use axeon_orm::migrate::{Migration, Migrator};
-use axeon_orm::{schema, Backend, Db, Error, Expr, Model};
+use axeon_orm::{schema, Backend, Db, Error, Expr, Model, Order};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
@@ -431,6 +431,66 @@ async fn relation_filters_and_joins(db: &Db) {
     assert_eq!(cy.posts().count(db).await.unwrap(), 0);
 }
 
+async fn raw_expressions(db: &Db) {
+    setup(db).await;
+    let mut users = Vec::new();
+    for (name, age) in [("Ada", 36), ("bob", 41), ("Cy", 25)] {
+        users.push(user(name, age).insert(db).await.unwrap());
+    }
+    post(&users[0], "a?b").insert(db).await.unwrap();
+    post(&users[1], "plain").insert(db).await.unwrap();
+
+    let names = |users: Vec<User>| users.into_iter().map(|u| u.name).collect::<Vec<_>>();
+    let by_id = || User::query().order_by(User::ID.asc());
+    assert_eq!(names(by_id().filter(Expr::raw("age * 2 > ?", (75,))).all(db).await.unwrap()), ["bob"]);
+    assert_eq!(names(by_id().filter(Expr::raw("LOWER(name) IN (?, ?)", ["ada", "bob"])).all(db).await.unwrap()), ["Ada", "bob"]);
+    assert_eq!(User::query().filter(Expr::raw("1 = 1", ())).count(db).await.unwrap(), 3);
+
+    // The fragment is parenthesized: its OR must not escape the AND.
+    let q = by_id().filter(User::AGE.lt(40)).filter(Expr::raw("name = ? OR name = ?", ("bob", "Cy")));
+    assert_eq!(names(q.all(db).await.unwrap()), ["Cy"]);
+    let q = by_id().filter(!Expr::raw("age > ? OR age < ?", (40, 30)) & User::AGE.gt(0));
+    assert_eq!(names(q.all(db).await.unwrap()), ["Ada"]);
+
+    // Placeholders keep their numbering after typed conditions (PostgreSQL's $n).
+    let q = by_id().filter(User::AGE.gt(20)).filter(Expr::raw("age < ?", (40,))).filter(User::NAME.ne("Cy"));
+    assert_eq!(names(q.all(db).await.unwrap()), ["Ada"]);
+
+    // `??` is a literal question mark.
+    assert_eq!(Post::query().filter(Expr::raw("title = 'a??b'", ())).count(db).await.unwrap(), 1);
+    assert_eq!(Post::query().filter(Expr::raw("title <> ? AND title <> 'x??'", ("plain",))).count(db).await.unwrap(), 1);
+
+    // Ordering by an expression, with tie-breakers.
+    let q = User::query().order_by(Order::raw("ABS(age - ?)", (40,))).order_by(User::NAME.asc());
+    assert_eq!(names(q.all(db).await.unwrap()), ["bob", "Ada", "Cy"]);
+    let q = User::query().filter(Expr::raw("age > ?", (20,))).order_by(Order::raw_desc("age % ?", (10,))).limit(2);
+    assert_eq!(names(q.all(db).await.unwrap()), ["Ada", "Cy"]);
+
+    // Inside relation subqueries, and in joins with t0 / t1.
+    assert_eq!(names(by_id().where_has(User::POSTS, Expr::raw("title LIKE ?", ("a%",))).all(db).await.unwrap()), ["Ada"]);
+    let rows = Post::query()
+        .join(Post::USER)
+        .filter_related(Expr::raw("t1.age > ?", (40,)))
+        .order_by(Order::raw("LENGTH(t0.title)", ()))
+        .all(db)
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|(p, u)| (p.title.as_str(), u.name.as_str())).collect::<Vec<_>>(), [("plain", "bob")]);
+    assert_eq!(User::query().filter(Expr::raw("age < ?", (30,))).update(db, [User::ACTIVE.set(false)]).await.unwrap(), 1);
+    assert_eq!(Post::query().filter(Expr::raw("score >= ?", (0.0,))).delete(db).await.unwrap(), 2);
+
+    if db.backend() == Backend::Postgres {
+        let meta = json!({ "certs": ["CE", "RoHS"], "moq": 100 });
+        Post { meta: Some(meta), ..post(&users[0], "jsonb") }.insert(db).await.unwrap();
+        Post { meta: Some(json!({ "certs": ["CE"] })), ..post(&users[1], "jsonb2") }.insert(db).await.unwrap();
+        let count = |e: Expr<Post>| Post::query().filter(e).count(db);
+        assert_eq!(count(Expr::raw("meta @> ?", (json!({ "certs": ["RoHS"] }),))).await.unwrap(), 1);
+        assert_eq!(count(Expr::raw("meta ?? 'moq'", ())).await.unwrap(), 1);
+        assert_eq!(count(Expr::raw("meta ?? ?", ("certs",))).await.unwrap(), 2);
+        assert_eq!(count(Expr::raw("(meta->>'moq')::int <= ?", (100,))).await.unwrap(), 1);
+    }
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -510,7 +570,19 @@ backend_tests!(
     many_to_many,
     aggregates,
     relation_filters_and_joins,
+    raw_expressions,
 );
+
+#[test]
+#[should_panic(expected = "has 2 placeholder(s) but 1 value(s)")]
+fn raw_placeholder_count_must_match() {
+    let _ = Expr::<User>::raw("age > ? AND age < ?", (1,));
+}
+
+#[test]
+fn raw_literal_question_marks_are_not_placeholders() {
+    let _ = Expr::<User>::raw("meta ?? 'a' AND name = ?", ("x",));
+}
 
 #[test]
 fn generated_schema() {

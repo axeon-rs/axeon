@@ -221,3 +221,13 @@ macro_rules! from_value {
 }
 
 from_value!(bool => Bool, i32 => I32, i64 => I64, f64 => F64, String => Text, &str => Text, Vec<u8> => Bytes);
+#[cfg(feature = "chrono")]
+from_value!(
+    chrono::DateTime<chrono::Utc> => DateTime,
+    chrono::NaiveDateTime => NaiveDateTime,
+    chrono::NaiveDate => Date,
+);
+#[cfg(feature = "uuid")]
+from_value!(uuid::Uuid => Uuid);
+#[cfg(feature = "json")]
+from_value!(serde_json::Value => Json);
