@@ -1,0 +1,33 @@
+[package]
+name = "axeon-client"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "An outbound HTTP client for Axeon apps: SSRF-safe egress, timeouts, retries, circuit breaking, request-ID propagation and metrics"
+license = "MIT"
+repository = "https://github.com/axeon-rs/axeon"
+documentation = "https://docs.rs/axeon-client"
+readme = "README.md"
+keywords = ["http", "client", "ssrf", "retry", "axeon"]
+categories = ["web-programming::http-client"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+axeon = { version = "1.0", path = "..", default-features = false }
+# No `system-proxy`: a proxy from the environment would resolve hosts
+# itself, around the egress checks.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset", "json", "query", "form"] }
+serde = "1"
+tokio = { version = "1", features = ["net", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+
+[features]
+default = ["metrics"]
+# `ClientBuilder::metrics`: per-client counters on an Axeon `Metrics` registry.
+metrics = []
