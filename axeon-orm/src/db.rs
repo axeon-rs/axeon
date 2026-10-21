@@ -457,6 +457,8 @@ impl Row {
             Kind::Uuid => Value::Uuid(self.get(column)?),
             #[cfg(feature = "json")]
             Kind::Json => Value::Json(self.get(column)?),
+            #[cfg(feature = "pgvector")]
+            Kind::Vector => Value::Vector(self.get(column)?),
         })
     }
 }
@@ -517,6 +519,8 @@ macro_rules! bind_all {
                     Kind::Uuid => query.bind(None::<uuid::Uuid>),
                     #[cfg(feature = "json")]
                     Kind::Json => query.bind(None::<serde_json::Value>),
+                    #[cfg(feature = "pgvector")]
+                    Kind::Vector => query.bind(None::<crate::vector::Vector>),
                 },
                 Value::Bool(v) => query.bind(v),
                 Value::I32(v) => query.bind(v),
@@ -534,6 +538,8 @@ macro_rules! bind_all {
                 Value::Uuid(v) => query.bind(v),
                 #[cfg(feature = "json")]
                 Value::Json(v) => query.bind(v),
+                #[cfg(feature = "pgvector")]
+                Value::Vector(v) => query.bind(v),
             };
         }
         query

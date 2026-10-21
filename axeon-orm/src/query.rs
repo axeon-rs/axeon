@@ -365,6 +365,11 @@ impl<M> Expr<M> {
         Expr::new(Cond::Raw(Fragment::new(sql, args.into_values())))
     }
 
+    #[cfg(feature = "pgvector")]
+    pub(crate) fn distance(distance: crate::vector::Distance<M>, compare: &'static str, limit: f64) -> Expr<M> {
+        Expr::new(Cond::Distance(distance.column, distance.metric.operator(), Value::Vector(distance.target), compare, limit))
+    }
+
     /// Both conditions.
     pub fn and(self, other: Expr<M>) -> Expr<M> {
         Expr::new(Cond::And(vec![self.cond, other.cond]))
@@ -435,6 +440,12 @@ impl<M> std::fmt::Debug for Order<M> {
 impl<M> Order<M> {
     fn new(term: SortTerm, descending: bool) -> Self {
         Order { sort: Sort { term, descending, qualifier: None }, _marker: PhantomData }
+    }
+
+    #[cfg(feature = "pgvector")]
+    pub(crate) fn distance(distance: crate::vector::Distance<M>, descending: bool) -> Order<M> {
+        let term = SortTerm::Distance(distance.column, distance.metric.operator(), Value::Vector(distance.target));
+        Order::new(term, descending)
     }
 
     /// Ascending order by an SQL expression, such as a vector distance or a
@@ -742,6 +753,32 @@ impl<M: Model> Query<M> {
     pub(crate) async fn fetch(&self, conn: &mut Conn<'_>) -> Result<Vec<M>> {
         let (sql, args) = self.select(conn.backend());
         conn.fetch_all(sql, args).await?.iter().map(M::from_row).collect()
+    }
+
+    /// The `k` matching rows nearest by `distance`, nearest first, with
+    /// their distances (feature `pgvector`). With an index on the same
+    /// distance, PostgreSQL doesn't compare every row; filters on other
+    /// columns apply to the index's candidates, so with a selective filter
+    /// raise `hnsw.ef_search` or use iterative scans to keep `k` results.
+    #[cfg(feature = "pgvector")]
+    pub async fn nearest<'c>(self, ex: impl Executor<'c>, distance: crate::vector::Distance<M>, k: u64) -> Result<Vec<(M, f64)>> {
+        let mut conn = ex.into_conn();
+        let backend = conn.backend();
+        if backend != Backend::Postgres {
+            return Err(Error::Config("vector search needs PostgreSQL with pgvector".into()));
+        }
+        let mut sql = Sql::new(backend);
+        sql.push("SELECT ").push(&column_list::<M>(backend)).push(", ");
+        sql.ident(distance.column).push(" ").push(distance.metric.operator()).push(" ").arg(Value::Vector(distance.target.clone()));
+        sql.push(" AS ").ident("__axeon_distance").push(" FROM ").ident(M::TABLE);
+        sql.where_clause(&self.conds);
+        sql.push(" ORDER BY ").ident("__axeon_distance").push(" LIMIT ").push(&k.to_string());
+        let (sql, args) = sql.finish();
+        conn.fetch_all(sql, args)
+            .await?
+            .iter()
+            .map(|row| Ok((M::from_row(row)?, row.get::<f64>("__axeon_distance")?)))
+            .collect()
     }
 
     /// Every matching row.

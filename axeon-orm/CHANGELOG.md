@@ -15,6 +15,12 @@
   integers is `i64`, `avg` is `f64`).
 - **Filtering by relations:** `has`, `doesnt_have`, `where_has` and
   `where_doesnt_have`, for every relation type.
+- **pgvector** (feature `pgvector`): `vector::Vector` columns with
+  `#[model(dimensions = n)]`, `cosine_distance` / `l2_distance` /
+  `inner_product` for ordering (`asc`/`desc`) and filtering (`lt`/`lte`),
+  `Query::nearest(&db, distance, k)` returning rows with their distances,
+  and `vector::create_index` for HNSW and IVFFlat indexes. Vectors use
+  pgvector's binary format; no extra dependency.
 - **Bulk inserts:** `Model::insert_many(&db, &rows)` and
   `Model::upsert_many(&db, &rows, OnConflict::on(..))` send multi-row
   `INSERT`s (up to 1000 rows each, under the parameter limit) and return

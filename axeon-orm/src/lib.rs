@@ -156,6 +156,7 @@
 //! | `json` | yes | `serde_json::Value` and `sqlx::types::Json<T>` columns |
 //! | `axeon` | yes | The [`server`] module |
 //! | `uuid` | no | `Uuid` columns |
+//! | `pgvector` | no | [`vector`] columns, distances and indexes (PostgreSQL) |
 //!
 //! # Beyond simple queries
 //!
@@ -165,6 +166,8 @@
 //!   and [`where_has`](Query::where_has).
 //! - **Joins:** [`Query::join`] and [`left_join`](Query::left_join) give
 //!   `(Post, User)` pairs from one query, filtered and sorted by either side.
+//! - **Vector search:** [`vector::Vector`] columns, distances to sort and
+//!   filter by, and [`Query::nearest`] (feature `pgvector`).
 //! - **JSON filters:** [`Column::contains`], [`has_key`](Column::has_key)
 //!   and [`key`](Column::key) paths on JSON columns.
 //! - **Raw SQL fragments:** [`Expr::raw`] and [`Order::raw`] mix SQL
@@ -193,6 +196,8 @@ mod sql;
 mod value;
 
 pub mod migrate;
+#[cfg(feature = "pgvector")]
+pub mod vector;
 #[cfg(all(feature = "axeon", feature = "postgres"))]
 pub mod broadcast;
 #[cfg(feature = "postgres")]

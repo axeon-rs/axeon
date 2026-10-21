@@ -43,5 +43,7 @@ tls = ["sqlx/tls-rustls-ring-webpki"]
 chrono = ["dep:chrono", "sqlx/chrono"]
 uuid = ["dep:uuid", "sqlx/uuid"]
 json = ["dep:serde_json", "sqlx/json"]
+# pgvector `vector` columns, distances and indexes (PostgreSQL).
+pgvector = ["postgres"]
 # `req.db()`, the `Transactional` middleware and error conversion for Axeon.
 axeon = ["dep:axeon"]

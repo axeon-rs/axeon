@@ -62,6 +62,10 @@ fn sql_type(kind: Kind, backend: Backend, indexed: bool) -> &'static str {
         (Backend::MySql, Kind::Json) => "JSON",
         #[cfg(feature = "json")]
         (_, Kind::Json) => "TEXT",
+        #[cfg(feature = "pgvector")]
+        (Backend::Postgres, Kind::Vector) => "vector",
+        #[cfg(feature = "pgvector")]
+        (_, Kind::Vector) => "TEXT",
     }
 }
 
@@ -84,6 +88,9 @@ fn column_sql(column: &ColumnDef, backend: Backend) -> String {
         };
     }
     let mut sql = format!("{} {}", name, sql_type(column.kind, backend, is_indexed(column)));
+    if let (Some(dimensions), Backend::Postgres) = (column.dimensions, backend) {
+        sql.push_str(&format!("({})", dimensions));
+    }
     if column.primary_key {
         sql.push_str(" PRIMARY KEY");
     } else if !column.nullable {

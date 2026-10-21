@@ -35,6 +35,9 @@ pub enum Kind {
     /// `JSONB`; `TEXT` in SQLite. Feature `json`.
     #[cfg(feature = "json")]
     Json,
+    /// pgvector `vector(n)`. Feature `pgvector`.
+    #[cfg(feature = "pgvector")]
+    Vector,
 }
 
 impl Kind {
@@ -78,6 +81,9 @@ pub enum Value {
     /// A JSON document.
     #[cfg(feature = "json")]
     Json(serde_json::Value),
+    /// A pgvector vector.
+    #[cfg(feature = "pgvector")]
+    Vector(crate::vector::Vector),
 }
 
 impl Value {
@@ -120,6 +126,8 @@ impl Hash for Value {
             Value::Uuid(v) => v.hash(state),
             #[cfg(feature = "json")]
             Value::Json(v) => v.to_string().hash(state),
+            #[cfg(feature = "pgvector")]
+            Value::Vector(v) => v.as_slice().iter().for_each(|x| x.to_bits().hash(state)),
         }
     }
 }

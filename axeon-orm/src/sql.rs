@@ -41,6 +41,9 @@ pub(crate) enum Cond {
     Raw(Fragment),
     #[cfg(feature = "json")]
     Json(&'static str, JsonPath, JsonTest),
+    /// `column <op> vector <compare> limit`, e.g. `embedding <=> $1 < 0.3`.
+    #[cfg(feature = "pgvector")]
+    Distance(&'static str, &'static str, Value, &'static str, f64),
 }
 
 /// A step into a JSON document: an object key or an array index.
@@ -163,6 +166,9 @@ pub(crate) enum SortTerm {
     Raw(Fragment),
     #[cfg(feature = "json")]
     Json(&'static str, JsonPath),
+    /// `column <op> vector`.
+    #[cfg(feature = "pgvector")]
+    Distance(&'static str, &'static str, Value),
 }
 
 /// SQL text with its parameters, numbered for the target database.
@@ -235,6 +241,12 @@ impl Sql {
                 }
                 SortTerm::Raw(fragment) => {
                     self.push("(").fragment(fragment).push(")");
+                }
+                #[cfg(feature = "pgvector")]
+                SortTerm::Distance(column, op, target) => {
+                    let previous = std::mem::replace(&mut self.qualifier, sort.qualifier);
+                    self.column(column).push(" ").push(op).push(" ").arg(target.clone());
+                    self.qualifier = previous;
                 }
                 #[cfg(feature = "json")]
                 SortTerm::Json(column, path) => {
@@ -367,6 +379,11 @@ impl Sql {
             // Parenthesized, so `OR` inside the fragment can't escape it.
             Cond::Raw(fragment) => {
                 self.push("(").fragment(fragment).push(")");
+            }
+            #[cfg(feature = "pgvector")]
+            Cond::Distance(column, op, target, compare, limit) => {
+                self.push("(").column(column).push(" ").push(op).push(" ").arg(target.clone());
+                self.push(" ").push(compare).push(" ").arg(Value::F64(*limit)).push(")");
             }
             // Never NULL (a missing key would make it unknown), so `!` gives
             // exactly the other rows. PostgreSQL's `@>` and `?` stay bare

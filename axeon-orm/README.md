@@ -217,6 +217,41 @@ let rows: Vec<(Post, User)> = Post::query()
 let rows: Vec<(User, Option<Profile>)> = User::query().left_join(User::PROFILE).all(&db).await?;
 ```
 
+## Vector search (pgvector)
+
+With the `pgvector` feature and the extension in PostgreSQL
+(`CREATE EXTENSION vector`):
+
+```rust
+use axeon_orm::vector::{self, Vector, VectorIndex};
+
+#[derive(Model)]
+struct Product {
+    id: i64,
+    category: String,
+    #[model(dimensions = 1024)]
+    embedding: Vector,
+}
+
+db.execute(&vector::create_index::<Product>("embedding", VectorIndex::hnsw_cosine())).await?;
+
+// The 10 nearest in a category, with their distances.
+let hits: Vec<(Product, f64)> = Product::query()
+    .filter(Product::CATEGORY.eq("lighting"))
+    .nearest(&db, Product::EMBEDDING.cosine_distance(&query), 10)
+    .await?;
+
+// Distances also sort and filter ordinary queries.
+Product::query().filter(Product::EMBEDDING.cosine_distance(&query).lt(0.3))
+    .order_by(Product::EMBEDDING.cosine_distance(&query).asc());
+```
+
+`cosine_distance` (`<=>`), `l2_distance` (`<->`) and `inner_product`
+(`<#>`, negated so smaller is closer). Vectors travel in pgvector's binary
+format. HNSW (or IVFFlat) indexes make nearest-neighbour queries
+approximate and fast; filters on other columns apply to the index's
+candidates, so with very selective filters raise `hnsw.ef_search`.
+
 ## JSON filters
 
 Filter and sort by values inside JSON columns (`serde_json::Value` or

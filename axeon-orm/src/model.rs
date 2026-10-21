@@ -98,6 +98,8 @@ pub struct ColumnDef {
     /// The only values allowed, for a [`SqlEnum`](derive@crate::SqlEnum)
     /// column.
     pub values: Option<&'static [&'static str]>,
+    /// The size of a vector column, from `#[model(dimensions = n)]`.
+    pub dimensions: Option<u32>,
 }
 
 impl ColumnDef {
@@ -116,6 +118,7 @@ impl ColumnDef {
             timestamp: None,
             references: None,
             values: None,
+            dimensions: None,
         }
     }
 
@@ -148,6 +151,12 @@ impl ColumnDef {
     #[doc(hidden)]
     pub const fn timestamp(mut self, timestamp: Timestamp) -> Self {
         self.timestamp = Some(timestamp);
+        self
+    }
+
+    #[doc(hidden)]
+    pub const fn dimensions(mut self, dimensions: u32) -> Self {
+        self.dimensions = Some(dimensions);
         self
     }
 

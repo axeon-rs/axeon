@@ -31,6 +31,7 @@ struct FieldAttrs {
     belongs_to: Option<Path>,
     on_delete: Option<LitStr>,
     skip: bool,
+    dimensions: Option<syn::LitInt>,
 }
 
 struct Field {
@@ -138,9 +139,16 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                     attrs.on_delete = Some(action);
                 } else if path.is_ident("skip") {
                     attrs.skip = true;
+                } else if path.is_ident("dimensions") {
+                    let lit: syn::LitInt = meta.value()?.parse()?;
+                    let n: u32 = lit.base10_parse()?;
+                    if !(1..=16000).contains(&n) {
+                        return Err(Error::new_spanned(&lit, "a vector has 1 to 16000 dimensions"));
+                    }
+                    attrs.dimensions = Some(lit);
                 } else {
                     return Err(meta.error(
-                        "expected primary_key, column, unique, index, default, created_at, updated_at, belongs_to, on_delete or skip",
+                        "expected primary_key, column, unique, index, default, created_at, updated_at, belongs_to, on_delete, skip or dimensions",
                     ));
                 }
                 Ok(())
@@ -192,6 +200,9 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         }
         if f.attrs.index {
             def = quote! { #def.index() };
+        }
+        if let Some(dimensions) = &f.attrs.dimensions {
+            def = quote! { #def.dimensions(#dimensions) };
         }
         if let Some(default) = &f.attrs.default {
             let sql = match default {
