@@ -38,6 +38,12 @@ release, WebSocket and JWT types are now Axeon's own:
 - `rust-version = "1.88"`, tested in CI, and a documented
   [stability policy](README.md#stability).
 - CI runs the test suite on Windows.
+- **Application metrics:** `Metrics::counter`, `gauge` and `histogram`
+  (and `_vec` variants with labels) register metrics on the same registry
+  and `/metrics` endpoint as the HTTP metrics. Handles are cheap to clone
+  and update with atomics; histograms have `start_timer()`. Names and
+  labels are validated, registering a name again returns the same
+  metric, and `metrics::DEFAULT_BUCKETS` is public.
 
 ## 1.0.0-rc.1 (2026-10-17)
 

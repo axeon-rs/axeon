@@ -518,6 +518,22 @@ app.middleware(SetRequestId::new())
         .router());
 ```
 
+Application metrics go on the same registry and endpoint:
+
+```rust
+use axeon::metrics::DEFAULT_BUCKETS;
+
+let tokens = metrics.counter_vec("llm_tokens_total", "LLM tokens used.", &["model"]);
+let queue = metrics.gauge_vec("queue_depth", "Jobs waiting.", &["queue"]);
+let step = metrics.histogram("workflow_step_seconds", "Step duration.", &DEFAULT_BUCKETS);
+
+tokens.with(&["qwen-max"]).inc_by(812.0);
+queue.with(&["onboarding"]).set(17.0);
+let timer = step.start_timer(); // records when observed or dropped
+```
+
+Keep label values to a small, fixed set (a model, a queue name), never IDs.
+
 Inside your own Tokio runtime (e.g. to connect to a database first), use
 `app.serve_with_shutdown(listener, axeon::shutdown_signal())`.
 

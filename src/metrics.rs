@@ -1,4 +1,4 @@
-//! Prometheus metrics for HTTP traffic.
+//! Prometheus metrics for HTTP traffic and the application.
 //!
 //! [`Metrics`] is middleware that records, per method, route pattern and
 //! status:
@@ -21,6 +21,34 @@
 //! app.mount("/", metrics.router()); // GET /metrics
 //! ```
 //!
+//! # Application metrics
+//!
+//! Register counters, gauges and histograms on the same registry, and they
+//! are served on the same endpoint:
+//!
+//! ```rust
+//! use axeon::metrics::{Metrics, DEFAULT_BUCKETS};
+//!
+//! let metrics = Metrics::new();
+//! let tokens = metrics.counter_vec("llm_tokens_total", "LLM tokens used.", &["model"]);
+//! let depth = metrics.gauge_vec("queue_depth", "Jobs waiting.", &["queue"]);
+//! let vendor = metrics.histogram_vec("vendor_seconds", "Vendor call duration.", &["vendor"], &DEFAULT_BUCKETS);
+//!
+//! tokens.with(&["qwen-max"]).inc_by(812.0);
+//! depth.with(&["onboarding"]).set(17.0);
+//! let timer = vendor.with(&["kyb"]).start_timer();
+//! // ... call the vendor ...
+//! timer.observe();
+//!
+//! let text = metrics.render();
+//! assert!(text.contains(r#"llm_tokens_total{model="qwen-max"} 812"#));
+//! assert!(text.contains(r#"vendor_seconds_count{vendor="kyb"} 1"#));
+//! ```
+//!
+//! Handles are cheap to clone and update with atomics, so keep them in
+//! application state. Each distinct set of label values is a series kept
+//! for the life of the process: use labels from a small, fixed set.
+//!
 //! Keep `/metrics` off the public internet, e.g. by mounting it on an
 //! internal port or protecting it with [`BasicAuth`](crate::auth::BasicAuth).
 
@@ -33,8 +61,14 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-/// Histogram bucket upper bounds, in seconds.
-const BUCKETS: [f64; 11] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+mod custom;
+
+pub use custom::{Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Timer};
+
+/// Histogram bucket upper bounds in seconds, from 5 ms to 10 s, used for
+/// HTTP request durations and suited to other request-like durations.
+pub const DEFAULT_BUCKETS: [f64; 11] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+const BUCKETS: [f64; 11] = DEFAULT_BUCKETS;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
@@ -55,6 +89,8 @@ struct Series {
 struct Registry {
     series: RwLock<HashMap<Key, Arc<Series>>>,
     in_flight: AtomicI64,
+    /// Application metrics, in registration order.
+    custom: RwLock<Vec<Arc<custom::Family>>>,
 }
 
 /// HTTP metrics middleware and its `/metrics` endpoint. Clones share data.
@@ -112,6 +148,9 @@ impl Metrics {
         }
         out.push_str("# HELP http_requests_in_flight HTTP requests being handled.\n# TYPE http_requests_in_flight gauge\n");
         let _ = writeln!(out, "http_requests_in_flight {}", self.registry.in_flight.load(Ordering::Relaxed));
+        for family in self.registry.custom.read().unwrap_or_else(|e| e.into_inner()).iter() {
+            family.render(&mut out);
+        }
         out
     }
 
