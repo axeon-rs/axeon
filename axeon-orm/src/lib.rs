@@ -119,6 +119,8 @@
 //!   parameters.
 //! - **Row locks:** [`Query::for_update`], [`skip_locked`](Query::skip_locked)
 //!   and [`nowait`](Query::nowait), for claiming rows in a transaction.
+//! - **LISTEN / NOTIFY:** [`Db::notify`] and [`Db::listen`] on PostgreSQL;
+//!   see [`notify`].
 //! - **Migrations:** [`migrate`], and the `axeon-orm` command-line tool
 //!   (`cargo install axeon-orm-cli`).
 //!
@@ -136,6 +138,8 @@ mod sql;
 mod value;
 
 pub mod migrate;
+#[cfg(feature = "postgres")]
+pub mod notify;
 pub mod relation;
 pub mod schema;
 #[cfg(feature = "axeon")]

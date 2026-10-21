@@ -204,6 +204,27 @@ Joins lock only the main table's rows; `count`, `exists` and aggregates
 don't lock. SQLite has no row locks (a write transaction locks the whole
 database), so these are left out there.
 
+## LISTEN / NOTIFY
+
+On PostgreSQL, send lightweight messages between connections, to wake
+workers or fan events out to every server:
+
+```rust
+let mut listener = db.listen(["jobs"]).await?;   // holds one pool connection
+
+let mut tx = db.begin().await?;
+// ... insert the job ...
+tx.notify("jobs", &job.id.to_string()).await?;   // delivered on commit only
+tx.commit().await?;
+
+let message = listener.recv().await?;            // or listener.into_stream()
+println!("{} on {}", message.payload, message.channel);
+```
+
+Messages aren't stored, so a listener only hears what is sent while it's
+connected. It reconnects by itself; `try_recv()` returns `None` when the
+connection dropped, so you can re-read what you might have missed.
+
 ## Migrations
 
 Put SQL files named `<version>_<name>.sql` in `migrations/`, then:

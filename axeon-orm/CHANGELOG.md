@@ -25,6 +25,11 @@
   joins (`FOR UPDATE [SKIP LOCKED | NOWAIT]`; joins lock only the main
   table). Left out on SQLite, which has no row locks. A `nowait` conflict
   is the new `Error::LockNotAvailable`.
+- **LISTEN / NOTIFY** (PostgreSQL): `Db::notify` and `Transaction::notify`
+  (sent on commit only), and `Db::listen` returning a `notify::Listener`
+  with `listen`, `unlisten`, `recv`, `try_recv` (`None` after a dropped
+  connection, so callers can catch up) and `into_stream`. Reconnects by
+  itself. Other databases return `Error::Config`.
 - `From` conversions into `Value` for `serde_json::Value`, `Uuid` and the
   chrono types.
 - **Joins:** `join` and `left_join` over `belongs_to`, `has_one` and
