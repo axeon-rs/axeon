@@ -38,6 +38,13 @@ release, WebSocket and JWT types are now Axeon's own:
 - `rust-version = "1.88"`, tested in CI, and a documented
   [stability policy](README.md#stability).
 - CI runs the test suite on Windows.
+- **Checked uploads:** multipart `Field::limit(bytes)` caps one field
+  (413), `Field::accept(types)` checks the real type from the first bytes
+  (415; `image/*` works), and `Field::write_to(writer)` / `Field::save(path)`
+  stream into any `AsyncWrite` while computing SHA-256, returning an
+  `Upload` (size, hash, detected and declared type). A rejected file
+  writes nothing. `multipart::sniff` detects PDF, common images, MP4, ZIP,
+  gzip and 7z. `Field::bytes` and `text` respect the limit.
 - **Broadcast across instances:** `broadcast::Hub` publishes messages to
   topics and streams them to subscribers on every instance, with
   `Hub::sse` for server-sent events resuming from `Last-Event-ID`

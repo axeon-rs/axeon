@@ -437,6 +437,20 @@ app.route("/upload").body_limit(1 << 30).stream_body().post(|req| async move {
     }
     Ok::<_, ServerError>("uploaded")
 });
+
+// Untrusted files: a per-field cap, the real type from the first bytes
+// (not the client's Content-Type), and SHA-256 while streaming to any
+// AsyncWrite, such as an object-store upload.
+app.route("/documents").body_limit(60 << 20).stream_body().post(|req| async move {
+    let mut form = req.multipart()?;
+    let Some(field) = form.next_field().await? else { return Err(ServerError::BadRequest("no file".into())) };
+    let upload = field
+        .limit(50 << 20)                              // 413 above 50 MiB
+        .accept(&["application/pdf", "image/*"])      // 415 for anything else
+        .save(std::env::temp_dir().join("doc.bin"))   // or .write_to(&mut writer)
+        .await?;
+    Ok(json!({ "sha256": upload.sha256_hex(), "size": upload.size(), "type": upload.content_type() }))
+});
 ```
 
 ### Realtime
