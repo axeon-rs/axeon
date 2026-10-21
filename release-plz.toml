@@ -32,3 +32,19 @@ git_release_enable = false
 [[package]]
 name = "axeon-orm-cli"
 git_tag_name = "axeon-orm-cli-v{{ version }}"
+
+[[package]]
+name = "axeon-jobs"
+git_tag_name = "axeon-jobs-v{{ version }}"
+
+[[package]]
+name = "axeon-redis"
+git_tag_name = "axeon-redis-v{{ version }}"
+
+[[package]]
+name = "axeon-openapi"
+git_tag_name = "axeon-openapi-v{{ version }}"
+
+[[package]]
+name = "axeon-client"
+git_tag_name = "axeon-client-v{{ version }}"

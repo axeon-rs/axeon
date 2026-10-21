@@ -1,6 +1,65 @@
 # Changelog
 
-## 1.0.0 (unreleased)
+## 1.1.0 (2026-10-22)
+
+New features for production backends, all additive: no breaking changes, and
+nothing to do when upgrading from 1.0. Five companion crates are released
+alongside: [axeon-orm 0.3](axeon-orm/CHANGELOG.md) and the new
+[axeon-jobs](axeon-jobs/CHANGELOG.md), [axeon-redis](axeon-redis/CHANGELOG.md),
+[axeon-openapi](axeon-openapi/CHANGELOG.md) and
+[axeon-client](axeon-client/CHANGELOG.md).
+
+### Added
+
+- **Checked uploads:** multipart `Field::limit(bytes)` caps one field
+  (413), `Field::accept(types)` checks the real type from the first bytes
+  (415; `image/*` works), and `Field::write_to(writer)` / `Field::save(path)`
+  stream into any `AsyncWrite` while computing SHA-256, returning an
+  `Upload` (size, hash, detected and declared type). A rejected file
+  writes nothing. `multipart::sniff` detects PDF, common images, MP4, ZIP,
+  gzip and 7z. `Field::bytes` and `text` respect the limit.
+- **Broadcast across instances:** `broadcast::Hub` publishes messages to
+  topics and streams them to subscribers on every instance, with
+  `Hub::sse` for server-sent events resuming from `Last-Event-ID`
+  (`Request::last_event_id`). Replay comes from the backend's log, a
+  `reset` event marks messages that were trimmed, slow subscribers catch
+  up from the log, and each instance uses one wake-up connection however
+  many clients it serves. `MemoryBackend` for one process; implement
+  `broadcast::Backend` for others (Redis and PostgreSQL ones ship in
+  axeon-redis and axeon-orm).
+- **Route metadata:** `RouteBuilder::meta(value)` attaches a value to a
+  route's handlers, and `Server::routes()` / `Router::routes()` list every
+  route (`RouteInfo`: method, pattern, metadata), for tools such as
+  axeon-openapi.
+- **Handler timeouts:** `Server::handler_timeout` (off by default) and
+  per-route `RouteBuilder::timeout` / `no_timeout`, kept through
+  `mount`. A handler that runs over is cancelled and answered with 503,
+  the new `ServerError::HandlerTimeout`; route middleware counts toward
+  the limit, global middleware sees the 503, and streamed responses only
+  have to start in time.
+- **Application metrics:** `Metrics::counter`, `gauge` and `histogram`
+  (and `_vec` variants with labels) register metrics on the same registry
+  and `/metrics` endpoint as the HTTP metrics. Handles are cheap to clone
+  and update with atomics; histograms have `start_timer()`. Names and
+  labels are validated, registering a name again returns the same
+  metric, and `metrics::DEFAULT_BUCKETS` is public.
+
+### Fixed
+
+- Closing a connection now reads and discards what the client is still
+  sending (up to 2 s or 1 MiB, stopping after 500 ms of quiet) after the
+  response is written. An early response such as `415` for an upload is no
+  longer lost to a connection reset, which showed up on Windows.
+- The README metrics example now compiles.
+
+### Changed
+
+- `ServerError::HandlerTimeout` is a new variant of a `#[non_exhaustive]`
+  enum, so matches that already have a wildcard arm keep working.
+- Updated dependencies: base64 0.23, getrandom 0.4 (feature `cookies`) and,
+  for checked uploads, sha2 (feature `multipart`).
+
+## 1.0.0 (2026-10-17)
 
 The first stable release: no breaking changes until 2.0. Upgrading from
 0.4? Read the 1.0.0-rc.1 notes below and
@@ -38,38 +97,6 @@ release, WebSocket and JWT types are now Axeon's own:
 - `rust-version = "1.88"`, tested in CI, and a documented
   [stability policy](README.md#stability).
 - CI runs the test suite on Windows.
-- **Checked uploads:** multipart `Field::limit(bytes)` caps one field
-  (413), `Field::accept(types)` checks the real type from the first bytes
-  (415; `image/*` works), and `Field::write_to(writer)` / `Field::save(path)`
-  stream into any `AsyncWrite` while computing SHA-256, returning an
-  `Upload` (size, hash, detected and declared type). A rejected file
-  writes nothing. `multipart::sniff` detects PDF, common images, MP4, ZIP,
-  gzip and 7z. `Field::bytes` and `text` respect the limit.
-- **Broadcast across instances:** `broadcast::Hub` publishes messages to
-  topics and streams them to subscribers on every instance, with
-  `Hub::sse` for server-sent events resuming from `Last-Event-ID`
-  (`Request::last_event_id`). Replay comes from the backend's log, a
-  `reset` event marks messages that were trimmed, slow subscribers catch
-  up from the log, and each instance uses one wake-up connection however
-  many clients it serves. `MemoryBackend` for one process; implement
-  `broadcast::Backend` for others (Redis and PostgreSQL ones ship in
-  axeon-redis and axeon-orm).
-- **Route metadata:** `RouteBuilder::meta(value)` attaches a value to a
-  route's handlers, and `Server::routes()` / `Router::routes()` list every
-  route (`RouteInfo`: method, pattern, metadata), for tools such as
-  axeon-openapi.
-- **Handler timeouts:** `Server::handler_timeout` (off by default) and
-  per-route `RouteBuilder::timeout` / `no_timeout`, kept through
-  `mount`. A handler that runs over is cancelled and answered with 503,
-  the new `ServerError::HandlerTimeout`; route middleware counts toward
-  the limit, global middleware sees the 503, and streamed responses only
-  have to start in time.
-- **Application metrics:** `Metrics::counter`, `gauge` and `histogram`
-  (and `_vec` variants with labels) register metrics on the same registry
-  and `/metrics` endpoint as the HTTP metrics. Handles are cheap to clone
-  and update with atomics; histograms have `start_timer()`. Names and
-  labels are validated, registering a name again returns the same
-  metric, and `metrics::DEFAULT_BUCKETS` is public.
 
 ## 1.0.0-rc.1 (2026-10-17)
 

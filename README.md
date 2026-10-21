@@ -39,7 +39,7 @@ fn main() {
 
 ```toml
 [dependencies]
-axeon = "1.0"
+axeon = "1.1"
 tokio = { version = "1", features = ["full"] } # for #[tokio::main], tokio::spawn, etc.
 serde = { version = "1", features = ["derive"] }
 ```
@@ -411,6 +411,18 @@ app.get("/posts", |req| async move {
 Prefer plain sqlx, SeaORM or Diesel? Put the pool in `app.state(pool)` and
 read it with `req.state::<PgPool>()`; Axeon doesn't depend on any database
 crate.
+
+### Companion crates
+
+Optional crates that build on Axeon, each versioned on its own:
+
+| Crate | What it does |
+|---|---|
+| [axeon-orm](axeon-orm) | Models, typed queries, relations, migrations, search and pgvector |
+| [axeon-jobs](axeon-jobs) | Background jobs on PostgreSQL: retries, delays, unique jobs, graceful shutdown |
+| [axeon-redis](axeon-redis) | A shared session store and a broadcast backend on Redis |
+| [axeon-openapi](axeon-openapi) | OpenAPI 3.1 documents generated from your routes and Rust types |
+| [axeon-client](axeon-client) | An outbound HTTP client with SSRF protection, retries and circuit breaking |
 
 ### Templates, static files and uploads
 

@@ -15,7 +15,7 @@ categories = ["asynchronous", "database", "web-programming"]
 all-features = true
 
 [dependencies]
-axeon-orm = { version = "0.2.0", path = "../axeon-orm", default-features = false, features = ["postgres", "json", "chrono"] }
+axeon-orm = { version = "0.3.0", path = "../axeon-orm", default-features = false, features = ["postgres", "json", "chrono"] }
 sqlx = { version = "0.9", default-features = false, features = ["postgres", "json", "chrono", "runtime-tokio", "derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,11 +23,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 futures = { version = "0.3.31", default-features = false, features = ["std"] }
 tracing = "0.1"
-axeon = { version = "1.0", path = "..", default-features = false, optional = true }
+axeon = { version = "1.1", path = "..", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-axeon-orm = { version = "0.2.0", path = "../axeon-orm", default-features = false, features = ["postgres", "sqlite", "json", "chrono"] }
+axeon-orm = { version = "0.3.0", path = "../axeon-orm", default-features = false, features = ["postgres", "sqlite", "json", "chrono"] }
 
 [features]
 default = ["metrics"]

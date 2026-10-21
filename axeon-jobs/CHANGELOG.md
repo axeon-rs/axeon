@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-10-22)
 
 First release: a `Job` trait, `enqueue` / `enqueue_with` (delays, run
 times, unique keys, other queues; with `&db` or inside a transaction), a

@@ -1,20 +1,13 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.3.0 (2026-10-22)
+
+Additive: everything from 0.2 keeps working. The minor version marks the size
+of the release and moves `axeon-orm-macros` and `axeon-orm-cli` in step.
+Requires Axeon 1.1 with the `axeon` feature (for the broadcast backend).
 
 ### Added
 
-- **Many-to-many relations:** `#[model(belongs_to_many(Tag))]` gives
-  `Post::TAGS` and `post.tags()`, through a pivot table (`post_tag` with
-  `post_id` and `tag_id` by default; all configurable). `attach`,
-  `attach_key`, `detach`, `detach_all` and `sync` manage links (linking
-  twice is not an error), `.with(Post::TAGS)` eager-loads them, and
-  `Db::create_pivot_table` / `schema::create_pivot_table` create the table.
-- **Aggregates:** `sum`, `avg`, `min`, `max` and `count_by` on queries.
-  Results are cast so every database returns the same Rust type (`sum` of
-  integers is `i64`, `avg` is `f64`).
-- **Filtering by relations:** `has`, `doesnt_have`, `where_has` and
-  `where_doesnt_have`, for every relation type.
 - **Full-text search** (PostgreSQL): `search::FullText` over text columns
   or a stored `tsvector`, `matches` (`websearch_to_tsquery` syntax) and
   `rank` (normalized `ts_rank`), `search::create_index` (a GIN index on
@@ -82,6 +75,29 @@
   connection, for raw queries inside an ORM transaction.
 - `From` conversions into `Value` for `serde_json::Value`, `Uuid` and the
   chrono types.
+
+### Changed
+
+- New `pgvector` feature (off by default) for vector columns.
+- `Error` gains `LockNotAvailable` and `SqlType` gains a defaulted `VALUES`
+  constant; both enums are `#[non_exhaustive]`, so existing code keeps
+  compiling.
+
+## 0.2.0 (2026-10-18)
+
+### Added
+
+- **Many-to-many relations:** `#[model(belongs_to_many(Tag))]` gives
+  `Post::TAGS` and `post.tags()`, through a pivot table (`post_tag` with
+  `post_id` and `tag_id` by default; all configurable). `attach`,
+  `attach_key`, `detach`, `detach_all` and `sync` manage links (linking
+  twice is not an error), `.with(Post::TAGS)` eager-loads them, and
+  `Db::create_pivot_table` / `schema::create_pivot_table` create the table.
+- **Aggregates:** `sum`, `avg`, `min`, `max` and `count_by` on queries.
+  Results are cast so every database returns the same Rust type (`sum` of
+  integers is `i64`, `avg` is `f64`).
+- **Filtering by relations:** `has`, `doesnt_have`, `where_has` and
+  `where_doesnt_have`, for every relation type.
 - **Joins:** `join` and `left_join` over `belongs_to`, `has_one` and
   `has_many`, returning `(Model, Related)` or `(Model, Option<Related>)`
   pairs from one query, with `filter_related` and `order_by_related`.

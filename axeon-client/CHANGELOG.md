@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-10-22)
 
 First release: `Client` on reqwest with egress control against SSRF
 (public-only by default, checked on resolved addresses, IP literals and
