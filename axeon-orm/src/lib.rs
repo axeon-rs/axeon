@@ -244,7 +244,7 @@ mod sealed {
 #[doc(hidden)]
 pub mod __private {
     pub use crate::db::Conn;
-    pub use crate::model::{column_name, delete, find, has_column, insert, insert_or_ignore, update, upsert};
+    pub use crate::model::{column_name, delete, find, has_column, insert, insert_many, insert_or_ignore, update, upsert, upsert_many};
 
     pub fn decode_error(column: &str, error: impl std::fmt::Display) -> crate::Error {
         crate::Error::decode(column, error)

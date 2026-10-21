@@ -15,6 +15,12 @@
   integers is `i64`, `avg` is `f64`).
 - **Filtering by relations:** `has`, `doesnt_have`, `where_has` and
   `where_doesnt_have`, for every relation type.
+- **Bulk inserts:** `Model::insert_many(&db, &rows)` and
+  `Model::upsert_many(&db, &rows, OnConflict::on(..))` send multi-row
+  `INSERT`s (up to 1000 rows each, under the parameter limit) and return
+  the stored rows in input order, on all three databases. Several
+  statements on a pool share one transaction. Duplicate conflict keys in
+  one `upsert_many` are refused before writing.
 - **JSON filters** (feature `json`): on `serde_json::Value` and
   `Json<T>` columns, `contains` (PostgreSQL `@>`, MySQL `JSON_CONTAINS`)
   and `has_key` (`?`), both able to use a GIN index, and paths with

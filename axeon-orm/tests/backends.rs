@@ -832,6 +832,87 @@ async fn json_filters(db: &Db) {
     assert_eq!(Item::query().filter(Item::NAME.eq("eco-tagged")).count(db).await.unwrap(), 2);
 }
 
+async fn bulk_inserts(db: &Db) {
+    db.create_table::<Product>().await.unwrap();
+    db.create_table::<Setting>().await.unwrap();
+    db.create_table::<Flag>().await.unwrap();
+    let now = Utc::now();
+    let product = |i: usize| Product { id: 0, sku: format!("SKU-{:05}", i), name: format!("Product {}", i), price: i as i64, created_at: now, updated_at: now };
+
+    assert!(Product::insert_many(db, &[]).await.unwrap().is_empty());
+
+    // 2500 rows: several statements, all in one transaction.
+    let rows: Vec<Product> = (0..2500).map(product).collect();
+    let started = std::time::Instant::now();
+    let stored = Product::insert_many(db, &rows).await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(stored.len(), 2500);
+    assert!(stored.iter().zip(&rows).all(|(s, r)| s.sku == r.sku && s.name == r.name), "same order as the input");
+    assert!(stored.windows(2).all(|w| w[0].id < w[1].id), "new IDs, increasing");
+    assert!(stored[0].id > 0);
+    assert_eq!(Product::query().count(db).await.unwrap(), 2500);
+    assert_eq!(Product::find_or_fail(db, stored[1234].id).await.unwrap(), stored[1234]);
+    eprintln!("{:?}: 2500 rows in {:?}", db.backend(), elapsed);
+
+    // All or nothing: a duplicate SKU in the third chunk rolls back the rest.
+    let mut batch: Vec<Product> = (2500..4000).map(product).collect();
+    batch[1300].sku = "SKU-00007".into();
+    let failed = Product::insert_many(db, &batch).await;
+    assert!(matches!(failed, Err(Error::UniqueViolation(_))), "{:?}", failed.map(|r| r.len()));
+    assert_eq!(Product::query().count(db).await.unwrap(), 2500);
+    // Inside the caller's transaction, it's the caller's to commit.
+    let mut tx = db.begin().await.unwrap();
+    Product::insert_many(&mut tx, &[product(5000), product(5001)]).await.unwrap();
+    assert_eq!(Product::query().count(&mut tx).await.unwrap(), 2502);
+    tx.rollback().await.unwrap();
+    assert_eq!(Product::query().count(db).await.unwrap(), 2500);
+
+    // Keys that aren't generated.
+    let settings: Vec<Setting> = ["b", "a", "c"].iter().map(|k| Setting { key: k.to_string(), value: format!("v{}", k) }).collect();
+    let stored = Setting::insert_many(db, &settings).await.unwrap();
+    assert_eq!(stored, settings);
+    // Only a primary key: one statement per row, still fine.
+    let flags = vec![Flag { name: "x".into() }, Flag { name: "y".into() }];
+    assert_eq!(Flag::insert_many(db, &flags).await.unwrap(), flags);
+
+    // Bulk upsert: existing SKUs are updated (keeping their IDs and
+    // created_at), new ones inserted, all in input order.
+    let existing = Product::query().filter(Product::SKU.is_in(["SKU-00002", "SKU-00001"])).order_by(Product::SKU.desc()).all(db).await.unwrap();
+    let later = Utc::now() + chrono::Duration::seconds(5);
+    let mut changes = vec![
+        Product { name: "renamed 2".into(), price: 999, ..existing[0].clone() },
+        Product { sku: "NEW-1".into(), name: "new".into(), ..product(0) },
+        Product { name: "renamed 1".into(), ..existing[1].clone() },
+    ];
+    for change in &mut changes {
+        change.created_at = later;
+    }
+    let upserted = Product::upsert_many(db, &changes, OnConflict::on(Product::SKU)).await.unwrap();
+    assert_eq!(upserted.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["renamed 2", "new", "renamed 1"]);
+    assert_eq!((upserted[0].id, upserted[0].price), (existing[0].id, 999));
+    assert_eq!(upserted[2].id, existing[1].id);
+    assert_eq!(upserted[0].created_at, existing[0].created_at, "created_at is kept");
+    assert!(upserted[1].id > 0 && upserted[1].id != existing[0].id);
+    assert_eq!(Product::query().count(db).await.unwrap(), 2501);
+    // Limiting the update.
+    let price_only = vec![Product { name: "ignored".into(), price: 1, ..existing[0].clone() }];
+    let updated = Product::upsert_many(db, &price_only, OnConflict::on(Product::SKU).update(Product::PRICE)).await.unwrap();
+    assert_eq!((updated[0].name.as_str(), updated[0].price), ("renamed 2", 1));
+    // Many rows across chunks.
+    let refresh: Vec<Product> = (0..2100).map(|i| Product { price: -1, ..product(i) }).collect();
+    let refreshed = Product::upsert_many(db, &refresh, OnConflict::on(Product::SKU)).await.unwrap();
+    assert_eq!(refreshed.len(), 2100);
+    assert!(refreshed.iter().zip(&refresh).all(|(s, r)| s.sku == r.sku && s.price == -1));
+    assert_eq!(Product::query().count(db).await.unwrap(), 2501);
+
+    // The same key twice in one call is refused before anything is written.
+    let twice = vec![Product { price: 7, ..product(10) }, Product { price: 8, ..product(10) }, product(9000)];
+    let refused = Product::upsert_many(db, &twice, OnConflict::on(Product::SKU)).await;
+    assert!(matches!(&refused, Err(Error::Config(m)) if m.contains("same conflict key")), "{:?}", refused.map(|r| r.len()));
+    assert_eq!(Product::query().filter(Product::PRICE.eq(7)).count(db).await.unwrap(), 0);
+    assert_eq!(Product::query().count(db).await.unwrap(), 2501);
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -916,6 +997,7 @@ backend_tests!(
     enums,
     upserts,
     json_filters,
+    bulk_inserts,
 );
 
 #[test]

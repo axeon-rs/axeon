@@ -609,6 +609,12 @@ impl<M: Model> Query<M> {
         self
     }
 
+    #[cfg(feature = "mysql")]
+    pub(crate) fn order_by_column(mut self, column: &'static str) -> Self {
+        self.order.push(Sort { term: SortTerm::Column(column), descending: false, qualifier: None });
+        self
+    }
+
     /// Sorts by a column (or an [`Order::raw`] expression); call again for
     /// tie-breakers.
     pub fn order_by(mut self, order: Order<M>) -> Self {

@@ -111,6 +111,22 @@ Post::query().filter(Post::PUBLISHED.eq(false)).delete(&db).await?;
 Columns are typed constants, so `User::EMAIL.eq(42)` or filtering users by
 a post column doesn't compile.
 
+### Bulk inserts
+
+Insert many rows with a few statements instead of one per row (about 9×
+faster on a local PostgreSQL for 2500 rows, more over a network):
+
+```rust
+let stored: Vec<Product> = Product::insert_many(&db, &products).await?;   // with IDs, in input order
+let synced = Product::upsert_many(&db, &products, OnConflict::on(Product::SKU)).await?;
+```
+
+Rows are sent up to 1000 per statement, within each database's parameter
+limit. With `&db`, several statements run in one transaction, so a failure
+inserts nothing; with `&mut tx`, they're part of yours. A conflict key may
+appear only once per `upsert_many` call; that's checked before anything is
+written.
+
 ### Upserts
 
 Insert a row, or update the one that already has the same unique columns,

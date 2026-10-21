@@ -375,6 +375,26 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                 ::axeon_orm::__private::insert(ex, &self).await
             }
 
+            /// Inserts `rows` with as few statements as possible (one per 1000 rows or so),
+            /// returning the stored rows, with database-assigned values, in the same order.
+            /// Several statements on a pool run in one transaction: all rows or none.
+            pub async fn insert_many<'c>(
+                ex: impl ::axeon_orm::Executor<'c>,
+                rows: &[Self],
+            ) -> ::axeon_orm::Result<::std::vec::Vec<Self>> {
+                ::axeon_orm::__private::insert_many(ex, rows).await
+            }
+
+            /// Like `insert_many`, updating rows whose `conflict` columns already exist (see
+            /// `upsert`). A key may appear only once per call.
+            pub async fn upsert_many<'c>(
+                ex: impl ::axeon_orm::Executor<'c>,
+                rows: &[Self],
+                conflict: ::axeon_orm::OnConflict<Self>,
+            ) -> ::axeon_orm::Result<::std::vec::Vec<Self>> {
+                ::axeon_orm::__private::upsert_many(ex, rows, &conflict).await
+            }
+
             /// Inserts this record or, if a row with the same `conflict` columns exists, updates
             /// it; returns the stored row.
             pub async fn upsert<'c>(
