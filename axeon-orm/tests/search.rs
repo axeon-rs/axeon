@@ -4,7 +4,6 @@
 
 use axeon_orm::search::{self, FullText};
 use axeon_orm::{Db, Error, Model};
-use std::collections::HashMap;
 
 #[derive(Model, Clone, Debug, PartialEq)]
 #[model(table = "articles")]
@@ -133,6 +132,7 @@ async fn stored_columns_and_indexes() {
 #[tokio::test]
 async fn hybrid_scores_combine_text_and_vectors() {
     use axeon_orm::vector::Vector;
+    use std::collections::HashMap;
 
     #[derive(Model, Clone, Debug)]
     struct Item {
