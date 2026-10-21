@@ -182,6 +182,7 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         let (col, ty) = (&f.column, &f.ty);
         let mut def = quote! {
             ::axeon_orm::ColumnDef::new(#col, <#ty as ::axeon_orm::SqlType>::KIND, <#ty as ::axeon_orm::SqlType>::NULLABLE)
+                .values(<#ty as ::axeon_orm::SqlType>::VALUES)
         };
         if std::ptr::eq(*f, pk) {
             def = quote! { #def.primary_key() };
@@ -410,7 +411,7 @@ fn unraw(ident: &Ident) -> String {
 }
 
 /// `UserProfile` → `user_profile`, `HTTPLog` → `http_log`.
-fn snake_case(name: &str) -> String {
+pub(crate) fn snake_case(name: &str) -> String {
     let chars: Vec<char> = name.chars().collect();
     let mut out = String::new();
     for (i, c) in chars.iter().enumerate() {

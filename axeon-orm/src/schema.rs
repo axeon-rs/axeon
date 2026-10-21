@@ -92,6 +92,10 @@ fn column_sql(column: &ColumnDef, backend: Backend) -> String {
     if column.unique {
         sql.push_str(" UNIQUE");
     }
+    if let Some(values) = column.values {
+        let values: Vec<String> = values.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect();
+        sql.push_str(&format!(" CHECK ({} IN ({}))", name, values.join(", ")));
+    }
     let now = match (backend, column.kind) {
         #[cfg(feature = "chrono")]
         (Backend::MySql, Kind::DateTime | Kind::NaiveDateTime) => "CURRENT_TIMESTAMP(6)",

@@ -93,6 +93,57 @@
 //! and with features `chrono`, `uuid` and `json` their types. Match the
 //! integer width to the column: `i32` for `INTEGER`, `i64` for `BIGINT`.
 //!
+//! # Enums
+//!
+//! `#[derive(SqlEnum)]` lets a fieldless enum be a column. It is stored as
+//! text, as the variant name in snake case unless renamed, so it works the
+//! same on every database:
+//!
+//! ```
+//! use axeon_orm::{Db, Model, SqlEnum};
+//!
+//! #[derive(SqlEnum, Clone, Copy, Debug, PartialEq)]
+//! enum Status {
+//!     Pending,                 // "pending"
+//!     InReview,                // "in_review"
+//!     #[sql_enum(rename = "ok")]
+//!     Approved,                // "ok"
+//! }
+//!
+//! #[derive(Model)]
+//! struct Case {
+//!     id: i64,
+//!     status: Status,
+//!     previous: Option<Status>,
+//! }
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> axeon_orm::Result<()> {
+//! # let db = Db::connect("sqlite::memory:").await?;
+//! # db.create_table::<Case>().await?;
+//! Case { id: 0, status: Status::InReview, previous: None }.insert(&db).await?;
+//! let open = Case::query()
+//!     .filter(Case::STATUS.is_in([Status::Pending, Status::InReview]))
+//!     .count(&db)
+//!     .await?;
+//! assert_eq!(open, 1);
+//! assert_eq!(Status::InReview.as_str(), "in_review");
+//! assert_eq!("ok".parse::<Status>().unwrap(), Status::Approved);
+//! # Ok(()) }
+//! ```
+//!
+//! `#[sql_enum(rename_all = "...")]` on the enum picks another case:
+//! `SCREAMING_SNAKE_CASE`, `kebab-case`, `lowercase`, `UPPERCASE`,
+//! `camelCase` or `PascalCase`. The derive also gives `Status::VALUES`,
+//! `as_str()`, `Display` and `FromStr`. [`schema::create_table`] adds a
+//! `CHECK` constraint listing the values. Reading a value the enum doesn't
+//! have (say, written by a newer release) is an [`Error::Decode`], not a
+//! panic.
+//!
+//! Native PostgreSQL enum types (`CREATE TYPE ... AS ENUM`) aren't
+//! supported: use a `TEXT` column, where adding a value is a code change
+//! (and a new `CHECK`), not an `ALTER TYPE`.
+//!
 //! # Features
 //!
 //! | Feature | Default | Enables |
@@ -150,10 +201,14 @@ pub use crate::error::{Error, Result};
 pub use crate::model::{ColumnDef, Model, Reference, Timestamp};
 pub use crate::query::{Assignment, Column, Expr, JoinQuery, Numeric, Order, Page, Query, RawArgs};
 pub use crate::relation::{BelongsTo, BelongsToMany, HasMany, HasOne, Join, Related, Relation};
-pub use crate::value::{Kind, SqlType, Value};
+pub use crate::value::{Kind, SqlType, UnknownVariant, Value};
 
 /// Derives [`Model`](trait@Model); see the [crate docs](crate#defining-models).
 pub use axeon_orm_macros::Model;
+
+/// Derives [`SqlType`] for a fieldless enum, stored as text; see the
+/// [crate docs](crate#enums).
+pub use axeon_orm_macros::SqlEnum;
 
 /// Embeds a folder of migrations in the binary at compile time and returns
 /// a [`Migrator`](migrate::Migrator). The path is relative to the crate's
@@ -173,6 +228,10 @@ pub mod prelude {
 pub mod __private {
     pub use crate::db::Conn;
     pub use crate::model::{column_name, delete, find, has_column, insert, update};
+
+    pub fn decode_error(column: &str, error: impl std::fmt::Display) -> crate::Error {
+        crate::Error::decode(column, error)
+    }
 }
 
 /// Mistakes the derive and the typed API reject at compile time.
@@ -217,6 +276,38 @@ pub mod __private {
 /// ```compile_fail
 /// #[derive(axeon_orm::Model)]
 /// struct User { id: i64, tags: std::collections::HashMap<String, String> }
+/// ```
+///
+/// An enum variant holding data:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::SqlEnum)]
+/// enum Status { Open, Closed(String) }
+/// ```
+///
+/// Two variants stored as the same value:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::SqlEnum)]
+/// enum Status { Open, #[sql_enum(rename = "open")] Reopened }
+/// ```
+///
+/// An unknown case:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::SqlEnum)]
+/// #[sql_enum(rename_all = "Title Case")]
+/// enum Status { Open }
+/// ```
+///
+/// Comparing an enum column with a string:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::SqlEnum)]
+/// enum Status { Open }
+/// #[derive(axeon_orm::Model)]
+/// struct Case { id: i64, status: Status }
+/// let _ = Case::query().filter(Case::STATUS.eq("open"));
 /// ```
 #[doc(hidden)]
 pub mod compile_fail_tests {}

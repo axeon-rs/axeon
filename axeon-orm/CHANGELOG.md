@@ -30,6 +30,13 @@
   with `listen`, `unlisten`, `recv`, `try_recv` (`None` after a dropped
   connection, so callers can catch up) and `into_stream`. Reconnects by
   itself. Other databases return `Error::Config`.
+- **Enums:** `#[derive(SqlEnum)]` makes a fieldless enum a column type,
+  stored as text (snake case by default; `rename_all` and per-variant
+  `rename`). Generated tables get a `CHECK` constraint with the values,
+  and unknown values read from the database are an `Error::Decode`. The
+  derive also adds `VALUES`, `as_str()`, `Display` and `FromStr` (with
+  the new `UnknownVariant` error). `SqlType` gains a `VALUES` constant
+  and `ColumnDef` a `values` field.
 - `From` conversions into `Value` for `serde_json::Value`, `Uuid` and the
   chrono types.
 - **Joins:** `join` and `left_join` over `belongs_to`, `has_one` and

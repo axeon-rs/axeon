@@ -48,6 +48,38 @@ The table is the struct name in snake case, pluralized (`users`, `posts`),
 and the primary key is `id` unless you say otherwise. Integer keys are
 assigned by the database.
 
+### Enums
+
+Derive `SqlEnum` on a fieldless enum to use it as a column. It's stored as
+text (the variant in snake case unless renamed), so it works the same on
+every database, and generated tables get a `CHECK` listing the values:
+
+```rust
+use axeon_orm::SqlEnum;
+
+#[derive(SqlEnum, Clone, Copy, Debug, PartialEq)]
+enum Status {
+    Pending,                    // "pending"
+    InReview,                   // "in_review"
+    #[sql_enum(rename = "ok")]
+    Approved,                   // "ok"
+}
+
+#[derive(Model)]
+struct Case { id: i64, status: Status, previous: Option<Status> }
+
+let open = Case::query()
+    .filter(Case::STATUS.is_in([Status::Pending, Status::InReview]))
+    .all(&db)
+    .await?;
+```
+
+`#[sql_enum(rename_all = "SCREAMING_SNAKE_CASE")]` (or `kebab-case`,
+`lowercase`, `UPPERCASE`, `camelCase`, `PascalCase`) changes the case. You
+also get `Status::VALUES`, `as_str()`, `Display` and `FromStr`. A row
+holding a value the enum doesn't know is a decode error, not a panic.
+Native PostgreSQL `ENUM` types aren't supported; use `TEXT`.
+
 ## Queries
 
 ```rust

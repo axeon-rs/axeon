@@ -8,7 +8,7 @@
 #![cfg(all(feature = "chrono", feature = "json"))]
 
 use axeon_orm::migrate::{Migration, Migrator};
-use axeon_orm::{schema, Backend, Db, Error, Expr, Model, Order};
+use axeon_orm::{schema, Backend, Db, Error, Expr, Model, Order, SqlEnum};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
@@ -541,6 +541,87 @@ async fn row_locks(db: &Db) {
     tx.rollback().await.unwrap();
 }
 
+#[derive(SqlEnum, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Status {
+    Pending,
+    InReview,
+    #[sql_enum(rename = "o'k")]
+    Approved,
+}
+
+#[derive(SqlEnum, Clone, Copy, Debug, PartialEq)]
+#[sql_enum(rename_all = "SCREAMING_SNAKE_CASE")]
+enum Priority {
+    Low,
+    VeryHigh,
+}
+
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Ticket {
+    id: i64,
+    #[model(index)]
+    status: Status,
+    priority: Priority,
+    previous: Option<Status>,
+}
+
+/// The `tickets` table seen as plain text, without the `CHECK`.
+#[derive(Model)]
+#[model(table = "tickets")]
+struct RawTicket {
+    id: i64,
+    status: String,
+    priority: String,
+    previous: Option<String>,
+}
+
+async fn enums(db: &Db) {
+    db.create_table::<Ticket>().await.unwrap();
+    let ticket = |status, priority, previous| Ticket { id: 0, status, priority, previous };
+    let a = ticket(Status::Pending, Priority::Low, None).insert(db).await.unwrap();
+    ticket(Status::InReview, Priority::VeryHigh, Some(Status::Pending)).insert(db).await.unwrap();
+    ticket(Status::Approved, Priority::Low, Some(Status::InReview)).insert(db).await.unwrap();
+
+    assert_eq!(Ticket::find_or_fail(db, a.id).await.unwrap(), a);
+    let count = |e: Expr<Ticket>| Ticket::query().filter(e).count(db);
+    assert_eq!(count(Ticket::STATUS.eq(Status::Approved)).await.unwrap(), 1);
+    assert_eq!(count(Ticket::STATUS.is_in([Status::Pending, Status::InReview])).await.unwrap(), 2);
+    assert_eq!(count(Ticket::PREVIOUS.is_null()).await.unwrap(), 1);
+    assert_eq!(count(Ticket::PREVIOUS.eq(Status::Pending)).await.unwrap(), 1);
+    assert_eq!(count(Expr::raw("status <> ?", (Status::Pending,))).await.unwrap(), 2);
+    let by_priority = Ticket::query().count_by(db, Ticket::PRIORITY).await.unwrap();
+    assert_eq!(by_priority, [(Priority::Low, 2), (Priority::VeryHigh, 1)]);
+
+    // Stored as text, as named.
+    let raw = RawTicket::query().order_by(RawTicket::ID.asc()).all(db).await.unwrap();
+    let stored: Vec<_> = raw.iter().map(|t| (t.status.as_str(), t.priority.as_str(), t.previous.as_deref())).collect();
+    assert_eq!(stored, [("pending", "LOW", None), ("in_review", "VERY_HIGH", Some("pending")), ("o'k", "LOW", Some("in_review"))]);
+
+    Ticket::query().filter(Ticket::ID.eq(a.id)).update(db, [Ticket::STATUS.set(Status::Approved), Ticket::PREVIOUS.set(Status::Pending)]).await.unwrap();
+    let mut a = Ticket::find_or_fail(db, a.id).await.unwrap();
+    assert_eq!((a.status, a.previous), (Status::Approved, Some(Status::Pending)));
+    a.status = Status::InReview;
+    a.previous = None;
+    a.update(db).await.unwrap();
+    assert_eq!(Ticket::find_or_fail(db, a.id).await.unwrap(), a);
+
+    // The CHECK constraint refuses other values.
+    let bad = RawTicket { id: 0, status: "lost".into(), priority: "LOW".into(), previous: None }.insert(db).await;
+    assert!(bad.is_err(), "CHECK let an unknown value in");
+
+    // Reading an unknown value is an error, not a panic.
+    db.drop_table::<Ticket>().await.unwrap();
+    db.create_table::<RawTicket>().await.unwrap();
+    RawTicket { id: 0, status: "archived".into(), priority: "LOW".into(), previous: None }.insert(db).await.unwrap();
+    match Ticket::query().first(db).await {
+        Err(Error::Decode { column, message }) => {
+            assert_eq!(column, "status");
+            assert!(message.contains(r#""archived" is not a Status value"#), "{}", message);
+        }
+        other => panic!("expected a decode error, got {:?}", other),
+    }
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -622,7 +703,27 @@ backend_tests!(
     relation_filters_and_joins,
     raw_expressions,
     row_locks,
+    enums,
 );
+
+#[test]
+fn enum_helpers() {
+    assert_eq!(Status::VALUES, ["pending", "in_review", "o'k"]);
+    assert_eq!(Priority::VALUES, ["LOW", "VERY_HIGH"]);
+    assert_eq!(Status::InReview.as_str(), "in_review");
+    assert_eq!(Priority::VeryHigh.to_string(), "VERY_HIGH");
+    assert_eq!("o'k".parse::<Status>(), Ok(Status::Approved));
+    let err = "Pending".parse::<Status>().unwrap_err();
+    assert_eq!((err.value(), err.to_string().as_str()), ("Pending", r#""Pending" is not a Status value"#));
+
+    let pg = schema::create_table::<Ticket>(Backend::Postgres);
+    assert!(pg.contains(r#""status" TEXT NOT NULL CHECK ("status" IN ('pending', 'in_review', 'o''k'))"#), "{}", pg);
+    assert!(pg.contains(r#""previous" TEXT CHECK ("previous" IN ('pending', 'in_review', 'o''k'))"#), "{}", pg);
+    let my = schema::create_table::<Ticket>(Backend::MySql);
+    assert!(my.contains("`status` VARCHAR(255) NOT NULL CHECK (`status` IN ('pending', 'in_review', 'o''k'))"), "{}", my);
+    assert!(my.contains("`priority` TEXT NOT NULL CHECK (`priority` IN ('LOW', 'VERY_HIGH'))"), "{}", my);
+}
+
 
 #[test]
 #[should_panic(expected = "has 2 placeholder(s) but 1 value(s)")]

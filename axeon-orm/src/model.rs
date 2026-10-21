@@ -89,6 +89,9 @@ pub struct ColumnDef {
     pub timestamp: Option<Timestamp>,
     /// A foreign key.
     pub references: Option<Reference>,
+    /// The only values allowed, for a [`SqlEnum`](derive@crate::SqlEnum)
+    /// column.
+    pub values: Option<&'static [&'static str]>,
 }
 
 impl ColumnDef {
@@ -106,6 +109,7 @@ impl ColumnDef {
             default_sql: None,
             timestamp: None,
             references: None,
+            values: None,
         }
     }
 
@@ -138,6 +142,12 @@ impl ColumnDef {
     #[doc(hidden)]
     pub const fn timestamp(mut self, timestamp: Timestamp) -> Self {
         self.timestamp = Some(timestamp);
+        self
+    }
+
+    #[doc(hidden)]
+    pub const fn values(mut self, values: Option<&'static [&'static str]>) -> Self {
+        self.values = values;
         self
     }
 
