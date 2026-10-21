@@ -9,12 +9,12 @@ authors = ["sketch"]
 repository = "https://github.com/axeon-rs/axeon"
 documentation = "https://docs.rs/axeon"
 readme = "README.md"
-exclude = ["examples/todo-api", "benchmarks", "axeon-orm", "axeon-orm-macros", "axeon-orm-cli", ".github"]
+exclude = ["examples/todo-api", "benchmarks", "axeon-orm", "axeon-orm-macros", "axeon-orm-cli", "axeon-jobs", ".github"]
 keywords = ["web", "framework", "server", "http", "async"]
 categories = ["web-programming::http-server", "asynchronous"]
 
 [workspace]
-members = [".", "axeon-orm", "axeon-orm-macros", "axeon-orm-cli"]
+members = [".", "axeon-orm", "axeon-orm-macros", "axeon-orm-cli", "axeon-jobs"]
 
 [package.metadata.docs.rs]
 all-features = true

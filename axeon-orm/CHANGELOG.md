@@ -45,6 +45,8 @@
   when the row exists. `ON CONFLICT` on PostgreSQL and SQLite, `ON
   DUPLICATE KEY UPDATE` on MySQL (8.0.19+), where an ignored insert
   doesn't fail the transaction.
+- `Transaction::postgres`, `sqlite` and `mysql`: the underlying sqlx
+  connection, for raw queries inside an ORM transaction.
 - `From` conversions into `Value` for `serde_json::Value`, `Uuid` and the
   chrono types.
 - **Joins:** `join` and `left_join` over `belongs_to`, `has_one` and

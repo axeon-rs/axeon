@@ -366,6 +366,39 @@ impl Transaction {
     pub async fn execute(&mut self, sql: &str) -> Result<()> {
         Conn::Tx(self).execute_raw(sql.to_string()).await
     }
+
+    /// The underlying sqlx connection, for queries the ORM can't express,
+    /// run inside this transaction. [`commit`](Transaction::commit) doesn't
+    /// see whether statements run here failed: after an error on
+    /// PostgreSQL, which aborts the transaction, roll back.
+    #[cfg(feature = "postgres")]
+    pub fn postgres(&mut self) -> Option<&mut sqlx::PgConnection> {
+        match &mut self.inner {
+            Tx::Postgres(tx) => Some(&mut **tx),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// The underlying sqlx connection; see [`postgres`](Transaction::postgres).
+    #[cfg(feature = "sqlite")]
+    pub fn sqlite(&mut self) -> Option<&mut sqlx::SqliteConnection> {
+        match &mut self.inner {
+            Tx::Sqlite(tx) => Some(&mut **tx),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// The underlying sqlx connection; see [`postgres`](Transaction::postgres).
+    #[cfg(feature = "mysql")]
+    pub fn mysql(&mut self) -> Option<&mut sqlx::MySqlConnection> {
+        match &mut self.inner {
+            Tx::MySql(tx) => Some(&mut **tx),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
 }
 
 /// A row returned by the database.

@@ -226,6 +226,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "axeon-jobs"
+version = "0.1.0"
+dependencies = [
+ "axeon",
+ "axeon-orm",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "axeon-orm"
 version = "0.2.0"
 dependencies = [
@@ -416,6 +431,7 @@ checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "num-traits",
+ "serde",
  "windows-link",
 ]
 
