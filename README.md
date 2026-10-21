@@ -484,12 +484,23 @@ let mut app = Server::new();
 app.max_connections(10_000)                    // default 1024; extra clients wait
     .keep_alive(Duration::from_secs(15))       // idle connections, default 5s
     .request_timeout(Duration::from_secs(10))  // headers, body, TLS handshake; default 30s
+    .handler_timeout(Duration::from_secs(15))  // 503 if a handler takes longer; default none
     .write_timeout(Duration::from_secs(10))    // clients that stop reading; default 30s
     .shutdown_delay(Duration::from_secs(5))    // stay up but not-ready after SIGTERM
     .shutdown_timeout(Duration::from_secs(20)) // then wait this long for requests
     .max_body_size(1024 * 1024)                // 413 above this; default 2 MiB
     .max_header_size(16 * 1024);               // 431 above this; default 16 KiB
+
+// Routes can override the handler timeout, longer or shorter, or opt out.
+app.route("/v1/products").timeout(Duration::from_secs(2)).get(|_req| async { "[]" });
+app.route("/documents").stream_body().timeout(Duration::from_secs(300)).post(|_req| async { "stored" });
+app.route("/assistant").no_timeout().post(|_req| async { "streamed" });
 ```
+
+A timed-out handler is cancelled at its next `.await` (an open transaction
+rolls back) and the client gets 503. Global middleware such as logging and
+metrics still sees the response. A streamed response only has to start in
+time; a `stream_body` handler reads its body within the limit.
 
 HTTPS is `app.with_tls("cert.pem", "key.pem")`; HTTP/2 is negotiated
 automatically.
@@ -521,8 +532,9 @@ app.middleware(SetRequestId::new())
 Application metrics go on the same registry and endpoint:
 
 ```rust
-use axeon::metrics::DEFAULT_BUCKETS;
+use axeon::metrics::{Metrics, DEFAULT_BUCKETS};
 
+let metrics = Metrics::new(); // the one passed to `app.middleware` above
 let tokens = metrics.counter_vec("llm_tokens_total", "LLM tokens used.", &["model"]);
 let queue = metrics.gauge_vec("queue_depth", "Jobs waiting.", &["queue"]);
 let step = metrics.histogram("workflow_step_seconds", "Step duration.", &DEFAULT_BUCKETS);

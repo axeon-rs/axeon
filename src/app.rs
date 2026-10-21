@@ -112,6 +112,7 @@ pub struct Server {
     write_timeout: Duration,
     shutdown_timeout: Duration,
     shutdown_delay: Duration,
+    handler_timeout: Option<Duration>,
     limits: Limits,
     router: Router,
     /// Middleware that wraps every request.
@@ -141,6 +142,7 @@ impl Server {
             write_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(30),
             shutdown_delay: Duration::ZERO,
+            handler_timeout: None,
             limits: Limits {
                 max_header_size: 16 * 1024,
                 max_headers: 100,
@@ -175,6 +177,22 @@ impl Server {
     /// request body, and to complete a TLS handshake. Default: 30 seconds.
     pub fn request_timeout(&mut self, request_timeout: Duration) -> &mut Self {
         self.request_timeout = request_timeout;
+        self
+    }
+
+    /// How long each route's middleware and handler may take to produce a
+    /// response; after that the handler is cancelled and the client gets
+    /// 503 ([`ServerError::HandlerTimeout`]). Routes can override it with
+    /// [`RouteBuilder::timeout`](crate::RouteBuilder::timeout) or
+    /// [`no_timeout`](crate::RouteBuilder::no_timeout). Global middleware
+    /// (logging, metrics) runs outside the limit, so it records the 503.
+    /// Default: no limit.
+    ///
+    /// Cancelled handlers stop at their next `.await`, and anything they
+    /// hold is dropped (an open transaction rolls back), so spawn work that
+    /// must finish. Streamed responses only have to start in time.
+    pub fn handler_timeout(&mut self, limit: Duration) -> &mut Self {
+        self.handler_timeout = Some(limit);
         self
     }
 
@@ -713,7 +731,7 @@ impl App {
         if !server.global.errors.is_empty() {
             return Err(format!("invalid middleware configuration: {}", server.global.errors.join("; ")).into());
         }
-        let router = server.router.compile(on_error.clone())?;
+        let router = server.router.compile(on_error.clone(), server.handler_timeout)?;
         if HeaderValue::from_str(&server.static_cache_control).is_err() {
             return Err(format!("invalid static Cache-Control value {:?}", server.static_cache_control).into());
         }
@@ -1068,6 +1086,7 @@ async fn handle_options(routes: &HashMap<Method, Route>, allow: String, req: Req
     let on_error = template.and_then(|route| route.chain.on_error.clone());
     let route = Route {
         body: Default::default(),
+        timeout: None,
         chain: Arc::new(Chain {
             middlewares,
             on_error,

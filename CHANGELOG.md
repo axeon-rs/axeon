@@ -38,6 +38,12 @@ release, WebSocket and JWT types are now Axeon's own:
 - `rust-version = "1.88"`, tested in CI, and a documented
   [stability policy](README.md#stability).
 - CI runs the test suite on Windows.
+- **Handler timeouts:** `Server::handler_timeout` (off by default) and
+  per-route `RouteBuilder::timeout` / `no_timeout`, kept through
+  `mount`. A handler that runs over is cancelled and answered with 503,
+  the new `ServerError::HandlerTimeout`; route middleware counts toward
+  the limit, global middleware sees the 503, and streamed responses only
+  have to start in time.
 - **Application metrics:** `Metrics::counter`, `gauge` and `histogram`
   (and `_vec` variants with labels) register metrics on the same registry
   and `/metrics` endpoint as the HTTP metrics. Handles are cheap to clone
