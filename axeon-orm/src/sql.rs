@@ -39,6 +39,64 @@ pub(crate) enum Cond {
     Or(Vec<Cond>),
     Not(Box<Cond>),
     Raw(Fragment),
+    #[cfg(feature = "json")]
+    Json(&'static str, JsonPath, JsonTest),
+}
+
+/// A step into a JSON document: an object key or an array index.
+#[cfg(feature = "json")]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PathStep {
+    Key(String),
+    Index(i32),
+}
+
+/// A path into a JSON column, from the document's root.
+#[cfg(feature = "json")]
+pub(crate) type JsonPath = Vec<PathStep>;
+
+/// What a JSON condition checks.
+#[cfg(feature = "json")]
+#[derive(Clone, Debug)]
+pub(crate) enum JsonTest {
+    /// The document contains this JSON (PostgreSQL `@>`).
+    Contains(Value),
+    /// The top-level object has this key (PostgreSQL `?`).
+    HasKey(String),
+    /// The path exists (its value may be JSON `null`).
+    Exists,
+    /// The string at the path compared with `op`.
+    Text(&'static str, Value),
+    /// The string at the path is (not) one of these.
+    TextIn(Vec<Value>, bool),
+    /// The number at the path compared with `op`; non-numbers don't match.
+    Number(&'static str, f64),
+    /// The value at the path is this boolean.
+    Bool(bool),
+}
+
+/// A SQL/JSON path string for SQLite and MySQL: `$."a"[0]."b"`.
+#[cfg(feature = "json")]
+fn json_path_string(path: &[PathStep]) -> String {
+    let mut out = String::from("$");
+    for step in path {
+        match step {
+            PathStep::Key(key) => {
+                out.push_str(".\"");
+                for c in key.chars() {
+                    if c == '"' || c == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(c);
+                }
+                out.push('"');
+            }
+            PathStep::Index(i) => {
+                let _ = write!(out, "[{}]", i);
+            }
+        }
+    }
+    out
 }
 
 /// Raw SQL from [`Expr::raw`](crate::Expr::raw) or
@@ -103,6 +161,8 @@ pub(crate) struct Sort {
 pub(crate) enum SortTerm {
     Column(&'static str),
     Raw(Fragment),
+    #[cfg(feature = "json")]
+    Json(&'static str, JsonPath),
 }
 
 /// SQL text with its parameters, numbered for the target database.
@@ -175,6 +235,12 @@ impl Sql {
                 }
                 SortTerm::Raw(fragment) => {
                     self.push("(").fragment(fragment).push(")");
+                }
+                #[cfg(feature = "json")]
+                SortTerm::Json(column, path) => {
+                    let previous = std::mem::replace(&mut self.qualifier, sort.qualifier);
+                    self.json_value(column, path);
+                    self.qualifier = previous;
                 }
             }
             self.push(if sort.descending { " DESC" } else { " ASC" });
@@ -301,6 +367,192 @@ impl Sql {
             // Parenthesized, so `OR` inside the fragment can't escape it.
             Cond::Raw(fragment) => {
                 self.push("(").fragment(fragment).push(")");
+            }
+            // Never NULL (a missing key would make it unknown), so `!` gives
+            // exactly the other rows. PostgreSQL's `@>` and `?` stay bare
+            // so a GIN index can serve them; only a NULL column makes them
+            // NULL, which `AND column IS NOT NULL` turns into false.
+            #[cfg(feature = "json")]
+            Cond::Json(column, path, test) => {
+                if self.backend == Backend::Postgres && matches!(test, JsonTest::Contains(_) | JsonTest::HasKey(_)) {
+                    self.push("(");
+                    self.json_cond(column, path, test);
+                    self.push(" AND ").column(column).push(" IS NOT NULL)");
+                } else {
+                    self.push("COALESCE((");
+                    self.json_cond(column, path, test);
+                    self.push("), FALSE)");
+                }
+            }
+        }
+    }
+
+    /// The JSON value at `path` (path keys are bound, never inlined):
+    /// jsonb in PostgreSQL, JSON in MySQL, an SQL value in SQLite.
+    #[cfg(feature = "json")]
+    fn json_value(&mut self, column: &str, path: &[PathStep]) {
+        match self.backend {
+            Backend::Postgres => {
+                self.column(column);
+                for step in path {
+                    self.push(" -> ");
+                    self.path_step(step);
+                }
+            }
+            Backend::MySql => {
+                self.push("JSON_EXTRACT(").column(column).push(", ").arg(Value::Text(json_path_string(path))).push(")");
+            }
+            Backend::Sqlite => {
+                self.push("json_extract(").column(column).push(", ").arg(Value::Text(json_path_string(path))).push(")");
+            }
+        }
+    }
+
+    /// A PostgreSQL path step, cast so that `->` picks the right overload,
+    /// and so key and index paths never share a cached statement.
+    #[cfg(feature = "json")]
+    fn path_step(&mut self, step: &PathStep) {
+        match step {
+            PathStep::Key(key) => self.arg(Value::Text(key.clone())).push("::text"),
+            PathStep::Index(i) => self.arg(Value::I32(*i)).push("::int"),
+        };
+    }
+
+    /// The string at `path` as text; other JSON values give their text in
+    /// PostgreSQL and MySQL.
+    #[cfg(feature = "json")]
+    fn json_text(&mut self, column: &str, path: &[PathStep]) {
+        match (self.backend, path.split_last()) {
+            (Backend::Postgres, Some((last, init))) => {
+                self.push("(");
+                self.json_value(column, init);
+                self.push(" ->> ");
+                self.path_step(last);
+                self.push(")");
+            }
+            (Backend::MySql, _) => {
+                self.push("JSON_UNQUOTE(");
+                self.json_value(column, path);
+                self.push(")");
+            }
+            _ => self.json_value(column, path),
+        }
+    }
+
+    /// The JSON type of the value at `path`, lower-case in every database
+    /// (`number` / `integer` / `real` / `double` vary), or NULL if missing.
+    #[cfg(feature = "json")]
+    fn json_type(&mut self, column: &str, path: &[PathStep]) {
+        match self.backend {
+            Backend::Postgres => {
+                self.push("jsonb_typeof(");
+                self.json_value(column, path);
+                self.push(")");
+            }
+            Backend::MySql => {
+                self.push("LOWER(JSON_TYPE(");
+                self.json_value(column, path);
+                self.push("))");
+            }
+            Backend::Sqlite => {
+                self.push("json_type(").column(column).push(", ").arg(Value::Text(json_path_string(path))).push(")");
+            }
+        }
+    }
+
+    /// `= <the JSON string type>`: SQLite's `json_type` calls it `text`.
+    #[cfg(feature = "json")]
+    fn json_string_type(&self) -> &'static str {
+        match self.backend {
+            Backend::Sqlite => " = 'text' AND ",
+            _ => " = 'string' AND ",
+        }
+    }
+
+    #[cfg(feature = "json")]
+    fn json_cond(&mut self, column: &str, path: &[PathStep], test: &JsonTest) {
+        match (test, self.backend) {
+            (JsonTest::Contains(value), Backend::Postgres) => {
+                self.column(column).push(" @> ").arg(value.clone());
+            }
+            (JsonTest::Contains(value), Backend::MySql) => {
+                self.push("JSON_CONTAINS(").column(column).push(", ").arg(value.clone()).push(")");
+            }
+            (JsonTest::Contains(_), Backend::Sqlite) => {
+                // SQLite has no JSON containment: fail with a clear error.
+                self.push("axeon_orm_json_contains_needs_postgres_or_mysql()");
+            }
+            (JsonTest::HasKey(key), Backend::Postgres) => {
+                self.column(column).push(" ? ").arg(Value::Text(key.clone()));
+            }
+            (JsonTest::HasKey(key), _) => {
+                let path = [PathStep::Key(key.clone())];
+                self.json_type(column, &path);
+                self.push(" IS NOT NULL");
+            }
+            (JsonTest::Exists, _) => {
+                self.json_type(column, path);
+                self.push(" IS NOT NULL");
+            }
+            (JsonTest::Text(op, value), _) => {
+                self.json_type(column, path);
+                self.push(self.json_string_type());
+                self.json_text(column, path);
+                self.push(" ").push(op).push(" ").arg(value.clone());
+            }
+            (JsonTest::TextIn(values, negated), _) => {
+                self.json_type(column, path);
+                self.push(self.json_string_type());
+                self.json_text(column, path);
+                self.push(if *negated { " NOT IN (" } else { " IN (" });
+                for (i, value) in values.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    self.arg(value.clone());
+                }
+                self.push(")");
+            }
+            (JsonTest::Number(op, number), backend) => {
+                // Only JSON numbers take part: no cast of a string can fail.
+                let numeric = match backend {
+                    Backend::Postgres => "('number')",
+                    Backend::MySql => "('integer', 'double', 'decimal', 'unsigned integer')",
+                    Backend::Sqlite => "('integer', 'real')",
+                };
+                self.push("CASE WHEN ");
+                self.json_type(column, path);
+                self.push(" IN ").push(numeric).push(" THEN ");
+                match backend {
+                    Backend::Postgres => {
+                        self.push("(");
+                        self.json_value(column, path);
+                        self.push(")::numeric");
+                    }
+                    Backend::MySql => {
+                        self.push("CAST(");
+                        self.json_value(column, path);
+                        self.push(" AS DOUBLE)");
+                    }
+                    Backend::Sqlite => self.json_value(column, path),
+                }
+                self.push(" END ").push(op).push(" ").arg(Value::F64(*number));
+            }
+            (JsonTest::Bool(expected), _) => {
+                self.json_type(column, path);
+                self.push(match self.backend {
+                    Backend::Sqlite => " = ",
+                    _ => " = 'boolean' AND ",
+                });
+                match self.backend {
+                    Backend::Sqlite => {
+                        self.arg(Value::Text(expected.to_string()));
+                    }
+                    _ => {
+                        self.json_text(column, path);
+                        self.push(" = ").arg(Value::Text(expected.to_string()));
+                    }
+                }
             }
         }
     }

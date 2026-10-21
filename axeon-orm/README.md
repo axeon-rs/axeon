@@ -201,6 +201,30 @@ let rows: Vec<(Post, User)> = Post::query()
 let rows: Vec<(User, Option<Profile>)> = User::query().left_join(User::PROFILE).all(&db).await?;
 ```
 
+## JSON filters
+
+Filter and sort by values inside JSON columns (`serde_json::Value` or
+`Json<T>`; `JSONB` in PostgreSQL), on every database:
+
+```rust
+let found = Product::query()
+    .filter(Product::FIELDS.contains(json!({ "certs": ["CE"] })))   // @> (GIN index)
+    .filter(Product::FIELDS.has_key("moq"))                         // ?  (GIN index)
+    .filter(Product::FIELDS.key("specs").key("color").text_in(["red", "blue"]))
+    .filter(Product::FIELDS.key("price").key("min").lte(25))
+    .filter(Product::FIELDS.key("sizes").index(0).exists())
+    .order_by(Product::FIELDS.key("price").key("min").asc())
+    .all(&db)
+    .await?;
+```
+
+Paths also have `text_eq`, `text_ne`, `text_like`, `num_eq`, `gt`, `gte`,
+`lt` and `bool_eq`. Text comparisons only match JSON strings and number
+comparisons only JSON numbers, so `"n/a"` in a price field doesn't match
+rather than failing the query. Conditions are never NULL, so `!` gives
+exactly the other rows. Keys are bound as parameters. `contains` needs
+PostgreSQL or MySQL; SQLite has no JSON containment.
+
 ## Raw SQL in queries
 
 For what typed columns can't express (JSONB, full-text search, pgvector,

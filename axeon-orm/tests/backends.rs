@@ -745,6 +745,93 @@ async fn upserts(db: &Db) {
 
 }
 
+#[derive(Model, Clone, Debug)]
+struct Item {
+    id: i64,
+    name: String,
+    fields: serde_json::Value,
+    extra: Option<sqlx::types::Json<serde_json::Value>>,
+}
+
+async fn json_filters(db: &Db) {
+    db.create_table::<Item>().await.unwrap();
+    let rows = [
+        ("lamp", json!({ "specs": { "color": "red", "watts": 40 }, "price": { "min": 12.5 }, "certs": ["CE", "RoHS"], "moq": 100, "eco": true, "sizes": ["S", "M"] })),
+        ("chair", json!({ "specs": { "color": "Red", "watts": null }, "price": { "min": 30 }, "certs": ["CE"], "eco": false, "sizes": ["L"] })),
+        ("desk", json!({ "specs": { "color": "blue" }, "price": { "min": "n/a" }, "certs": [], "a,b}": { "q\"uote": "odd" } })),
+        ("rug", json!({ "specs": { "color": "red", "watts": 7 }, "price": { "min": 9 }, "moq": null })),
+    ];
+    for (name, fields) in rows {
+        Item { id: 0, name: name.into(), fields, extra: None }.insert(db).await.unwrap();
+    }
+    Item { id: 0, name: "typed".into(), fields: json!({}), extra: Some(sqlx::types::Json(json!({ "k": "v" }))) }.insert(db).await.unwrap();
+
+    let names = |items: Vec<Item>| items.into_iter().map(|i| i.name).collect::<Vec<_>>();
+    let find = |e: Expr<Item>| Item::query().filter(e).order_by(Item::ID.asc()).all(db);
+    let f = || Item::FIELDS;
+
+    // Strings: case-sensitive, only JSON strings.
+    assert_eq!(names(find(f().key("specs").key("color").text_eq("red")).await.unwrap()), ["lamp", "rug"]);
+    assert_eq!(names(find(f().key("specs").key("color").text_ne("red")).await.unwrap()), ["chair", "desk"], "missing isn't 'not red'");
+    assert_eq!(names(find(f().key("specs").key("color").text_in(["blue", "Red"])).await.unwrap()), ["chair", "desk"]);
+    assert!(find(f().key("specs").key("color").text_in(Vec::<String>::new())).await.unwrap().is_empty());
+    assert_eq!(names(find(f().key("specs").key("color").text_like("b%")).await.unwrap()), ["desk"]);
+    assert!(find(f().key("moq").text_eq("100")).await.unwrap().is_empty(), "a number isn't text");
+
+    // Numbers: strings and nulls just don't match.
+    assert_eq!(names(find(f().key("price").key("min").lte(12.5)).await.unwrap()), ["lamp", "rug"]);
+    assert_eq!(names(find(f().key("price").key("min").gt(10)).await.unwrap()), ["lamp", "chair"]);
+    assert_eq!(names(find(f().key("price").key("min").num_eq(30)).await.unwrap()), ["chair"]);
+    assert_eq!(names(find(f().key("specs").key("watts").gte(0)).await.unwrap()), ["lamp", "rug"]);
+    assert_eq!(names(find(f().key("price").key("min").lt(1000)).await.unwrap()), ["lamp", "chair", "rug"], "\"n/a\" doesn't fail the query");
+
+    // Booleans, arrays, existence.
+    assert_eq!(names(find(f().key("eco").bool_eq(true)).await.unwrap()), ["lamp"]);
+    assert_eq!(names(find(f().key("eco").bool_eq(false)).await.unwrap()), ["chair"]);
+    assert_eq!(names(find(f().key("sizes").index(1).text_eq("M")).await.unwrap()), ["lamp"]);
+    assert_eq!(names(find(f().key("certs").index(0).exists()).await.unwrap()), ["lamp", "chair"]);
+    assert_eq!(names(find(f().key("moq").exists()).await.unwrap()), ["lamp", "rug"], "null still exists");
+    assert_eq!(names(find(f().has_key("moq")).await.unwrap()), ["lamp", "rug"]);
+    assert_eq!(names(find(!f().has_key("moq") & f().has_key("specs")).await.unwrap()), ["chair", "desk"]);
+    assert_eq!(names(find(f().key("specs").key("watts").exists() & !f().key("specs").key("watts").gte(0)).await.unwrap()), ["chair"]);
+    // Keys with special characters are bound, not spliced into the SQL. (This
+    // also follows an index path of the same shape: a regression test for
+    // PostgreSQL statement caching with differently typed parameters.)
+    assert_eq!(names(find(f().key("a,b}").key("q\"uote").text_eq("odd")).await.unwrap()), ["desk"]);
+    assert_eq!(names(find(Item::EXTRA.key("k").text_eq("v")).await.unwrap()), ["typed"], "Json<T> columns too");
+
+    // Sorting by a path.
+    let by_price = Item::query().filter(f().key("price").key("min").gte(0)).order_by(f().key("price").key("min").desc()).all(db).await.unwrap();
+    assert_eq!(names(by_price), ["chair", "lamp", "rug"]);
+    let by_color = Item::query().filter(f().key("specs").key("color").exists()).order_by(f().key("specs").key("color").asc()).order_by(Item::ID.asc());
+    let colors: Vec<String> = by_color.all(db).await.unwrap().into_iter().map(|i| i.fields["specs"]["color"].as_str().unwrap().to_string()).collect();
+    let mut sorted = colors.clone();
+    sorted.sort();
+    assert_eq!(colors, sorted);
+
+    // A NULL column matches neither a filter nor its negation's opposite.
+    assert_eq!(names(find(!Item::EXTRA.has_key("k")).await.unwrap()), ["lamp", "chair", "desk", "rug"]);
+    if db.backend() != Backend::Sqlite {
+        assert_eq!(names(find(!Item::EXTRA.contains(json!({ "k": "v" }))).await.unwrap()), ["lamp", "chair", "desk", "rug"]);
+    }
+
+    // Containment: PostgreSQL and MySQL only.
+    let contains = find(f().contains(json!({ "certs": ["RoHS"] }))).await;
+    let nested = find(f().contains(json!({ "specs": { "color": "red" } }))).await;
+    if db.backend() == Backend::Sqlite {
+        let error = contains.unwrap_err().to_string();
+        assert!(error.contains("axeon_orm_json_contains_needs_postgres_or_mysql"), "{}", error);
+    } else {
+        assert_eq!(names(contains.unwrap()), ["lamp"]);
+        assert_eq!(names(nested.unwrap()), ["lamp", "rug"]);
+        assert_eq!(names(find(f().contains(json!({ "certs": ["CE"] })) & f().key("price").key("min").lt(20)).await.unwrap()), ["lamp"]);
+    }
+
+    // With joins and updates too.
+    assert_eq!(Item::query().filter(f().key("eco").exists()).update(db, [Item::NAME.set("eco-tagged")]).await.unwrap(), 2);
+    assert_eq!(Item::query().filter(Item::NAME.eq("eco-tagged")).count(db).await.unwrap(), 2);
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -828,6 +915,7 @@ backend_tests!(
     row_locks,
     enums,
     upserts,
+    json_filters,
 );
 
 #[test]

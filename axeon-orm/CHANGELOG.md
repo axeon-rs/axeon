@@ -15,6 +15,14 @@
   integers is `i64`, `avg` is `f64`).
 - **Filtering by relations:** `has`, `doesnt_have`, `where_has` and
   `where_doesnt_have`, for every relation type.
+- **JSON filters** (feature `json`): on `serde_json::Value` and
+  `Json<T>` columns, `contains` (PostgreSQL `@>`, MySQL `JSON_CONTAINS`)
+  and `has_key` (`?`), both able to use a GIN index, and paths with
+  `key(..)` / `index(..)` for `exists`, `text_eq` / `text_ne` / `text_like`
+  / `text_in`, `num_eq` / `gt` / `gte` / `lt` / `lte`, `bool_eq`, and
+  `asc` / `desc` sorting. Works on PostgreSQL, MySQL and SQLite
+  (`contains` excepted on SQLite). Typed comparisons skip values of other
+  JSON types, conditions are never NULL, and path keys are bound.
 - **Raw SQL in queries:** `Expr::raw(sql, args)` for conditions and
   `Order::raw` / `Order::raw_desc` for orderings, combined with typed
   filters, relation filters and joins. `?` placeholders are bound to

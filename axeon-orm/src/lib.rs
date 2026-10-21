@@ -165,6 +165,8 @@
 //!   and [`where_has`](Query::where_has).
 //! - **Joins:** [`Query::join`] and [`left_join`](Query::left_join) give
 //!   `(Post, User)` pairs from one query, filtered and sorted by either side.
+//! - **JSON filters:** [`Column::contains`], [`has_key`](Column::has_key)
+//!   and [`key`](Column::key) paths on JSON columns.
 //! - **Raw SQL fragments:** [`Expr::raw`] and [`Order::raw`] mix SQL
 //!   (JSONB, full-text search, pgvector) into a typed query, with bound
 //!   parameters.
@@ -204,6 +206,8 @@ pub use crate::db::{Backend, Db, DbOptions, Executor, Row, Transaction};
 pub use crate::error::{Error, Result};
 pub use crate::model::{ColumnDef, Model, OnConflict, Reference, Timestamp};
 pub use crate::query::{Assignment, Column, Expr, JoinQuery, Numeric, Order, Page, Query, RawArgs};
+#[cfg(feature = "json")]
+pub use crate::query::{JsonColumn, JsonPath};
 pub use crate::relation::{BelongsTo, BelongsToMany, HasMany, HasOne, Join, Related, Relation};
 pub use crate::value::{Kind, SqlType, UnknownVariant, Value};
 
@@ -226,6 +230,15 @@ pub mod prelude {
     pub use crate::{Db, Executor, Model, Query, Transaction};
     #[cfg(feature = "axeon")]
     pub use crate::server::{DbRequest, HealthExt, Transactional};
+}
+
+#[cfg(feature = "json")]
+mod sealed {
+    pub trait Sealed {}
+    #[cfg(feature = "json")]
+    impl Sealed for serde_json::Value {}
+    #[cfg(feature = "json")]
+    impl<T> Sealed for sqlx::types::Json<T> {}
 }
 
 #[doc(hidden)]

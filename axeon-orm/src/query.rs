@@ -5,6 +5,8 @@ use crate::error::{Error, Result};
 use crate::model::{primary_key, Model};
 use crate::relation::{Join, Related, Relation, WithQuery};
 use crate::sql::{column_list, Cond, Fragment, Lock, Sort, SortTerm, Sql};
+#[cfg(feature = "json")]
+use crate::sql::{JsonTest, PathStep};
 use crate::value::{SqlType, Value};
 use serde::Serialize;
 use std::marker::PhantomData;
@@ -129,6 +131,177 @@ impl<M> Column<M, String> {
     /// PostgreSQL, case-insensitive for ASCII in SQLite.
     pub fn like(&self, pattern: impl Into<String>) -> Expr<M> {
         Expr::new(Cond::Compare(self.name, "LIKE", Value::Text(pattern.into())))
+    }
+}
+
+/// A JSON column type: `serde_json::Value` or `sqlx::types::Json<T>`.
+#[cfg(feature = "json")]
+pub trait JsonColumn: crate::sealed::Sealed {}
+
+#[cfg(feature = "json")]
+impl JsonColumn for serde_json::Value {}
+#[cfg(feature = "json")]
+impl<T> JsonColumn for sqlx::types::Json<T> {}
+
+/// Filters on JSON columns (feature `json`). In PostgreSQL the column must
+/// be `JSONB`, as [`create_table`](crate::Db::create_table) makes it.
+///
+/// ```no_run
+/// # use axeon_orm::{Db, Model};
+/// # use serde_json::json;
+/// # #[derive(Model)] struct Product { id: i64, fields: serde_json::Value }
+/// # async fn run(db: Db) -> axeon_orm::Result<()> {
+/// let found = Product::query()
+///     .filter(Product::FIELDS.contains(json!({ "certs": ["CE"] })))
+///     .filter(Product::FIELDS.key("specs").key("color").text_eq("red"))
+///     .filter(Product::FIELDS.key("price").key("min").lte(25))
+///     .order_by(Product::FIELDS.key("price").key("min").asc())
+///     .all(&db)
+///     .await?;
+/// # Ok(()) }
+/// ```
+///
+/// Path keys and values are always sent as bound parameters.
+#[cfg(feature = "json")]
+impl<M, T: JsonColumn> Column<M, T> {
+    /// The document contains `value`: every key and array element in
+    /// `value` is in the column too (PostgreSQL `@>`, which a GIN index
+    /// speeds up; MySQL `JSON_CONTAINS`). Not available in SQLite, where
+    /// the query fails.
+    pub fn contains(&self, value: serde_json::Value) -> Expr<M> {
+        Expr::new(Cond::Json(self.name, Vec::new(), JsonTest::Contains(Value::Json(value))))
+    }
+
+    /// The top-level object has `key` (PostgreSQL `?`, which a GIN index
+    /// speeds up), even if its value is `null`.
+    pub fn has_key(&self, key: impl Into<String>) -> Expr<M> {
+        Expr::new(Cond::Json(self.name, Vec::new(), JsonTest::HasKey(key.into())))
+    }
+
+    /// The value under `key` of the top-level object, to filter or sort by.
+    pub fn key(&self, key: impl Into<String>) -> JsonPath<M> {
+        JsonPath { column: self.name, path: vec![PathStep::Key(key.into())], _marker: PhantomData }
+    }
+
+    /// The element at `index` of a top-level array.
+    pub fn index(&self, index: u32) -> JsonPath<M> {
+        JsonPath { column: self.name, path: vec![PathStep::Index(index.min(i32::MAX as u32) as i32)], _marker: PhantomData }
+    }
+}
+
+/// A value inside a JSON column, from [`Column::key`]: go deeper with
+/// [`key`](JsonPath::key) and [`index`](JsonPath::index), then compare.
+///
+/// Text comparisons match only JSON strings and number comparisons only
+/// JSON numbers, so `"n/a"` in a price field just doesn't match instead of
+/// failing the query.
+#[cfg(feature = "json")]
+pub struct JsonPath<M> {
+    column: &'static str,
+    path: Vec<PathStep>,
+    _marker: PhantomData<fn() -> M>,
+}
+
+#[cfg(feature = "json")]
+impl<M> Clone for JsonPath<M> {
+    fn clone(&self) -> Self {
+        Self { column: self.column, path: self.path.clone(), _marker: PhantomData }
+    }
+}
+
+#[cfg(feature = "json")]
+impl<M> std::fmt::Debug for JsonPath<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonPath").field("column", &self.column).field("path", &self.path).finish()
+    }
+}
+
+#[cfg(feature = "json")]
+impl<M> JsonPath<M> {
+    /// The value under `key` of this object.
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.path.push(PathStep::Key(key.into()));
+        self
+    }
+
+    /// The element at `index` of this array.
+    pub fn index(mut self, index: u32) -> Self {
+        self.path.push(PathStep::Index(index.min(i32::MAX as u32) as i32));
+        self
+    }
+
+    fn test(&self, test: JsonTest) -> Expr<M> {
+        Expr::new(Cond::Json(self.column, self.path.clone(), test))
+    }
+
+    /// The path exists, even with a `null` value.
+    pub fn exists(&self) -> Expr<M> {
+        self.test(JsonTest::Exists)
+    }
+
+    /// A string equal to `value`.
+    pub fn text_eq(&self, value: impl Into<String>) -> Expr<M> {
+        self.test(JsonTest::Text("=", Value::Text(value.into())))
+    }
+
+    /// A string other than `value` (not missing or another type).
+    pub fn text_ne(&self, value: impl Into<String>) -> Expr<M> {
+        self.test(JsonTest::Text("<>", Value::Text(value.into())))
+    }
+
+    /// A string matching `pattern`, with `%` and `_` wildcards.
+    pub fn text_like(&self, pattern: impl Into<String>) -> Expr<M> {
+        self.test(JsonTest::Text("LIKE", Value::Text(pattern.into())))
+    }
+
+    /// A string equal to one of `values`; false when `values` is empty.
+    pub fn text_in<S: Into<String>>(&self, values: impl IntoIterator<Item = S>) -> Expr<M> {
+        let values: Vec<Value> = values.into_iter().map(|v| Value::Text(v.into())).collect();
+        if values.is_empty() {
+            return Expr::any([]);
+        }
+        self.test(JsonTest::TextIn(values, false))
+    }
+
+    /// A number equal to `value`.
+    pub fn num_eq(&self, value: impl Into<f64>) -> Expr<M> {
+        self.test(JsonTest::Number("=", value.into()))
+    }
+
+    /// A number greater than `value`.
+    pub fn gt(&self, value: impl Into<f64>) -> Expr<M> {
+        self.test(JsonTest::Number(">", value.into()))
+    }
+
+    /// A number at least `value`.
+    pub fn gte(&self, value: impl Into<f64>) -> Expr<M> {
+        self.test(JsonTest::Number(">=", value.into()))
+    }
+
+    /// A number less than `value`.
+    pub fn lt(&self, value: impl Into<f64>) -> Expr<M> {
+        self.test(JsonTest::Number("<", value.into()))
+    }
+
+    /// A number at most `value`.
+    pub fn lte(&self, value: impl Into<f64>) -> Expr<M> {
+        self.test(JsonTest::Number("<=", value.into()))
+    }
+
+    /// The boolean `value`.
+    pub fn bool_eq(&self, value: bool) -> Expr<M> {
+        self.test(JsonTest::Bool(value))
+    }
+
+    /// Sorts by this value, ascending. Each database orders mixed JSON
+    /// types its own way, so sort by fields of one type.
+    pub fn asc(&self) -> Order<M> {
+        Order::new(SortTerm::Json(self.column, self.path.clone()), false)
+    }
+
+    /// Sorts by this value, descending.
+    pub fn desc(&self) -> Order<M> {
+        Order::new(SortTerm::Json(self.column, self.path.clone()), true)
     }
 }
 
