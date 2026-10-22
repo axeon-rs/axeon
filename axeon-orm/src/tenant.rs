@@ -51,11 +51,17 @@ impl Scope {
     /// `conds` plus the tenant filter for `M`, with subqueries on
     /// tenant-scoped tables (from `has` and `where_has`) filtered too.
     pub(crate) fn apply<M: Model>(&self, conds: &[Cond]) -> Result<Vec<Cond>> {
+        let mut scoped = self.apply_to(conds)?;
+        scoped.extend(self.filter_for::<M>()?);
+        Ok(scoped)
+    }
+
+    /// `conds` with subqueries on tenant-scoped tables filtered.
+    pub(crate) fn apply_to(&self, conds: &[Cond]) -> Result<Vec<Cond>> {
         let mut scoped = conds.to_vec();
         for cond in &mut scoped {
             self.scope_subqueries(cond)?;
         }
-        scoped.extend(self.filter_for::<M>()?);
         Ok(scoped)
     }
 

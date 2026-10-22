@@ -217,6 +217,10 @@ impl Sql {
         Self { backend, text: String::with_capacity(128), args: Vec::new(), qualifier: None, has_where: false }
     }
 
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
     pub fn push(&mut self, sql: &str) -> &mut Self {
         self.text.push_str(sql);
         self
@@ -342,6 +346,14 @@ impl Sql {
             self.push(keyword);
             self.cond(cond);
         }
+        self.qualifier = previous;
+        self
+    }
+
+    /// Appends one condition with columns qualified by `qualifier`.
+    pub fn cond_as(&mut self, cond: &Cond, qualifier: Option<&'static str>) -> &mut Self {
+        let previous = std::mem::replace(&mut self.qualifier, qualifier);
+        self.cond(cond);
         self.qualifier = previous;
         self
     }

@@ -422,7 +422,7 @@ impl<M> std::ops::Not for Expr<M> {
 /// An `ORDER BY` term, from [`Column::asc`], [`Column::desc`],
 /// [`Order::raw`] or [`Order::raw_desc`].
 pub struct Order<M> {
-    sort: Sort,
+    pub(crate) sort: Sort,
     _marker: PhantomData<fn() -> M>,
 }
 

@@ -213,6 +213,7 @@ pub mod idempotency;
 pub mod notify;
 pub mod relation;
 pub mod schema;
+pub mod select;
 #[cfg(feature = "testing")]
 pub mod testing;
 #[cfg(feature = "axeon")]

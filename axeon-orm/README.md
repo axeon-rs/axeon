@@ -223,6 +223,43 @@ let rows: Vec<(Post, User)> = Post::query()
 let rows: Vec<(User, Option<Profile>)> = User::query().left_join(User::PROFILE).all(&db).await?;
 ```
 
+### Reports: more tables, GROUP BY and HAVING
+
+`select::Select` joins any number of tables through their relations and
+decodes each row into your own `Deserialize` struct (or JSON):
+
+```rust
+use axeon_orm::select::{Agg, Select};
+
+#[derive(Deserialize)]
+struct Row { supplier: String, category: String, products: i64, avg_price: Option<f64> }
+
+let rows: Vec<Row> = Select::from::<Supplier>()
+    .join(Supplier::PRODUCTS)                 // from any table already in the report
+    .join(Product::CATEGORY)
+    .left_join(Product::REVIEWS)              // keep products without reviews
+    .column_as(Supplier::NAME, "supplier")
+    .column_as(Category::NAME, "category")
+    .aggregate(Agg::count_distinct(Product::ID), "products")
+    .aggregate(Agg::avg(Product::PRICE), "avg_price")
+    .filter(Supplier::ACTIVE.eq(true))        // WHERE, on any joined model
+    .group_by(Supplier::NAME)
+    .group_by(Category::NAME)
+    .having(Agg::count().gte(3))              // HAVING
+    .order_by_alias("products", true)
+    .limit(50)
+    .fetch(&db)                               // or .fetch_json(&db) for a dashboard
+    .await?;
+```
+
+- Aggregates: `count`, `count_of`, `count_distinct`, `sum` (`i64` or
+  `f64`), `avg` (`f64`), `min` and `max` (the column's type); read
+  nullable results (left joins, empty groups) as `Option`.
+- Each model appears once (no self-joins); mistakes such as a column of a
+  model that isn't joined fail with `Error::Config` when the report runs.
+- Tenant scopes apply to every table (in `ON` for left joins), and
+  `to_sql` shows the SQL for `EXPLAIN`.
+
 ## Full-text and hybrid search (PostgreSQL)
 
 ```rust
@@ -565,8 +602,7 @@ app.post("/transfer", |req| async move {
 ## Not yet
 
 Planned for later versions: composite primary keys, extra columns on pivot
-tables, `GROUP BY` beyond `count_by`, joins across more than two tables,
-and down migrations. For anything
+tables, self-joins in reports, and down migrations. For anything
 the ORM can't express, use sqlx directly via `db.postgres()` /
 `db.sqlite()`.
 

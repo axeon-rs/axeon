@@ -57,6 +57,14 @@
   `Transaction::statement_timeout` (PostgreSQL) cancel long statements with
   the new `Error::StatementTimeout` (503 in Axeon).
 
+- **Reports:** `select::Select` joins any number of tables through their
+  relations (inner or left), selects typed columns and aggregates
+  (`Agg::count`, `count_of`, `count_distinct`, `sum`, `avg`, `min`, `max`),
+  filters on any joined model, and supports `GROUP BY`, `HAVING`, ordering
+  by column or alias, and `LIMIT`/`OFFSET`. Rows decode into a
+  `Deserialize` struct (`fetch`) or JSON objects (`fetch_json`). Tenant
+  scopes apply to every table.
+
 ### Changed
 
 - The `tls` feature uses rustls' aws-lc-rs provider
