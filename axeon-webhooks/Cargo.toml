@@ -1,0 +1,28 @@
+[package]
+name = "axeon-webhooks"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Signed webhooks for Axeon apps: HMAC-SHA256 signing and verification with timestamps, replay protection and secret rotation"
+license = "MIT"
+repository = "https://github.com/axeon-rs/axeon"
+documentation = "https://docs.rs/axeon-webhooks"
+readme = "README.md"
+keywords = ["webhooks", "hmac", "signature", "axeon", "security"]
+categories = ["web-programming", "cryptography"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+axeon = { version = "1.1", path = "..", default-features = false, optional = true }
+hmac = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[features]
+default = ["axeon"]
+# `VerifyWebhook`, middleware that checks signatures before handlers run.
+axeon = ["dep:axeon"]

@@ -537,6 +537,7 @@ Optional crates that build on Axeon, each versioned on its own:
 | [axeon-openapi](axeon-openapi) | OpenAPI 3.1 documents generated from your routes and Rust types |
 | [axeon-client](axeon-client) | An outbound HTTP client with SSRF protection, retries and circuit breaking |
 | [axeon-otel](axeon-otel) | OpenTelemetry: a server span per request, W3C trace context, OTLP export |
+| [axeon-webhooks](axeon-webhooks) | Signed webhooks: HMAC-SHA256 with timestamps, replay protection and secret rotation |
 
 ### Templates, static files and uploads
 

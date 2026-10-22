@@ -372,6 +372,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "axeon-webhooks"
+version = "0.1.0"
+dependencies = [
+ "axeon",
+ "hmac 0.12.1",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "backon"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
