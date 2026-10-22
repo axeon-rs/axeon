@@ -47,6 +47,7 @@ impl From<Error> for ServerError {
         match error {
             Error::NotFound => ServerError::NotFound,
             Error::InvalidCursor(msg) => ServerError::BadRequest(format!("invalid cursor: {}", msg)),
+            Error::StatementTimeout(_) => ServerError::Status(503, "the database took too long".to_string()),
             Error::StaleRecord(_) => {
                 ServerError::Conflict("the record was changed by someone else; reload it and try again".to_string())
             }

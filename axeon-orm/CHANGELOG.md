@@ -48,6 +48,15 @@
   transaction) until it ends. Tenant scopes apply, and an error in a
   transaction marks it failed.
 
+- **Query observability:** `DbOptions::metrics` records
+  `db_query_duration_seconds` and `db_query_errors_total` (by operation and
+  table) on an Axeon registry; `DbOptions::slow_query` logs slow statements
+  (target `axeon_orm::slow_query`, SQL with placeholders only, plus a
+  fingerprint); `DbOptions::statement_timeout` (PostgreSQL
+  `statement_timeout`, MySQL `max_execution_time`) and
+  `Transaction::statement_timeout` (PostgreSQL) cancel long statements with
+  the new `Error::StatementTimeout` (503 in Axeon).
+
 ### Changed
 
 - The `tls` feature uses rustls' aws-lc-rs provider

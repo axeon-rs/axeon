@@ -194,6 +194,7 @@ mod db;
 mod error;
 mod cursor;
 mod model;
+mod observe;
 mod query;
 mod sql;
 mod tenant;

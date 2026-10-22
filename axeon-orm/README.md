@@ -410,6 +410,30 @@ let n = Selection::query().all_tenants().count(&org).await?; // per query
   gets the filter added beside it), pivot tables, and models without a
   tenant column.
 
+## Query observability
+
+```rust
+let db = Db::connect_with(&url, DbOptions::new()
+    .metrics(&metrics)                              // on Axeon's /metrics
+    .slow_query(Duration::from_millis(200))         // warn! with the SQL, never its values
+    .statement_timeout(Duration::from_secs(5)))     // the database cancels longer statements
+    .await?;
+
+// A tighter limit for one transaction (PostgreSQL):
+let mut tx = db.begin().await?;
+tx.statement_timeout(Duration::from_millis(300)).await?;
+```
+
+- `db_query_duration_seconds` (histogram) and `db_query_errors_total`,
+  labelled by `operation` (`select`, `insert`, `update`, `delete`) and
+  `table`, cover every statement except streamed ones.
+- Slow statements are logged at `warn` with target
+  `axeon_orm::slow_query`: duration, operation, table, a fingerprint for
+  grouping, and the SQL with placeholders.
+- A cancelled statement fails with `Error::StatementTimeout` (503 in Axeon
+  handlers). PostgreSQL applies the timeout to every statement; MySQL's
+  `max_execution_time` covers only `SELECT`s; SQLite has none.
+
 ## Transactions
 
 ```rust
