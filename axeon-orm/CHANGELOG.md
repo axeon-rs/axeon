@@ -65,6 +65,13 @@
   `Deserialize` struct (`fetch`) or JSON objects (`fetch_json`). Tenant
   scopes apply to every table.
 
+- **Partitioned tables** (PostgreSQL, feature `chrono`):
+  `partition::Partitioning::monthly` / `daily` creates a table
+  `PARTITION BY RANGE` of a time column (primary key including it),
+  `ensure` creates the current and upcoming partitions, `drop_before`
+  detaches and drops partitions that ended before a cutoff, and
+  `partitions` lists them with UTC bounds.
+
 ### Changed
 
 - The `tls` feature uses rustls' aws-lc-rs provider

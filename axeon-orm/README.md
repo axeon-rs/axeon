@@ -505,6 +505,32 @@ Joins lock only the main table's rows; `count`, `exists` and aggregates
 don't lock. SQLite has no row locks (a write transaction locks the whole
 database), so these are left out there.
 
+## Partitioned tables (PostgreSQL)
+
+For fast-growing, append-mostly tables (audit events, LLM call logs), one
+partition per month or day keeps recent queries fast and makes retention
+a `DROP` instead of a huge `DELETE`:
+
+```rust
+use axeon_orm::partition::Partitioning;
+
+let audit = Partitioning::monthly(AuditEvent::CREATED_AT);     // or ::daily
+audit.create_table::<AuditEvent>(&db).await?;                   // or save create_table_sql() as a migration
+
+// Daily, from a scheduled job:
+audit.ensure(&db, 3).await?;                                    // this month and the next 3
+audit.drop_before(&db, Utc::now() - Duration::days(400)).await?;
+```
+
+- The model is used as usual. Rows whose time has no partition can't be
+  inserted, so keep partitions created ahead with `ensure`.
+- PostgreSQL requires the primary key to include the partition column,
+  so the table's key is `(id, created_at)`; ids still come from one
+  sequence. Other unique columns are refused, and upserts on `id` alone
+  don't work on these tables.
+- Partition bounds are UTC whatever the session time zone; `partitions()`
+  lists them, and `#[model(index)]` indexes reach every partition.
+
 ## LISTEN / NOTIFY
 
 On PostgreSQL, send lightweight messages between connections, to wake

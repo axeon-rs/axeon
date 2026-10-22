@@ -211,6 +211,8 @@ pub mod broadcast;
 pub mod idempotency;
 #[cfg(feature = "postgres")]
 pub mod notify;
+#[cfg(all(feature = "postgres", feature = "chrono"))]
+pub mod partition;
 pub mod relation;
 pub mod schema;
 pub mod select;
