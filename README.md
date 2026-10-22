@@ -423,6 +423,35 @@ app.get("/v1/products/:id", |req| async move {
 `with_last_modified` enables `If-Modified-Since`. Add `ConditionalGet`
 after `Compression`, so ETags describe the uncompressed data.
 
+### Hosts and custom domains
+
+```rust
+use axeon::host::ResolveHost;
+use axeon::{Router, Server, ServerError};
+
+#[derive(Clone)]
+struct Storefront { id: i64 }
+
+let mut stores = Router::new();
+stores.get("/", |req| async move { format!("store {}", req.subdomain().unwrap_or("")) });
+
+let mut app = Server::new();
+app.host("*.stores.example.com", stores);   // acme.stores.example.com → "acme"
+app.get("/", |_req| async { "main site" }); // every other host
+
+// Customers' own domains, looked up at runtime (cached for a minute):
+app.middleware(
+    ResolveHost::new(|host: String| async move {
+        Ok::<_, ServerError>((host == "shop.acme.com").then_some(Storefront { id: 7 }))
+    })
+    .skip(["example.com", "acme.stores.example.com"]),
+);
+```
+
+A host's router owns that host (no fallthrough to the main routes), body
+limits follow its routes, and global middleware runs for every host.
+`req.host()` gives the requested host, lowercased and without the port.
+
 ### Languages
 
 ```rust

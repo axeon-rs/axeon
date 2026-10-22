@@ -60,6 +60,14 @@
   as middleware it attaches a `Locale` (`Request::locale`) and sets
   `Content-Language` and `Vary: Accept-Language`.
 
+- **Host-based routing:** `Server::host("*.stores.example.com", router)`
+  (or an exact host) serves those hosts from their own router, with
+  `Request::subdomain` for the wildcard label and body limits per host
+  route; `Request::host` gives the normalized requested host. The
+  `host::ResolveHost` middleware resolves hosts known only at runtime
+  (customers' own domains) with an async lookup, caches the result,
+  attaches it as an extension and answers 404 for unknown hosts.
+
 ### Fixed
 
 - `Server::with_tls` no longer panics with "Could not automatically

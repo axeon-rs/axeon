@@ -55,6 +55,7 @@
 //! | [`auth`] | Bearer, Basic, API key (feature `api-keys`) and JWT (feature `jwt`) authentication |
 //! | [`cache`] | `Cache-Control`, ETags and `304 Not Modified` for API responses |
 //! | [`locale`] | The best supported language per request, from `Accept-Language` |
+//! | [`host`] | Routes per host and subdomain, and custom domains resolved at runtime |
 //! | `cookies`, `session`, `csrf` | Signed/encrypted cookies, sessions, CSRF protection (feature `cookies`) |
 //! | [`config`] | Typed configuration from environment variables and `.env` |
 //! | `templates` | HTML templates (feature `templates`) |
@@ -124,6 +125,7 @@ pub mod cookies;
 pub mod csrf;
 pub(crate) mod error;
 pub(crate) mod handler;
+pub mod host;
 mod lifecycle;
 pub mod locale;
 mod static_files;
