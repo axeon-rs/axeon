@@ -25,7 +25,7 @@ impl Job for SendWebhook {
     }
 }
 
-// Create the table (or add `axeon_jobs::migration()` to your migrations).
+// Create the tables (or add `axeon_jobs::migrations()` to your migrations).
 axeon_jobs::install(&db).await?;
 
 // Enqueue with `&db`, or `&mut tx` to commit the job with your other writes.
@@ -35,12 +35,14 @@ tx.commit().await?;
 
 axeon_jobs::enqueue_with(&db, &job, Enqueue::new()
     .delay(Duration::from_secs(60))   // or .run_at(time)
-    .unique_key("event:7")).await?;   // skipped while one is waiting or running
+    .unique_key("event:7")            // skipped while one is waiting or running
+    .priority(10)).await?;            // higher runs first; default Job::PRIORITY (0)
 
 // The worker process.
 Worker::new(db.clone())
     .register::<SendWebhook>()
     .queue("webhooks", 16)            // concurrency; default 4 per queue
+    .schedule("rescreen", "0 3 * * *", RescreenAll) // cron, in UTC
     .state(http_client)               // ctx.state::<HttpClient>() in jobs
     .metrics(&metrics)                // Prometheus, on Axeon's /metrics
     .run_until(axeon::shutdown_signal())
@@ -79,10 +81,23 @@ With the `metrics` feature (default), `Worker::metrics` records
 `jobs_completed_total`, `jobs_failed_total` (`outcome` `retry` or
 `failed`), `job_duration_seconds` and `jobs_running`.
 
+## Schedules
+
+`Worker::schedule(name, expression, job)` enqueues `job` on a five-field
+cron expression (`minute hour day month weekday`, UTC; names like `MON`
+and `JAN`, ranges, steps and lists, plus `@hourly`, `@daily`, `@weekly`,
+`@monthly`, `@yearly`).
+
+- Every worker can declare the same schedules. The next run time lives in
+  `axeon_jobs_schedules` and is advanced with a compare-and-swap in the
+  same transaction as the enqueue, so each run is enqueued exactly once.
+- A run is skipped while the previous one is still waiting or running
+  (unique key `cron:<name>`), so slow jobs don't pile up.
+- Runs missed while no worker was up are made up once, not once per miss.
+
 ## Not yet
 
-Recurring (cron) schedules, priorities, and batches. Until cron lands, a
-job can enqueue its own next run with `Enqueue::run_at` and a unique key.
+Batches.
 
 ## Testing
 

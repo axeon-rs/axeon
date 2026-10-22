@@ -7,19 +7,22 @@
 //! router's routes) or [`RouteBuilder::middleware`](crate::RouteBuilder::middleware)
 //! (one route). Tower layers work too, via `layer`.
 //!
-//! Built in: [`SecurityHeaders`], [`Cors`], [`RateLimiter`], [`Compression`]
+//! Built in: [`SecurityHeaders`], [`Cors`], [`RateLimiter`] (with shared
+//! stores, see [`rate_limit`]), [`Compression`]
 //! (feature `compression`), [`SetRequestId`] and [`RequestLogger`]. More live
 //! in [`auth`](crate::auth), [`cookies`](crate::cookies),
 //! [`session`](crate::session), [`csrf`](crate::csrf) and
 //! [`metrics`](crate::metrics).
 
 mod security;
+pub mod rate_limit;
 #[cfg(feature = "compression")]
 mod compression;
 mod observe;
 
 use crate::message::Request;
-pub use security::{Cors, RateLimiter, SecurityHeaders};
+pub use rate_limit::RateLimiter;
+pub use security::{Cors, SecurityHeaders};
 #[cfg(feature = "compression")]
 pub use compression::Compression;
 pub use observe::{RequestId, RequestLogger, SetRequestId};

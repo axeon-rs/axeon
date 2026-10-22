@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Shared rate limits:** `middleware::rate_limit` adds a `RateLimitStore`
+  trait (in-memory by default; Redis in `axeon-redis`), so every instance
+  of an app enforces one limit. `RateLimiter::new(Quota)` with
+  `Quota::per_minute/per_hour/per_day(..).burst(..)` (GCRA) or
+  `Quota::daily(n)` / `fixed_window` (resets at UTC midnight),
+  `quota_by` for per-plan limits, `prefix`, `fail_open` and
+  `headers(true)` for `RateLimit-Limit`, `-Remaining`, `-Reset` and
+  `-Policy`. Existing `RateLimiter::per_minute(..).burst(..)` code behaves
+  as before.
+
+### Fixed
+
+- `Server::with_tls` no longer panics with "Could not automatically
+  determine the process-level CryptoProvider" when another dependency
+  compiles in rustls' ring provider next to aws-lc-rs (as axeon-orm 0.3's
+  `tls` feature did). It uses the process default provider, installing
+  aws-lc-rs if none is set. All companion crates now use aws-lc-rs.
+
 ## 1.1.0 (2026-10-22)
 
 New features for production backends, all additive: no breaking changes, and

@@ -135,8 +135,10 @@ version = "0.3.0"
 dependencies = [
  "axeon",
  "axeon-orm-macros",
+ "base64 0.23.1",
  "futures",
  "serde",
+ "serde_json",
  "sqlx",
  "tokio",
 ]

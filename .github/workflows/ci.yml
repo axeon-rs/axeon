@@ -46,6 +46,26 @@ jobs:
           key: ${{ matrix.features }}
       - run: cargo test ${{ matrix.features }}
 
+  workspace:
+    name: All crates together
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Feature unification only shows up when every crate is built at once:
+      # one crate can switch on a dependency feature that breaks another.
+      - run: cargo test --workspace --all-features
+      # Every crate must use rustls' aws-lc-rs provider. Two providers in one
+      # app make `ClientConfig::builder()` panic in crates that call it.
+      - name: Only one rustls crypto provider
+        run: |
+          if cargo tree -i ring --workspace --all-features -e normal --target all 2>/dev/null | grep -q ring; then
+            cargo tree -i ring --workspace --all-features -e normal --target all
+            echo "ring is a normal dependency again; use the aws-lc-rs rustls provider" >&2
+            exit 1
+          fi
+
   msrv:
     name: Minimum Rust version
     runs-on: ubuntu-latest

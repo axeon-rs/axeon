@@ -537,3 +537,95 @@ async fn needs_postgres_and_jobs() {
     let not_pg = Worker::new(sqlite).register::<Record>().run_until(async {}).await;
     assert!(matches!(not_pg, Err(axeon_jobs::Error::Config(m)) if m.contains("PostgreSQL")));
 }
+
+#[tokio::test]
+async fn higher_priorities_run_first() {
+    let Some(db) = db("priorities").await else { return };
+    let log = Log::default();
+    // Enqueued oldest first, with priorities mixed in.
+    for (label, priority) in [("low", -5), ("normal-1", 0), ("urgent", 10), ("normal-2", 0), ("high", 5)] {
+        axeon_jobs::enqueue_with(&db, &record(label), Enqueue::new().priority(priority)).await.unwrap();
+    }
+    let (stop, handle) = spawn(worker(&db, &log).queue("default", 1));
+    eventually("5 runs", || async { log.len() == 5 }).await;
+    let order: Vec<String> = log.runs().into_iter().map(|(label, _)| label).collect();
+    assert_eq!(order, ["urgent", "high", "normal-1", "normal-2", "low"]);
+    stop.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn schedules_enqueue_each_run_once() {
+    let Some(db) = db("schedules").await else { return };
+    let pool = db.postgres().unwrap();
+    let log = Log::default();
+    // A schedule that came due a while ago, as after a weekend with no
+    // workers running: it is made up once.
+    sqlx::query(
+        "INSERT INTO axeon_jobs_schedules (name, expression, next_run_at) VALUES ('nightly', '0 3 * * *', now() - interval '2 days')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    // Three workers declare the same schedules.
+    let mut workers = Vec::new();
+    for i in 0..3 {
+        let worker = worker(&db, &log)
+            .id(format!("w{}", i))
+            .schedule("nightly", "0 3 * * *", record("nightly"))
+            .schedule("hourly", "@hourly", record("hourly"));
+        workers.push(spawn(worker));
+    }
+    eventually("the nightly run", || async { log.len() == 1 }).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(log.runs(), [("nightly".to_string(), 1)]);
+
+    // Next runs are in the future, at the next match of each expression.
+    type Time = chrono::DateTime<chrono::Utc>;
+    let rows: Vec<(String, String, Time, Option<Time>)> =
+        sqlx::query_as("SELECT name, expression, next_run_at, last_run_at FROM axeon_jobs_schedules ORDER BY name")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let now = chrono::Utc::now();
+    let (hourly, nightly) = (&rows[0], &rows[1]);
+    assert_eq!((hourly.0.as_str(), nightly.0.as_str()), ("hourly", "nightly"));
+    assert_eq!(nightly.2, "0 3 * * *".parse::<axeon_jobs::Cron>().unwrap().next_after(now).unwrap());
+    assert_eq!(hourly.2, "@hourly".parse::<axeon_jobs::Cron>().unwrap().next_after(now).unwrap());
+    assert!(nightly.3.is_some() && hourly.3.is_none());
+
+    // A changed expression replaces the next run time.
+    for (stop, handle) in workers {
+        stop.send(()).unwrap();
+        handle.await.unwrap().unwrap();
+    }
+    let (stop, handle) = spawn(worker(&db, &log).schedule("nightly", "30 4 * * *", record("nightly")));
+    eventually("the new expression", || async {
+        let expression: String = sqlx::query_scalar("SELECT expression FROM axeon_jobs_schedules WHERE name = 'nightly'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        expression == "30 4 * * *"
+    })
+    .await;
+    stop.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+    assert_eq!(log.len(), 1);
+}
+
+#[tokio::test]
+async fn bad_schedules_stop_the_worker() {
+    let Some(db) = db("bad_schedules").await else { return };
+    let log = Log::default();
+    for (worker, error) in [
+        (worker(&db, &log).schedule("x", "61 * * * *", record("x")), "minute"),
+        (worker(&db, &log).schedule("x", "0 0 31 2 *", record("x")), "never matches"),
+        (worker(&db, &log).schedule("x", "@daily", record("x")).schedule("x", "@hourly", record("y")), "two schedules"),
+    ] {
+        let result = worker.run_until(async {}).await;
+        assert!(matches!(&result, Err(axeon_jobs::Error::Config(m)) if m.contains(error)), "{:?}", result);
+    }
+    // A scheduled type is registered once, even if also registered by hand.
+    let worker = Worker::new(db.clone()).schedule("x", "@daily", record("x")).register::<Record>().state(log);
+    worker.run_until(async {}).await.unwrap();
+}

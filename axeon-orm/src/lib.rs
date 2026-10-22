@@ -192,6 +192,7 @@
 
 mod db;
 mod error;
+mod cursor;
 mod model;
 mod query;
 mod sql;
@@ -212,6 +213,7 @@ pub mod schema;
 pub mod server;
 
 pub use crate::db::{Backend, Db, DbOptions, Executor, Row, Transaction};
+pub use crate::cursor::CursorPage;
 pub use crate::error::{Error, Result};
 pub use crate::model::{ColumnDef, Model, OnConflict, Reference, Timestamp};
 pub use crate::query::{Assignment, Column, Expr, JoinQuery, Numeric, Order, Page, Query, RawArgs};

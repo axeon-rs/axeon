@@ -51,6 +51,11 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// How long one run may take. After that it is cancelled and retried;
     /// if the worker died, another worker takes it over a little later.
     const TIMEOUT: Duration = Duration::from_secs(300);
+    /// Among due jobs on the same queue, higher priorities are taken first;
+    /// equal priorities run oldest due first. Default 0; negative values
+    /// run after normal work. Override per job with
+    /// [`Enqueue::priority`](crate::Enqueue::priority).
+    const PRIORITY: i16 = 0;
 
     /// The wait before the next run after `attempt` (from 1) failed. By
     /// default 2s, 4s, 8s... up to an hour, with some jitter.

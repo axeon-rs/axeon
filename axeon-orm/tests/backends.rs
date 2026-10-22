@@ -918,6 +918,93 @@ async fn bulk_inserts(db: &Db) {
     assert_eq!(Product::query().count(db).await.unwrap(), 2501);
 }
 
+async fn cursor_pagination(db: &Db) {
+    setup(db).await;
+    // Repeated ages, so ties are broken by the primary key.
+    let ages = [30, 20, 30, 40, 20, 30, 10, 40, 30, 20, 50];
+    for (i, age) in ages.into_iter().enumerate() {
+        user(&format!("u{:02}", i), age).insert(db).await.unwrap();
+    }
+
+    // Walks every page and checks it matches the same order read in one go.
+    async fn walk(db: &Db, query: axeon_orm::Query<User>, per_page: u64) -> Vec<i64> {
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = query.clone().cursor_paginate(db, after.as_deref(), per_page).await.unwrap();
+            assert!(page.items.len() as u64 <= per_page);
+            seen.extend(page.items.iter().map(|u| u.id));
+            pages += 1;
+            assert!(pages < 50, "cursor pagination doesn't advance");
+            match page.next_cursor {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        seen
+    }
+    let ids = |users: Vec<User>| users.into_iter().map(|u| u.id).collect::<Vec<_>>();
+
+    // Default order: primary key ascending.
+    let expected = ids(User::query().order_by(User::ID.asc()).all(db).await.unwrap());
+    assert_eq!(walk(db, User::query(), 4).await, expected);
+
+    // One direction (a row comparison on PostgreSQL and SQLite).
+    let expected = ids(User::query().order_by(User::AGE.desc()).order_by(User::ID.desc()).all(db).await.unwrap());
+    for per_page in [1, 3, 11, 20] {
+        assert_eq!(walk(db, User::query().order_by(User::AGE.desc()), per_page).await, expected);
+    }
+
+    // Mixed directions, a filter and a timestamp key.
+    let expected = ids(
+        User::query()
+            .filter(User::AGE.gte(20))
+            .order_by(User::AGE.asc())
+            .order_by(User::CREATED_AT.desc())
+            .order_by(User::ID.desc())
+            .all(db)
+            .await
+            .unwrap(),
+    );
+    let mixed = User::query().filter(User::AGE.gte(20)).order_by(User::AGE.asc()).order_by(User::CREATED_AT.desc());
+    assert_eq!(walk(db, mixed.clone(), 2).await, expected);
+
+    // The last page has no cursor; an exact fit doesn't leave an empty page.
+    let all = User::query().cursor_paginate(db, None, 11).await.unwrap();
+    assert_eq!((all.items.len(), all.has_more()), (11, false));
+
+    // Cursors are checked.
+    let first = User::query().order_by(User::AGE.desc()).cursor_paginate(db, None, 2).await.unwrap();
+    let cursor = first.next_cursor.unwrap();
+    let other_order = User::query().order_by(User::AGE.asc()).cursor_paginate(db, Some(&cursor), 2).await;
+    assert!(matches!(&other_order, Err(Error::InvalidCursor(m)) if m.contains("sort order")), "{:?}", other_order.map(|p| p.items.len()));
+    for bad in ["", "not a cursor", "eyJrIjoxfQ"] {
+        let result = User::query().cursor_paginate(db, Some(bad), 2).await;
+        assert!(matches!(result, Err(Error::InvalidCursor(_))), "{:?}", bad);
+    }
+    let nullable = User::query().order_by(User::BIO.asc()).cursor_paginate(db, None, 2).await;
+    assert!(matches!(&nullable, Err(Error::Config(m)) if m.contains("nullable")));
+    let raw = User::query().order_by(Order::raw("age * 2", ())).cursor_paginate(db, None, 2).await;
+    assert!(matches!(raw, Err(Error::Config(_))));
+
+    // A text primary key works too.
+    for slug in ["c", "a", "e", "b", "d"] {
+        Tag { slug: slug.into(), label: slug.to_uppercase(), uses: 0 }.insert(db).await.unwrap();
+    }
+    let mut after = None;
+    let mut slugs = Vec::new();
+    loop {
+        let page = Tag::query().cursor_paginate(db, after.as_deref(), 2).await.unwrap();
+        slugs.extend(page.items.into_iter().map(|t| t.slug));
+        match page.next_cursor {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(slugs, ["a", "b", "c", "d", "e"]);
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -1003,6 +1090,7 @@ backend_tests!(
     upserts,
     json_filters,
     bulk_inserts,
+    cursor_pagination,
 );
 
 #[test]

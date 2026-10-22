@@ -60,13 +60,19 @@
 //!   wasn't recorded as done runs again. Make jobs safe to repeat, e.g. with
 //!   the job's [ID](JobContext::id) as an idempotency key.
 //!
-//! Not yet: recurring (cron) schedules and priorities. Until then, a job
-//! can enqueue its own next run with [`Enqueue::run_at`] and a
-//! [unique key](Enqueue::unique_key).
+//! # Priorities and schedules
+//!
+//! Among due jobs on a queue, higher [`Job::PRIORITY`] (or
+//! [`Enqueue::priority`]) values are taken first.
+//!
+//! [`Worker::schedule`] enqueues a job on a [`Cron`] schedule, such as a
+//! nightly re-screen at `0 3 * * *` (UTC). However many workers declare a
+//! schedule, each run is enqueued once.
 
 #![warn(missing_docs)]
 
 mod admin;
+mod cron;
 mod enqueue;
 mod job;
 #[cfg(feature = "metrics")]
@@ -74,6 +80,7 @@ mod metrics;
 mod worker;
 
 pub use admin::{FailedJob, Jobs, QueueCounts};
+pub use cron::{Cron, CronError};
 pub use enqueue::{enqueue, enqueue_with, Enqueue, Target};
 pub use job::{default_backoff, Job, JobContext, JobError, JobResult};
 pub use worker::Worker;
@@ -108,27 +115,53 @@ CREATE UNIQUE INDEX IF NOT EXISTS axeon_jobs_unique ON axeon_jobs (unique_key)
     WHERE unique_key IS NOT NULL AND state <> 'failed';
 "#;
 
-/// The schema as a migration, to run with your own:
+/// Priorities and recurring schedules, added in 0.2. Safe to run again.
+pub const SCHEMA_PRIORITY_AND_SCHEDULES: &str = r#"
+ALTER TABLE axeon_jobs ADD COLUMN IF NOT EXISTS priority SMALLINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS axeon_jobs_ready ON axeon_jobs (queue, priority DESC, run_at, id) WHERE state = 'pending';
+CREATE TABLE IF NOT EXISTS axeon_jobs_schedules (
+    name TEXT PRIMARY KEY,
+    expression TEXT NOT NULL,
+    next_run_at TIMESTAMPTZ NOT NULL,
+    last_run_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"#;
+
+/// The schema as migrations, to run with your own:
 ///
 /// ```no_run
 /// # async fn run(db: axeon_orm::Db) -> axeon_orm::Result<()> {
 /// use axeon_orm::migrate::Migrator;
 ///
 /// let mut migrations = Migrator::from_dir("migrations")?.migrations().to_vec();
-/// migrations.push(axeon_jobs::migration());
+/// migrations.extend(axeon_jobs::migrations());
 /// Migrator::new(migrations).run(&db).await?;
 /// # Ok(()) }
 /// ```
 ///
-/// Or copy [`SCHEMA`] into a migration file of your own.
+/// Or copy [`SCHEMA`] and [`SCHEMA_PRIORITY_AND_SCHEDULES`] into migration
+/// files of your own.
+pub fn migrations() -> Vec<Migration> {
+    vec![
+        Migration::new(20261021000000, "axeon_jobs", SCHEMA),
+        Migration::new(20261022000000, "axeon_jobs_priority_and_schedules", SCHEMA_PRIORITY_AND_SCHEDULES),
+    ]
+}
+
+/// The first schema migration only, from 0.1. Use [`migrations`], which
+/// also adds priorities and schedules.
+#[deprecated(since = "0.2.0", note = "use `migrations()`, which includes priorities and schedules")]
 pub fn migration() -> Migration {
     Migration::new(20261021000000, "axeon_jobs", SCHEMA)
 }
 
-/// Creates the table if it doesn't exist; handy for tests and prototypes.
+/// Creates the tables if they don't exist, and upgrades them; handy for
+/// tests and prototypes.
 pub async fn install(db: &Db) -> Result<()> {
     pool(db)?;
-    db.execute(SCHEMA).await.map_err(Error::Database)
+    db.execute(SCHEMA).await.map_err(Error::Database)?;
+    db.execute(SCHEMA_PRIORITY_AND_SCHEDULES).await.map_err(Error::Database)
 }
 
 /// What can go wrong enqueueing, managing or running jobs.

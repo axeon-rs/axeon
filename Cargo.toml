@@ -86,6 +86,9 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "timeout", "compression-gzip", "set-header", "decompression-gzip"] }
 flate2 = "1"
 proptest = "1"
+# Compiles ring in next to aws-lc-rs, so the TLS test covers apps whose
+# dependencies enable both rustls providers (Server::with_tls must not panic).
+rustls = { version = "0.23.46", features = ["ring"] }
 
 [features]
 default = ["tls", "compression", "ws", "multipart", "cookies", "jwt", "templates"]

@@ -296,6 +296,7 @@ version = "0.3.0"
 dependencies = [
  "axeon",
  "axeon-orm-macros",
+ "base64 0.23.1",
  "chrono",
  "futures",
  "serde",
@@ -330,6 +331,7 @@ dependencies = [
  "axeon",
  "futures",
  "redis",
+ "rustls",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
@@ -2254,6 +2256,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "ryu",
+ "sha1_smol",
  "socket2",
  "tokio",
  "tokio-rustls",
@@ -2612,6 +2615,12 @@ dependencies = [
  "cpufeatures 0.3.1",
  "digest 0.11.3",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"

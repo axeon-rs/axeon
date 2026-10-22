@@ -100,6 +100,9 @@ let recent = Post::query()
     .await?;
 
 let page = Post::query().paginate(&db, 2, 20).await?;   // items, total, last_page
+// Keyset pagination for public APIs: no OFFSET or COUNT(*), opaque cursor.
+let page = Post::query().order_by(Post::ID.desc()).cursor_paginate(&db, after.as_deref(), 20).await?;
+// page.items, page.next_cursor (None on the last page)
 let n = Post::query().filter(Post::USER_ID.eq(ada.id)).count(&db).await?;
 
 let mut user = user;

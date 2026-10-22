@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `RedisRateLimitStore`: Axeon `RateLimiter` state shared by every
+  instance (GCRA and fixed windows in one Lua call, Redis' clock, hashed
+  keys that expire).
+
+### Fixed
+
+- With the `tls` feature, connecting no longer panics when several rustls
+  crypto providers are compiled in: aws-lc-rs is installed as the process
+  default if none is set.
+
 ## 0.1.0 (2026-10-22)
 
 First release: `RedisBroadcast`, a backend for Axeon's `broadcast::Hub`

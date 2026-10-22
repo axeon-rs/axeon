@@ -942,6 +942,61 @@ impl<M: Model> Query<M> {
         Ok(Page { items, page, per_page, total, last_page: total.div_ceil(per_page).max(1) })
     }
 
+    /// Keyset (cursor) pagination: up to `limit` rows after the `after`
+    /// cursor (`None` for the first page), without `OFFSET` or `COUNT(*)`,
+    /// so every page costs the same however deep it is and rows inserted
+    /// meanwhile don't shift pages.
+    ///
+    /// The order comes from [`order_by`](Query::order_by), which must use
+    /// plain, non-nullable columns; the primary key is added as the final
+    /// tie-breaker (default order: primary key ascending). An index on the
+    /// sort columns plus the primary key makes each page one index range
+    /// scan. Cursors are opaque URL-safe strings; one made for another sort
+    /// order, or a damaged one, is rejected with [`Error::InvalidCursor`]
+    /// (a 400 in Axeon handlers).
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, Model};
+    /// # #[derive(Model)] struct Product { id: i64, category: String, created_at: chrono::DateTime<chrono::Utc> }
+    /// # async fn run(db: Db, after: Option<String>) -> axeon_orm::Result<()> {
+    /// let page = Product::query()
+    ///     .filter(Product::CATEGORY.eq("lighting"))
+    ///     .order_by(Product::CREATED_AT.desc())
+    ///     .cursor_paginate(&db, after.as_deref(), 50)
+    ///     .await?;
+    /// // Send `page.next_cursor` to the client for the next request.
+    /// # Ok(()) }
+    /// ```
+    pub async fn cursor_paginate<'c>(
+        mut self,
+        ex: impl Executor<'c>,
+        after: Option<&str>,
+        limit: u64,
+    ) -> Result<crate::cursor::CursorPage<M>> {
+        let mut conn = ex.into_conn();
+        let keys = crate::cursor::keys::<M>(&self.order)?;
+        let limit = limit.max(1);
+        if let Some(cursor) = after {
+            let values = crate::cursor::decode::<M>(cursor, &keys)?;
+            self.conds.push(crate::cursor::after(conn.backend(), &keys, values));
+        }
+        self.order = keys
+            .iter()
+            .map(|&(column, descending)| Sort { term: SortTerm::Column(column), descending, qualifier: None })
+            .collect();
+        self.offset = None;
+        // One extra row tells whether there is a next page.
+        self.limit = Some(limit.saturating_add(1));
+        let mut items = self.fetch(&mut conn).await?;
+        let more = items.len() as u64 > limit;
+        items.truncate(limit as usize);
+        let next_cursor = match items.last() {
+            Some(last) if more => Some(crate::cursor::encode(last, &keys)?),
+            _ => None,
+        };
+        Ok(crate::cursor::CursorPage { items, next_cursor })
+    }
+
     /// Deletes every matching row; returns how many. Without a filter this
     /// empties the table.
     pub async fn delete<'c>(self, ex: impl Executor<'c>) -> Result<u64> {

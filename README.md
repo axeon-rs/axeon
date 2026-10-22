@@ -246,7 +246,7 @@ app.get("/", |req| async move { req.state::<Config>().map(|config| config.greeti
 |---|---|
 | `middleware::SecurityHeaders` | HSTS, nosniff, frame options, referrer and cross-origin policies, CSP |
 | `middleware::Cors` | CORS headers and preflights |
-| `middleware::RateLimiter` | Token bucket per IP, API key or user, with `Retry-After` |
+| `middleware::RateLimiter` | GCRA or daily quotas per IP, API key or user, plan-based limits, `RateLimit-*` and `Retry-After` headers; shared across instances with `axeon_redis::RedisRateLimitStore` |
 | `middleware::Compression` | gzip/deflate |
 | `middleware::SetRequestId`, `RequestLogger` | Request IDs and structured logs |
 | `auth::BearerAuth`, `auth::BasicAuth`, `auth::jwt::Jwt` | Authentication |

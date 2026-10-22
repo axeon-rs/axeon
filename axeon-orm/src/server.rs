@@ -43,6 +43,7 @@ impl From<Error> for ServerError {
     fn from(error: Error) -> Self {
         match error {
             Error::NotFound => ServerError::NotFound,
+            Error::InvalidCursor(msg) => ServerError::BadRequest(format!("invalid cursor: {}", msg)),
             Error::UniqueViolation(_) => ServerError::Conflict("record already exists".to_string()),
             Error::ForeignKeyViolation(_) => {
                 ServerError::Conflict("related record is missing or still referenced".to_string())

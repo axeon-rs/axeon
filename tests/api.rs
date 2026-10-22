@@ -436,6 +436,65 @@ async fn rate_limited_responses_say_when_to_retry() {
 }
 
 #[tokio::test]
+async fn rate_limits_by_plan_with_headers() {
+    use axeon::middleware::rate_limit::{Quota, RateLimiter};
+    let mut app = Server::new();
+    app.middleware(
+        RateLimiter::new(Quota::per_minute(60).burst(1))
+            .key_by(|req| req.get_header("x-api-key").map(String::from))
+            .quota_by(|req| match req.get_header("x-plan") {
+                Some("pro") => Some(Quota::daily(3)),
+                _ => None,
+            })
+            .headers(true),
+    );
+    app.get("/", |_req| async { "ok" });
+    let app = app.into_app().await.unwrap();
+    let call = |key: &'static str, plan: &'static str| {
+        app.call(axeon::Request::new(axeon::Method::GET, "/").with_header("x-api-key", key).with_header("x-plan", plan))
+    };
+
+    let first = call("free", "free").await;
+    assert_eq!(first.status, 200);
+    assert_eq!(first.get_header("ratelimit-limit"), Some("1"));
+    assert_eq!(first.get_header("ratelimit-remaining"), Some("0"));
+    assert_eq!(first.get_header("ratelimit-policy"), Some("60;w=60;burst=1"));
+    let limited = call("free", "free").await;
+    assert_eq!(limited.status, 429);
+    assert_eq!(limited.get_header("ratelimit-remaining"), Some("0"));
+    assert!(limited.get_header("retry-after").is_some());
+
+    // A daily plan quota, on its own state.
+    let mut remaining = Vec::new();
+    for _ in 0..4 {
+        remaining.push(call("pro", "pro").await.get_header("ratelimit-remaining").unwrap().to_string());
+    }
+    assert_eq!(remaining, ["2", "1", "0", "0"]);
+}
+
+#[tokio::test]
+async fn rate_limit_store_failures_fail_open_or_closed() {
+    use axeon::middleware::rate_limit::{Quota, RateLimitDecision, RateLimitStore, RateLimiter};
+    struct Down;
+    impl RateLimitStore for Down {
+        fn check<'a>(
+            &'a self,
+            _key: &'a str,
+            _quota: &'a Quota,
+        ) -> futures::future::BoxFuture<'a, Result<RateLimitDecision, Box<dyn std::error::Error + Send + Sync>>> {
+            Box::pin(async { Err("connection refused".into()) })
+        }
+    }
+    for (open, status) in [(true, 200), (false, 503)] {
+        let mut app = Server::new();
+        app.middleware(RateLimiter::per_minute(1).store(Down).fail_open(open));
+        app.get("/", |_req| async { "ok" });
+        let app = app.into_app().await.unwrap();
+        assert_eq!(app.call(axeon::Request::new(axeon::Method::GET, "/")).await.status, status);
+    }
+}
+
+#[tokio::test]
 async fn security_headers_defaults_and_overrides() {
     use axeon::middleware::SecurityHeaders;
     let mut app = Server::new();

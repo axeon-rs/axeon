@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Keyset pagination:** `Query::cursor_paginate(ex, after, limit)` returns
+  a `CursorPage` with `items` and an opaque, URL-safe `next_cursor`. No
+  `OFFSET` or `COUNT(*)`, so deep pages cost the same as the first. Orders
+  by the query's `order_by` columns (any mix of directions) plus the primary
+  key as tie-breaker; cursors from another sort order, or damaged ones, are
+  rejected with the new `Error::InvalidCursor` (400 in Axeon handlers).
+
+### Changed
+
+- The `tls` feature uses rustls' aws-lc-rs provider
+  (`sqlx/tls-rustls-aws-lc-rs`) instead of ring, like Axeon and
+  axeon-client. Apps combining them no longer compile in two providers,
+  which made `Server::with_tls` and Redis TLS panic.
+- `serde_json` is always a dependency (cursors are JSON); the `json`
+  feature still controls JSON columns.
+
 ## 0.3.0 (2026-10-22)
 
 Additive: everything from 0.2 keeps working. The minor version marks the size
