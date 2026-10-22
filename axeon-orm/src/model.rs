@@ -294,6 +294,7 @@ fn write_insert<M: Model>(sql: &mut Sql, backend: Backend, values: Vec<(&'static
 #[doc(hidden)]
 pub async fn insert<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M> {
     let mut conn = ex.into_conn();
+    conn.writable()?;
     conn.scope().check_row(model)?;
     let backend = conn.backend();
     let mut sql = Sql::new(backend);
@@ -401,6 +402,7 @@ fn write_conflict_target<M>(sql: &mut Sql, backend: Backend, conflict: &OnConfli
 #[doc(hidden)]
 pub async fn upsert<'c, M: Model>(ex: impl Executor<'c>, model: &M, conflict: &OnConflict<M>) -> Result<M> {
     let mut conn = ex.into_conn();
+    conn.writable()?;
     conn.scope().check_row(model)?;
     let guard = conn.scope().filter_for::<M>()?;
     let result = upsert_scoped(&mut conn, model, conflict, guard.is_some()).await;
@@ -515,6 +517,7 @@ async fn upsert_mysql<M: Model>(_: &mut Conn<'_>, _: Sql, _: &M, _: &OnConflict<
 #[doc(hidden)]
 pub async fn insert_or_ignore<'c, M: Model>(ex: impl Executor<'c>, model: &M, conflict: &OnConflict<M>) -> Result<Option<M>> {
     let mut conn = ex.into_conn();
+    conn.writable()?;
     conn.scope().check_row(model)?;
     let backend = conn.backend();
     let mut sql = Sql::new(backend);
@@ -549,6 +552,7 @@ async fn insert_or_ignore_mysql<M: Model>(_: &mut Conn<'_>, _: Sql, _: &M) -> Re
 #[doc(hidden)]
 pub async fn update<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M> {
     let mut conn = ex.into_conn();
+    conn.writable()?;
     conn.scope().check_row(model)?;
     let tenant = conn.scope().filter_for::<M>()?;
     let backend = conn.backend();
@@ -620,6 +624,7 @@ async fn missing_or_stale<M: Model>(conn: &mut Conn<'_>, key: Vec<Cond>) -> Erro
 #[doc(hidden)]
 pub async fn delete<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<()> {
     let mut conn = ex.into_conn();
+    conn.writable()?;
     let key = key_conds(model);
     let mut conds = key.clone();
     conds.extend(conn.scope().filter_for::<M>()?);
@@ -667,6 +672,7 @@ pub async fn upsert_many<'c, M: Model>(ex: impl Executor<'c>, models: &[M], conf
 async fn bulk<'c, M: Model>(ex: impl Executor<'c>, models: &[M], conflict: Option<&OnConflict<M>>) -> Result<Vec<M>> {
     let Some(first) = models.first() else { return Ok(Vec::new()) };
     let mut conn = ex.into_conn();
+    conn.writable()?;
     for model in models {
         conn.scope().check_row(model)?;
     }

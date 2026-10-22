@@ -398,6 +398,7 @@ impl<P: Model, C: Model> BelongsToMany<P, C> {
     /// Unlinks `related` from `parent`; returns whether a link existed.
     pub async fn detach<'c>(&self, ex: impl Executor<'c>, parent: &P, related: &C) -> Result<bool> {
         let mut conn = ex.into_conn();
+        conn.writable()?;
         let key = related.get(C::PRIMARY_KEY).unwrap_or(Value::Null(primary_key::<C>().kind));
         let mut sql = Sql::new(conn.backend());
         sql.push("DELETE FROM ").ident(self.pivot);
@@ -409,6 +410,7 @@ impl<P: Model, C: Model> BelongsToMany<P, C> {
     /// Unlinks everything from `parent`; returns how many links were removed.
     pub async fn detach_all<'c>(&self, ex: impl Executor<'c>, parent: &P) -> Result<u64> {
         let mut conn = ex.into_conn();
+        conn.writable()?;
         let mut sql = Sql::new(conn.backend());
         sql.push("DELETE FROM ").ident(self.pivot);
         sql.where_clause(&[Cond::Compare(self.foreign_key, "=", Self::parent_key(parent))]);
@@ -421,6 +423,7 @@ impl<P: Model, C: Model> BelongsToMany<P, C> {
     /// atomic.
     pub async fn sync<'c, V: SqlType>(&self, ex: impl Executor<'c>, parent: &P, keys: impl IntoIterator<Item = V>) -> Result<()> {
         let mut conn = ex.into_conn();
+        conn.writable()?;
         let keys: Vec<Value> = keys.into_iter().map(|k| k.to_value()).collect();
         let mut sql = Sql::new(conn.backend());
         sql.push("DELETE FROM ").ident(self.pivot);
@@ -435,6 +438,7 @@ impl<P: Model, C: Model> BelongsToMany<P, C> {
 
     /// Inserts pivot rows, skipping links that already exist.
     async fn insert_links(&self, conn: &mut Conn<'_>, parent: Value, keys: Vec<Value>) -> Result<()> {
+        conn.writable()?;
         for chunk in keys.chunks(CHUNK / 2) {
             let backend = conn.backend();
             let mut sql = Sql::new(backend);

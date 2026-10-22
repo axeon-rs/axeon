@@ -80,6 +80,12 @@
   from composite-key models, and `belongs_to` targeting one, are compile
   errors.
 
+- **Read replicas:** `Db::with_replicas` attaches replica pools;
+  `Db::replica()` hands out a handle on the next one in turn (or the
+  primary when there are none) that keeps the tenant scope and metrics and
+  refuses writes, also in transactions begun on it. `replica_count` and
+  `is_replica` describe a handle.
+
 ### Changed
 
 - The `tls` feature uses rustls' aws-lc-rs provider

@@ -125,6 +125,17 @@ pub struct Db {
     inner: Pool,
     scope: Scope,
     observer: Arc<Observer>,
+    /// Read replicas, from [`Db::with_replicas`].
+    replicas: Option<Arc<Replicas>>,
+    /// A replica handle: writes are refused.
+    read_only: bool,
+}
+
+/// Replica pools, taken in turn.
+#[derive(Debug)]
+struct Replicas {
+    pools: Vec<Pool>,
+    next: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Debug)]
@@ -166,7 +177,7 @@ impl Db {
                     .idle_timeout(options.idle_timeout)
                     .connect_with(connect)
                     .await?;
-                return Ok(Db { inner: Pool::Postgres(pool), scope: Scope::Unset, observer: observer.clone() });
+                return Ok(Db { inner: Pool::Postgres(pool), scope: Scope::Unset, observer: observer.clone(), replicas: None, read_only: false });
             }
             #[cfg(not(feature = "postgres"))]
             return Err(Error::Config("PostgreSQL support needs the `postgres` feature".into()));
@@ -189,7 +200,7 @@ impl Db {
                     // connection open forever.
                     pool = pool.max_connections(1).min_connections(1).idle_timeout(None).max_lifetime(None);
                 }
-                return Ok(Db { inner: Pool::Sqlite(pool.connect_with(connect).await?), scope: Scope::Unset, observer: observer.clone() });
+                return Ok(Db { inner: Pool::Sqlite(pool.connect_with(connect).await?), scope: Scope::Unset, observer: observer.clone(), replicas: None, read_only: false });
             }
             #[cfg(not(feature = "sqlite"))]
             return Err(Error::Config("SQLite support needs the `sqlite` feature".into()));
@@ -215,7 +226,7 @@ impl Db {
                     });
                 }
                 let pool = pool.connect_with(connect).await?;
-                return Ok(Db { inner: Pool::MySql(pool), scope: Scope::Unset, observer: observer.clone() });
+                return Ok(Db { inner: Pool::MySql(pool), scope: Scope::Unset, observer: observer.clone(), replicas: None, read_only: false });
             }
             #[cfg(not(feature = "mysql"))]
             return Err(Error::Config("MySQL support needs the `mysql` feature".into()));
@@ -253,14 +264,71 @@ impl Db {
     /// Not covered: raw SQL (`execute`, `postgres()` and the like), pivot
     /// tables, and models without a tenant column.
     pub fn for_tenant(&self, tenant: impl Into<Value>) -> Db {
-        Db { inner: self.inner.clone(), scope: Scope::Tenant(tenant.into()), observer: self.observer.clone() }
+        Db { inner: self.inner.clone(), scope: Scope::Tenant(tenant.into()), observer: self.observer.clone(), replicas: self.replicas.clone(), read_only: self.read_only }
     }
 
     /// The same pool, seeing every tenant's rows: for background jobs,
     /// migrations and operator tools. The explicit opt-out from tenant
     /// scopes; a plain `Db` refuses to touch tenant-scoped models.
     pub fn all_tenants(&self) -> Db {
-        Db { inner: self.inner.clone(), scope: Scope::All, observer: self.observer.clone() }
+        Db { inner: self.inner.clone(), scope: Scope::All, observer: self.observer.clone(), replicas: self.replicas.clone(), read_only: self.read_only }
+    }
+
+    /// Adds read replicas: [`replica`](Db::replica) then hands out handles
+    /// on them in turn. Connect each with [`Db::connect_with`] (same
+    /// backend); this `Db` stays the primary for writes and for reads
+    /// that must see the latest data.
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, DbOptions, Model};
+    /// # #[derive(Model)] struct Product { id: i64, category: String }
+    /// # async fn run() -> axeon_orm::Result<()> {
+    /// let db = Db::connect("postgres://primary/app").await?.with_replicas(vec![
+    ///     Db::connect("postgres://replica-1/app").await?,
+    ///     Db::connect("postgres://replica-2/app").await?,
+    /// ]);
+    ///
+    /// // A catalog read that tolerates a little replication lag:
+    /// let lighting = Product::query().filter(Product::CATEGORY.eq("lighting")).all(&db.replica()).await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// When a replica's backend differs from the primary's.
+    pub fn with_replicas(mut self, replicas: Vec<Db>) -> Db {
+        for replica in &replicas {
+            assert_eq!(replica.backend(), self.backend(), "a replica must use the same database as the primary");
+        }
+        let pools = replicas.into_iter().map(|r| r.inner).collect::<Vec<_>>();
+        self.replicas = (!pools.is_empty()).then(|| Arc::new(Replicas { pools, next: Default::default() }));
+        self
+    }
+
+    /// A handle on the next read replica (in turn), or on the primary when
+    /// there are none, so the same code runs without replicas. It keeps
+    /// this handle's tenant scope and metrics, and refuses writes with
+    /// [`Error::Config`]. Replicas lag behind the primary: read what you
+    /// just wrote from the primary.
+    pub fn replica(&self) -> Db {
+        let inner = match &self.replicas {
+            Some(replicas) => {
+                let turn = replicas.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                replicas.pools[turn % replicas.pools.len()].clone()
+            }
+            None => self.inner.clone(),
+        };
+        Db { inner, scope: self.scope.clone(), observer: self.observer.clone(), replicas: None, read_only: true }
+    }
+
+    /// How many read replicas this `Db` has.
+    pub fn replica_count(&self) -> usize {
+        self.replicas.as_ref().map_or(0, |r| r.pools.len())
+    }
+
+    /// Whether this is a [`replica`](Db::replica) handle, which refuses writes.
+    pub fn is_replica(&self) -> bool {
+        self.read_only
     }
 
     /// The tenant this handle is scoped to, if any.
@@ -294,7 +362,7 @@ impl Db {
             #[cfg(feature = "mysql")]
             Pool::MySql(pool) => Tx::MySql(pool.begin().await?),
         };
-        Ok(Transaction { inner, failed: false, scope: self.scope.clone(), observer: self.observer.clone() })
+        Ok(Transaction { inner, failed: false, scope: self.scope.clone(), observer: self.observer.clone(), read_only: self.read_only })
     }
 
     /// Checks the database answers, e.g. for a readiness probe.
@@ -373,21 +441,21 @@ impl Db {
 #[cfg(feature = "mysql")]
 impl From<sqlx::MySqlPool> for Db {
     fn from(pool: sqlx::MySqlPool) -> Self {
-        Db { inner: Pool::MySql(pool), scope: Scope::Unset, observer: Arc::default() }
+        Db { inner: Pool::MySql(pool), scope: Scope::Unset, observer: Arc::default(), replicas: None, read_only: false }
     }
 }
 
 #[cfg(feature = "postgres")]
 impl From<sqlx::PgPool> for Db {
     fn from(pool: sqlx::PgPool) -> Self {
-        Db { inner: Pool::Postgres(pool), scope: Scope::Unset, observer: Arc::default() }
+        Db { inner: Pool::Postgres(pool), scope: Scope::Unset, observer: Arc::default(), replicas: None, read_only: false }
     }
 }
 
 #[cfg(feature = "sqlite")]
 impl From<sqlx::SqlitePool> for Db {
     fn from(pool: sqlx::SqlitePool) -> Self {
-        Db { inner: Pool::Sqlite(pool), scope: Scope::Unset, observer: Arc::default() }
+        Db { inner: Pool::Sqlite(pool), scope: Scope::Unset, observer: Arc::default(), replicas: None, read_only: false }
     }
 }
 
@@ -404,6 +472,8 @@ pub struct Transaction {
     scope: Scope,
     /// Query timing, from the `Db` it began on.
     observer: Arc<Observer>,
+    /// Begun on a replica handle: writes are refused.
+    read_only: bool,
 }
 
 #[derive(Debug)]
@@ -733,6 +803,19 @@ macro_rules! run {
 }
 
 impl Conn<'_> {
+    /// Fails for a [replica](Db::replica) handle (or a transaction begun
+    /// on one), before a write reaches the replica.
+    pub(crate) fn writable(&self) -> Result<()> {
+        let read_only = match self {
+            Conn::Db(db) => db.read_only,
+            Conn::Tx(tx) => tx.read_only,
+        };
+        if read_only {
+            return Err(Error::Config("writes must go to the primary, not a replica handle".into()));
+        }
+        Ok(())
+    }
+
     pub(crate) fn scope(&self) -> &Scope {
         match self {
             Conn::Db(db) => &db.scope,
@@ -743,7 +826,7 @@ impl Conn<'_> {
     /// Runs with another tenant scope, e.g. for a query that opted out.
     pub(crate) fn rescoped(&mut self, scope: Scope) -> Rescoped<'_> {
         match self {
-            Conn::Db(db) => Rescoped::Db(Db { inner: db.inner.clone(), scope, observer: db.observer.clone() }),
+            Conn::Db(db) => Rescoped::Db(Db { inner: db.inner.clone(), scope, observer: db.observer.clone(), replicas: db.replicas.clone(), read_only: db.read_only }),
             Conn::Tx(tx) => {
                 let previous = std::mem::replace(&mut tx.scope, scope);
                 Rescoped::Tx(tx, Some(previous))

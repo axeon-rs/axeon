@@ -478,6 +478,27 @@ let n = Selection::query().all_tenants().count(&org).await?; // per query
   gets the filter added beside it), pivot tables, and models without a
   tenant column.
 
+## Read replicas
+
+```rust
+let db = Db::connect(&primary_url).await?.with_replicas(vec![
+    Db::connect(&replica_1_url).await?,
+    Db::connect(&replica_2_url).await?,
+]);
+
+// Reads that tolerate replication lag go to a replica, in turn:
+let products = Product::query().filter(Product::CATEGORY.eq("lighting")).all(&db.replica()).await?;
+// Writes, and reads right after them, stay on `db`.
+```
+
+- `db.replica()` is a handle like any `Db` (queries, `find`, streams,
+  reports, cursors), with the same tenant scope and metrics; without
+  replicas it reads the primary, so the same code runs everywhere.
+- Writes through it (and through transactions begun on it) fail with
+  `Error::Config` before reaching the replica.
+- Routing is explicit because only the app knows which reads can be a
+  little stale.
+
 ## Query observability
 
 ```rust

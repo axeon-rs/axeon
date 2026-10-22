@@ -1075,6 +1075,7 @@ impl<M: Model> Query<M> {
     /// empties the table.
     pub async fn delete<'c>(self, ex: impl Executor<'c>) -> Result<u64> {
         let mut conn = ex.into_conn();
+        conn.writable()?;
         let mut sql = Sql::new(conn.backend());
         sql.push("DELETE FROM ").ident(M::TABLE);
         sql.where_clause(&self.scoped(&conn)?);
@@ -1095,6 +1096,7 @@ impl<M: Model> Query<M> {
     /// ```
     pub async fn update<'c>(self, ex: impl Executor<'c>, set: impl IntoIterator<Item = Assignment<M>>) -> Result<u64> {
         let mut conn = ex.into_conn();
+        conn.writable()?;
         let scope = self.scope(&conn);
         let conds = scope.apply::<M>(&self.conds)?;
         let mut sql = Sql::new(conn.backend());
