@@ -192,6 +192,37 @@ let tags = post.tags().all(&db).await?;
 let posts_with_tags = Post::query().with(Post::TAGS).all(&db).await?;
 ```
 
+### Composite keys and pivot tables with data
+
+Mark several fields `#[model(primary_key)]` for a composite key. That also
+covers pivot rows that carry data, such as a margin on a buyer's
+selection: make the pivot table a model.
+
+```rust
+#[derive(Model)]
+#[model(table = "selections")]
+struct Selection {
+    #[model(primary_key, belongs_to = Buyer)]
+    buyer_id: i64,
+    #[model(primary_key, belongs_to = Product)]
+    product_id: i64,
+    margin: f64,
+}
+
+let s = Selection::find_or_fail(&db, (buyer.id, product.id)).await?;   // find by the tuple
+let rows: Vec<(Selection, Product)> = Selection::query()
+    .filter(Selection::BUYER_ID.eq(buyer.id))
+    .join(Selection::PRODUCT)                                           // pivot data + the product
+    .all(&db)
+    .await?;
+```
+
+Insert, update, delete, upserts (`OnConflict::on(..).and(..)`), bulk
+inserts and cursor pagination use every key column. A composite-key model
+can `belongs_to` others, but can't have `has_many`, `has_one` or
+`belongs_to_many` relations, and can't be the target of a `belongs_to`
+(both are compile errors).
+
 ### Filtering by relations
 
 ```rust
@@ -627,8 +658,8 @@ app.post("/transfer", |req| async move {
 
 ## Not yet
 
-Planned for later versions: composite primary keys, extra columns on pivot
-tables, self-joins in reports, and down migrations. For anything
+Planned for later versions: relations from composite-key models,
+self-joins in reports, and down migrations. For anything
 the ORM can't express, use sqlx directly via `db.postgres()` /
 `db.sqlite()`.
 

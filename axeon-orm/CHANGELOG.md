@@ -72,6 +72,14 @@
   detaches and drops partitions that ended before a cutoff, and
   `partitions` lists them with UTC bounds.
 
+- **Composite primary keys:** several `#[model(primary_key)]` fields;
+  `Model::PRIMARY_KEYS` lists them, `find` / `find_or_fail` take a tuple,
+  and inserts (including MySQL's read-back), updates, deletes, bulk
+  inserts, upserts, cursor pagination and generated tables use every key
+  column. Pivot tables with extra columns are modelled this way. Relations
+  from composite-key models, and `belongs_to` targeting one, are compile
+  errors.
+
 ### Changed
 
 - The `tls` feature uses rustls' aws-lc-rs provider

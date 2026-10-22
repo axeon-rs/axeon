@@ -53,9 +53,11 @@ pub(crate) fn keys<M: Model>(order: &[Sort]) -> Result<Vec<Key>> {
         }
         keys.push((*column, sort.descending));
     }
-    if !keys.iter().any(|(c, _)| *c == M::PRIMARY_KEY) {
-        let descending = keys.last().is_some_and(|(_, d)| *d);
-        keys.push((M::PRIMARY_KEY, descending));
+    let descending = keys.last().is_some_and(|(_, d)| *d);
+    for key in M::PRIMARY_KEYS {
+        if !keys.iter().any(|(c, _)| c == key) {
+            keys.push((key, descending));
+        }
     }
     Ok(keys)
 }

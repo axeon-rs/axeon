@@ -264,7 +264,7 @@ mod sealed {
 #[doc(hidden)]
 pub mod __private {
     pub use crate::db::Conn;
-    pub use crate::model::{column_name, delete, find, has_column, insert, insert_many, insert_or_ignore, update, upsert, upsert_many};
+    pub use crate::model::{column_name, delete, find, find_by_key, has_column, insert, insert_many, insert_or_ignore, update, upsert, upsert_many};
 
     pub fn decode_error(column: &str, error: impl std::fmt::Display) -> crate::Error {
         crate::Error::decode(column, error)
@@ -357,6 +357,25 @@ pub mod __private {
 /// ```compile_fail
 /// #[derive(axeon_orm::Model)]
 /// struct Doc { id: i64, #[model(version)] version: Option<i64> }
+/// ```
+///
+/// Relations from a model with a composite primary key:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::Model)]
+/// struct Post { id: i64, selection_id: i64 }
+/// #[derive(axeon_orm::Model)]
+/// #[model(has_many(Post))]
+/// struct Selection { #[model(primary_key)] a: i64, #[model(primary_key)] b: i64 }
+/// ```
+///
+/// `belongs_to` a model with a composite primary key:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::Model)]
+/// struct Pair { #[model(primary_key)] a: i64, #[model(primary_key)] b: i64 }
+/// #[derive(axeon_orm::Model)]
+/// struct Note { id: i64, #[model(belongs_to = Pair)] pair_id: i64 }
 /// ```
 ///
 /// Two version columns:

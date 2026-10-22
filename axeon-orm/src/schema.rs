@@ -75,10 +75,6 @@ fn is_indexed(column: &ColumnDef) -> bool {
     column.primary_key || column.unique || column.index || column.references.is_some()
 }
 
-fn column_sql(column: &ColumnDef, backend: Backend) -> String {
-    column_sql_with(column, backend, true)
-}
-
 /// A column definition; without `inline_keys`, `PRIMARY KEY` and `UNIQUE`
 /// are left for table-level constraints (partitioned tables).
 fn column_sql_with(column: &ColumnDef, backend: Backend, inline_keys: bool) -> String {
@@ -150,7 +146,15 @@ fn foreign_key(backend: Backend, column: &str, table: &str, target: &str, on_del
 /// `#[model(index)]` column.
 pub fn create_table<M: Model>(backend: Backend) -> String {
     let table = ident(backend, M::TABLE);
-    let mut lines: Vec<String> = M::COLUMNS.iter().map(|c| format!("    {}", column_sql(c, backend))).collect();
+    let composite = M::PRIMARY_KEYS.len() > 1;
+    let mut lines: Vec<String> = M::COLUMNS
+        .iter()
+        .map(|c| format!("    {}", column_sql_with(c, backend, !(composite && c.primary_key))))
+        .collect();
+    if composite {
+        let key: Vec<String> = M::PRIMARY_KEYS.iter().map(|c| ident(backend, c)).collect();
+        lines.push(format!("    PRIMARY KEY ({})", key.join(", ")));
+    }
     let indexed = M::COLUMNS.iter().filter(|c| c.index && !c.unique && !c.primary_key);
     let index_name = |column: &str| ident(backend, &format!("{}_{}_index", M::TABLE, column));
     let mut after = String::new();
@@ -192,9 +196,11 @@ pub(crate) fn create_partitioned_table<M: Model>(column: &str) -> crate::Result<
     }
     let table = ident(backend, M::TABLE);
     let mut lines: Vec<String> = M::COLUMNS.iter().map(|c| format!("    {}", column_sql_with(c, backend, false))).collect();
-    let pk = primary_key::<M>().name;
-    let key = if pk == column { ident(backend, pk) } else { format!("{}, {}", ident(backend, pk), ident(backend, column)) };
-    lines.push(format!("    PRIMARY KEY ({})", key));
+    let mut key: Vec<String> = M::PRIMARY_KEYS.iter().map(|c| ident(backend, c)).collect();
+    if !M::PRIMARY_KEYS.contains(&column) {
+        key.push(ident(backend, column));
+    }
+    lines.push(format!("    PRIMARY KEY ({})", key.join(", ")));
     let mut after = String::new();
     for indexed in M::COLUMNS.iter().filter(|c| c.index && !c.unique && !c.primary_key) {
         after.push_str(&format!(

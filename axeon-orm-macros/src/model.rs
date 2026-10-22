@@ -184,18 +184,70 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         }
     }
 
-    let explicit: Vec<&&Field> = columns.iter().filter(|f| f.attrs.primary_key).collect();
-    let pk = match explicit.as_slice() {
-        [one] => **one,
-        [] => *columns.iter().find(|f| f.ident == "id").ok_or_else(|| {
+    let explicit: Vec<&Field> = columns.iter().filter(|f| f.attrs.primary_key).copied().collect();
+    let pks: Vec<&Field> = match explicit.as_slice() {
+        [] => vec![*columns.iter().find(|f| f.ident == "id").ok_or_else(|| {
             Error::new(Span::call_site(), "add an `id` field or mark the primary key with #[model(primary_key)]")
-        })?,
-        [_, second, ..] => {
-            return Err(Error::new_spanned(&second.ident, "only one primary key is supported"));
+        })?],
+        _ => explicit,
+    };
+    let composite = pks.len() > 1;
+    if composite {
+        if let Some(relation) = relations.first() {
+            return Err(Error::new_spanned(
+                &relation.target,
+                "a model with a composite primary key can't have has_many, has_one or belongs_to_many relations",
+            ));
+        }
+    }
+    let pk = pks[0];
+    let find_methods = if composite {
+        let params: Vec<Ident> = (0..pks.len()).map(|i| format_ident!("k{}", i)).collect();
+        let tys: Vec<&Type> = pks.iter().map(|f| &f.ty).collect();
+        let columns: Vec<&str> = pks.iter().map(|f| f.column.as_str()).collect();
+        let doc = format!("The key: `({})`.", columns.join(", "));
+        quote! {
+            /// Fetches the row with this primary key.
+            #[doc = #doc]
+            pub async fn find<'c>(
+                ex: impl ::axeon_orm::Executor<'c>,
+                key: (#(impl ::core::convert::Into<#tys>),*),
+            ) -> ::axeon_orm::Result<::core::option::Option<Self>> {
+                let (#(#params),*) = key;
+                let values = ::std::vec![#(::axeon_orm::SqlType::to_value(&::core::convert::Into::<#tys>::into(#params))),*];
+                ::axeon_orm::__private::find_by_key(ex, values).await
+            }
+
+            /// Fetches the row with this primary key, or fails with `Error::NotFound`.
+            pub async fn find_or_fail<'c>(
+                ex: impl ::axeon_orm::Executor<'c>,
+                key: (#(impl ::core::convert::Into<#tys>),*),
+            ) -> ::axeon_orm::Result<Self> {
+                Self::find(ex, key).await?.ok_or(::axeon_orm::Error::NotFound)
+            }
+        }
+    } else {
+        let pk_ty = &pk.ty;
+        quote! {
+            /// Fetches the row with this primary key.
+            pub async fn find<'c>(
+                ex: impl ::axeon_orm::Executor<'c>,
+                key: impl ::core::convert::Into<#pk_ty>,
+            ) -> ::axeon_orm::Result<::core::option::Option<Self>> {
+                ::axeon_orm::__private::find(ex, ::axeon_orm::SqlType::to_value(&key.into())).await
+            }
+
+            /// Fetches the row with this primary key, or fails with `Error::NotFound`.
+            pub async fn find_or_fail<'c>(
+                ex: impl ::axeon_orm::Executor<'c>,
+                key: impl ::core::convert::Into<#pk_ty>,
+            ) -> ::axeon_orm::Result<Self> {
+                Self::find(ex, key).await?.ok_or(::axeon_orm::Error::NotFound)
+            }
         }
     };
     let pk_column = &pk.column;
-    let pk_ty = &pk.ty;
+    let pk_columns: Vec<&String> = pks.iter().map(|f| &f.column).collect();
 
     let tenants: Vec<&&Field> = columns.iter().filter(|f| f.attrs.tenant).collect();
     let tenant = match tenants.as_slice() {
@@ -230,8 +282,11 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
             ::axeon_orm::ColumnDef::new(#col, <#ty as ::axeon_orm::SqlType>::KIND, <#ty as ::axeon_orm::SqlType>::NULLABLE)
                 .values(<#ty as ::axeon_orm::SqlType>::VALUES)
         };
-        if std::ptr::eq(*f, pk) {
+        if pks.iter().any(|k| std::ptr::eq(*k, *f)) {
             def = quote! { #def.primary_key() };
+            if composite {
+                def = quote! { #def.composite_key() };
+            }
         }
         if f.attrs.unique {
             def = quote! { #def.unique() };
@@ -321,6 +376,10 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
             let related_key =
                 relation.related_key.as_ref().map(LitStr::value).unwrap_or_else(|| format!("{}_id", target_snake));
             let doc = format!("The `{}` records linked to this one through `{}`.", target_name, pivot);
+            let message = format!("{}::{}: belongs_to_many needs a model with a single-column primary key", name, accessor);
+            assertions.push(quote! {
+                assert!(<#target as ::axeon_orm::Model>::PRIMARY_KEYS.len() == 1, #message);
+            });
             relation_items.push(quote! {
                 #[doc = #doc]
                 pub const #const_ident: ::axeon_orm::BelongsToMany<Self, #target> =
@@ -359,6 +418,10 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         let const_ident = format_ident!("{}", accessor.to_uppercase());
         let col = &field.column;
         let doc = format!("The record `{}` points to.", col);
+        let message = format!("{}.{}: belongs_to needs a model with a single-column primary key", name, col);
+        assertions.push(quote! {
+            assert!(<#target as ::axeon_orm::Model>::PRIMARY_KEYS.len() == 1, #message);
+        });
         relation_items.push(quote! {
             #[doc = #doc]
             pub const #const_ident: ::axeon_orm::BelongsTo<Self, #target> = ::axeon_orm::BelongsTo::new(#col);
@@ -374,6 +437,7 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         impl ::axeon_orm::Model for #name {
             const TABLE: &'static str = #table;
             const PRIMARY_KEY: &'static str = #pk_column;
+            const PRIMARY_KEYS: &'static [&'static str] = &[#(#pk_columns),*];
             const COLUMNS: &'static [::axeon_orm::ColumnDef] = &[#(#column_defs),*];
             const TENANT: ::core::option::Option<&'static str> = #tenant;
             const VERSION: ::core::option::Option<&'static str> = #version;
@@ -402,21 +466,7 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                 ::axeon_orm::Query::new()
             }
 
-            /// Fetches the row with this primary key.
-            pub async fn find<'c>(
-                ex: impl ::axeon_orm::Executor<'c>,
-                key: impl ::core::convert::Into<#pk_ty>,
-            ) -> ::axeon_orm::Result<::core::option::Option<Self>> {
-                ::axeon_orm::__private::find(ex, ::axeon_orm::SqlType::to_value(&key.into())).await
-            }
-
-            /// Fetches the row with this primary key, or fails with `Error::NotFound`.
-            pub async fn find_or_fail<'c>(
-                ex: impl ::axeon_orm::Executor<'c>,
-                key: impl ::core::convert::Into<#pk_ty>,
-            ) -> ::axeon_orm::Result<Self> {
-                Self::find(ex, key).await?.ok_or(::axeon_orm::Error::NotFound)
-            }
+            #find_methods
 
             /// Fetches every row.
             pub async fn all<'c>(ex: impl ::axeon_orm::Executor<'c>) -> ::axeon_orm::Result<::std::vec::Vec<Self>> {

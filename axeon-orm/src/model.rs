@@ -32,8 +32,11 @@ use std::marker::PhantomData;
 pub trait Model: Sized + Send + Sync + Unpin + 'static {
     /// The table name.
     const TABLE: &'static str;
-    /// The primary key column.
+    /// The primary key column (the first one, for a composite key).
     const PRIMARY_KEY: &'static str;
+    /// Every primary key column: one, or several for a composite key
+    /// (several `#[model(primary_key)]` fields).
+    const PRIMARY_KEYS: &'static [&'static str] = &[Self::PRIMARY_KEY];
     /// Every column, in field order.
     const COLUMNS: &'static [ColumnDef];
     /// The tenant column (`#[model(tenant)]`), if rows belong to tenants.
@@ -139,6 +142,12 @@ impl ColumnDef {
     }
 
     #[doc(hidden)]
+    pub const fn composite_key(mut self) -> Self {
+        self.auto_increment = false;
+        self
+    }
+
+    #[doc(hidden)]
     pub const fn unique(mut self) -> Self {
         self.unique = true;
         self
@@ -214,7 +223,16 @@ fn value_of<M: Model>(model: &M, column: &'static str) -> Value {
 
 /// The row whose `column` equals `key`, within the tenant scope.
 pub(crate) async fn fetch_one_where<M: Model>(conn: &mut Conn<'_>, column: &'static str, key: Value) -> Result<Option<M>> {
-    let mut conds = vec![Cond::Compare(column, "=", key)];
+    fetch_one_by(conn, vec![Cond::Compare(column, "=", key)]).await
+}
+
+/// `key column = value` for every primary key column of `model`.
+fn key_conds<M: Model>(model: &M) -> Vec<Cond> {
+    M::PRIMARY_KEYS.iter().map(|column| Cond::Compare(column, "=", value_of(model, column))).collect()
+}
+
+/// The first row matching `conds`, within the tenant scope.
+async fn fetch_one_by<M: Model>(conn: &mut Conn<'_>, mut conds: Vec<Cond>) -> Result<Option<M>> {
     conds.extend(conn.scope().filter_for::<M>()?);
     let mut sql = Sql::new(conn.backend());
     sql.push("SELECT ").push(&column_list::<M>(conn.backend())).push(" FROM ").ident(M::TABLE);
@@ -227,6 +245,13 @@ pub(crate) async fn fetch_one_where<M: Model>(conn: &mut Conn<'_>, column: &'sta
 #[doc(hidden)]
 pub async fn find<'c, M: Model>(ex: impl Executor<'c>, key: Value) -> Result<Option<M>> {
     fetch_one_where(&mut ex.into_conn(), M::PRIMARY_KEY, key).await
+}
+
+/// Fetches by a composite key: one value per primary key column, in order.
+#[doc(hidden)]
+pub async fn find_by_key<'c, M: Model>(ex: impl Executor<'c>, key: Vec<Value>) -> Result<Option<M>> {
+    let conds = M::PRIMARY_KEYS.iter().zip(key).map(|(column, value)| Cond::Compare(column, "=", value)).collect();
+    fetch_one_by(&mut ex.into_conn(), conds).await
 }
 
 /// The columns an `INSERT` writes and their values: all but
@@ -287,8 +312,7 @@ pub async fn insert<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M>
 async fn insert_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, model: &M) -> Result<M> {
     let (sql, args) = sql.finish();
     let id = conn.insert_mysql(sql, args).await?;
-    let key = mysql_key(model, id);
-    fetch_one_where(conn, M::PRIMARY_KEY, key).await?.ok_or(Error::NotFound)
+    fetch_one_by(conn, mysql_key(model, id)).await?.ok_or(Error::NotFound)
 }
 
 #[cfg(not(feature = "mysql"))]
@@ -296,15 +320,15 @@ async fn insert_mysql<M: Model>(_: &mut Conn<'_>, _: Sql, _: &M) -> Result<M> {
     unreachable!("MySQL connections need the `mysql` feature")
 }
 
-/// The primary key of a row MySQL just wrote: `id` from `LAST_INSERT_ID()`
-/// for an auto-increment key, else the model's own key.
+/// The key of a row MySQL just wrote, as conditions: `id` from
+/// `LAST_INSERT_ID()` for an auto-increment key, else the model's own key.
 #[cfg(feature = "mysql")]
-fn mysql_key<M: Model>(model: &M, id: u64) -> Value {
+fn mysql_key<M: Model>(model: &M, id: u64) -> Vec<Cond> {
     let pk = primary_key::<M>();
     match (pk.auto_increment, pk.kind) {
-        (true, Kind::I32) => Value::I32(id as i32),
-        (true, _) => Value::I64(id as i64),
-        (false, _) => value_of(model, pk.name),
+        (true, Kind::I32) => vec![Cond::Compare(pk.name, "=", Value::I32(id as i32))],
+        (true, _) => vec![Cond::Compare(pk.name, "=", Value::I64(id as i64))],
+        (false, _) => key_conds(model),
     }
 }
 
@@ -477,7 +501,7 @@ async fn upsert_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, model: &M, confli
     let id = conn.insert_mysql(sql, args).await?;
     let pk = primary_key::<M>();
     if pk.auto_increment {
-        return fetch_one_where(conn, pk.name, mysql_key(model, id)).await?.ok_or(Error::NotFound);
+        return fetch_one_by(conn, mysql_key(model, id)).await?.ok_or(Error::NotFound);
     }
     let conds = conflict.target.iter().map(|c| crate::sql::Cond::Compare(c, "=", value_of(model, c))).collect();
     crate::Query::<M>::new().cond(crate::sql::Cond::And(conds)).fetch(conn).await?.into_iter().next().ok_or(Error::NotFound)
@@ -513,7 +537,7 @@ async fn insert_or_ignore_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, model: 
     let (sql, args) = sql.finish();
     match conn.insert_mysql_unless_duplicate(sql, args).await? {
         None => Ok(None),
-        Some(id) => fetch_one_where(conn, M::PRIMARY_KEY, mysql_key(model, id)).await,
+        Some(id) => fetch_one_by(conn, mysql_key(model, id)).await,
     }
 }
 
@@ -548,11 +572,11 @@ pub async fn update<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M>
     }
     if first {
         // Only a primary key: nothing to change, but still check the row exists.
-        return fetch_one_where(&mut conn, M::PRIMARY_KEY, value_of(model, M::PRIMARY_KEY)).await?.ok_or(Error::NotFound);
+        return fetch_one_by(&mut conn, key_conds(model)).await?.ok_or(Error::NotFound);
     }
-    let key = value_of(model, M::PRIMARY_KEY);
+    let key = key_conds(model);
     // The stored row must be the tenant's too, not only the new values.
-    let mut conds = vec![Cond::Compare(M::PRIMARY_KEY, "=", key.clone())];
+    let mut conds = key.clone();
     conds.extend(tenant);
     conds.extend(version_cond(model));
     sql.where_clause(&conds);
@@ -564,7 +588,7 @@ pub async fn update<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M>
         if changed == 0 && M::VERSION.is_some() {
             return Err(missing_or_stale::<M>(&mut conn, key).await);
         }
-        return fetch_one_where(&mut conn, M::PRIMARY_KEY, key).await?.ok_or(Error::NotFound);
+        return fetch_one_by(&mut conn, key).await?.ok_or(Error::NotFound);
     }
     sql.push(" RETURNING ").push(&column_list::<M>(backend));
     let (sql, args) = sql.finish();
@@ -582,11 +606,11 @@ fn version_cond<M: Model>(model: &M) -> Option<Cond> {
 /// Why a keyed write matched no row: the row is gone ([`Error::NotFound`])
 /// or, with a version column, another write changed it first
 /// ([`Error::StaleRecord`]).
-async fn missing_or_stale<M: Model>(conn: &mut Conn<'_>, key: Value) -> Error {
+async fn missing_or_stale<M: Model>(conn: &mut Conn<'_>, key: Vec<Cond>) -> Error {
     if M::VERSION.is_none() {
         return Error::NotFound;
     }
-    match fetch_one_where::<M>(conn, M::PRIMARY_KEY, key).await {
+    match fetch_one_by::<M>(conn, key).await {
         Ok(Some(_)) => Error::StaleRecord(format!("this `{}` row was changed since it was loaded", M::TABLE)),
         Ok(None) => Error::NotFound,
         Err(error) => error,
@@ -596,8 +620,8 @@ async fn missing_or_stale<M: Model>(conn: &mut Conn<'_>, key: Value) -> Error {
 #[doc(hidden)]
 pub async fn delete<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<()> {
     let mut conn = ex.into_conn();
-    let key = value_of(model, M::PRIMARY_KEY);
-    let mut conds = vec![Cond::Compare(M::PRIMARY_KEY, "=", key.clone())];
+    let key = key_conds(model);
+    let mut conds = key.clone();
     conds.extend(conn.scope().filter_for::<M>()?);
     conds.extend(version_cond(model));
     let mut sql = Sql::new(conn.backend());
@@ -750,7 +774,7 @@ async fn bulk_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, chunk: &[M], confli
             }
             Ok(rows)
         }
-        None => fetch_by_keys(conn, chunk, &[pk.name]).await,
+        None => fetch_by_keys(conn, chunk, M::PRIMARY_KEYS).await,
         Some(conflict) => fetch_by_keys(conn, chunk, &conflict.target).await,
     }
 }
@@ -785,7 +809,7 @@ fn in_input_order<M: Model>(input: &[M], mut stored: Vec<M>, conflict: Option<&O
     }
     let keys: Vec<&'static str> = match conflict {
         Some(conflict) => conflict.target.clone(),
-        None => vec![pk.name],
+        None => M::PRIMARY_KEYS.to_vec(),
     };
     let mut by_key: std::collections::HashMap<Vec<Value>, M> = stored.into_iter().map(|row| (key_of(&row, &keys), row)).collect();
     input

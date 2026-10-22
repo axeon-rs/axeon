@@ -1241,6 +1241,80 @@ async fn streaming(db: &Db) {
     }
 }
 
+/// A pivot row with data: a user's selection of a product, with a margin.
+#[derive(Model, Clone, Debug, PartialEq)]
+#[model(table = "selections")]
+struct Selection {
+    #[model(primary_key, belongs_to = User)]
+    user_id: i64,
+    #[model(primary_key)]
+    product_code: String,
+    margin: f64,
+}
+
+async fn composite_keys(db: &Db) {
+    setup(db).await;
+    db.create_table::<Selection>().await.unwrap();
+    let ada = user("Ada", 36).insert(db).await.unwrap();
+    let bob = user("Bob", 41).insert(db).await.unwrap();
+    let pick = |user: &User, code: &str, margin: f64| Selection { user_id: user.id, product_code: code.into(), margin };
+
+    // Insert, and the key is the pair.
+    let lamp = pick(&ada, "lamp", 0.2).insert(db).await.unwrap();
+    assert_eq!(lamp, pick(&ada, "lamp", 0.2));
+    pick(&ada, "desk", 0.3).insert(db).await.unwrap();
+    pick(&bob, "lamp", 0.1).insert(db).await.unwrap();
+    assert!(matches!(pick(&ada, "lamp", 0.9).insert(db).await, Err(Error::UniqueViolation(_))));
+
+    // Find by the tuple.
+    assert_eq!(Selection::find(db, (ada.id, "lamp")).await.unwrap(), Some(lamp.clone()));
+    assert_eq!(Selection::find(db, (bob.id, "desk")).await.unwrap(), None);
+    assert!(matches!(Selection::find_or_fail(db, (bob.id, "desk")).await, Err(Error::NotFound)));
+
+    // Updates and deletes touch exactly one row.
+    let mut changed = lamp.clone();
+    changed.margin = 0.25;
+    changed.update(db).await.unwrap();
+    assert_eq!(Selection::find_or_fail(db, (ada.id, "lamp")).await.unwrap().margin, 0.25);
+    assert_eq!(Selection::find_or_fail(db, (bob.id, "lamp")).await.unwrap().margin, 0.1);
+    assert_eq!(Selection::find_or_fail(db, (ada.id, "desk")).await.unwrap().margin, 0.3);
+    Selection::find_or_fail(db, (ada.id, "desk")).await.unwrap().delete(db).await.unwrap();
+    assert_eq!(Selection::query().count(db).await.unwrap(), 2);
+    let mut gone = pick(&ada, "desk", 0.3);
+    assert!(matches!(gone.update(db).await, Err(Error::NotFound)));
+
+    // Upserts on the key, bulk inserts and insert-or-ignore.
+    let key = || OnConflict::on(Selection::USER_ID).and(Selection::PRODUCT_CODE);
+    assert_eq!(pick(&ada, "lamp", 0.5).upsert(db, key()).await.unwrap().margin, 0.5);
+    assert_eq!(pick(&ada, "lamp", 0.7).insert_or_ignore(db, key()).await.unwrap(), None);
+    let many = Selection::insert_many(db, &[pick(&bob, "desk", 0.4), pick(&bob, "chair", 0.6), pick(&ada, "chair", 0.6)]).await.unwrap();
+    assert_eq!(many.iter().map(|s| (s.user_id, s.product_code.as_str())).collect::<Vec<_>>(), [(bob.id, "desk"), (bob.id, "chair"), (ada.id, "chair")]);
+    let upserted = Selection::upsert_many(db, &[pick(&bob, "desk", 0.45), pick(&ada, "rug", 0.2)], key()).await.unwrap();
+    assert_eq!(upserted.iter().map(|s| s.margin).collect::<Vec<_>>(), [0.45, 0.2]);
+
+    // Cursor pagination breaks ties on every key column.
+    let mut after = None;
+    let mut seen = Vec::new();
+    loop {
+        let page = Selection::query().order_by(Selection::MARGIN.asc()).cursor_paginate(db, after.as_deref(), 2).await.unwrap();
+        seen.extend(page.items.into_iter().map(|s| (s.margin, s.user_id, s.product_code)));
+        match page.next_cursor {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    let mut expected = seen.clone();
+    expected.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(seen.len(), 6);
+    assert_eq!(seen, expected);
+
+    // A pivot model joins to its parents through belongs_to.
+    let rows = Selection::query().join(Selection::USER).filter(Selection::PRODUCT_CODE.eq("chair")).order_by(Selection::USER_ID.asc()).all(db).await.unwrap();
+    assert_eq!(rows.iter().map(|(s, u)| (s.margin, u.name.as_str())).collect::<Vec<_>>(), [(0.6, "Ada"), (0.6, "Bob")]);
+    // The key's belongs_to column is a real foreign key.
+    assert!(matches!(ada.clone().delete(db).await, Err(Error::ForeignKeyViolation(_))));
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -1330,6 +1404,7 @@ backend_tests!(
     tenant_scopes,
     optimistic_locking,
     streaming,
+    composite_keys,
 );
 
 #[test]
