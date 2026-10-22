@@ -26,6 +26,9 @@ pub(crate) struct Subquery {
     pub table: &'static str,
     pub column: &'static str,
     pub conds: Vec<Cond>,
+    /// The table's tenant column, when it is tenant-scoped; the filter is
+    /// added when the query runs.
+    pub tenant: Option<&'static str>,
 }
 
 /// A condition in a `WHERE` clause.

@@ -29,6 +29,12 @@ pub enum Error {
     /// A pagination cursor from a client is damaged or was made for a
     /// different sort order.
     InvalidCursor(String),
+    /// A tenant-scoped model was used through a [`Db`](crate::Db) or
+    /// transaction with no tenant scope: a bug, since it could have leaked
+    /// another tenant's rows.
+    TenantScope(String),
+    /// A write named a row of another tenant than the scope's.
+    WrongTenant(String),
     /// Bad configuration, e.g. an unsupported database URL.
     Config(String),
     /// The transaction was already committed, rolled back, or is in use.
@@ -53,6 +59,8 @@ impl fmt::Display for Error {
             Error::Decode { column, message } => write!(f, "cannot decode column `{}`: {}", column, message),
             Error::Migration(msg) => write!(f, "migration error: {}", msg),
             Error::InvalidCursor(msg) => write!(f, "invalid cursor: {}", msg),
+            Error::TenantScope(msg) => write!(f, "missing tenant scope: {}", msg),
+            Error::WrongTenant(msg) => write!(f, "wrong tenant: {}", msg),
             Error::Config(msg) => write!(f, "configuration error: {}", msg),
             Error::Transaction(msg) => write!(f, "transaction error: {}", msg),
             Error::Database(error) => write!(f, "database error: {}", error),

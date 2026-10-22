@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 use crate::model::{primary_key, Model};
 use crate::relation::{Join, Related, Relation, WithQuery};
 use crate::sql::{column_list, Cond, Fragment, Lock, Sort, SortTerm, Sql};
+use crate::tenant::Scope;
 #[cfg(feature = "json")]
 use crate::sql::{JsonTest, PathStep};
 use crate::value::{SqlType, Value};
@@ -574,6 +575,7 @@ pub struct Query<M> {
     limit: Option<u64>,
     offset: Option<u64>,
     lock: Option<Lock>,
+    all_tenants: bool,
     _marker: PhantomData<fn() -> M>,
 }
 
@@ -585,6 +587,7 @@ impl<M> Clone for Query<M> {
             limit: self.limit,
             offset: self.offset,
             lock: self.lock,
+            all_tenants: self.all_tenants,
             _marker: PhantomData,
         }
     }
@@ -598,6 +601,7 @@ impl<M> std::fmt::Debug for Query<M> {
             .field("limit", &self.limit)
             .field("offset", &self.offset)
             .field("lock", &self.lock)
+            .field("all_tenants", &self.all_tenants)
             .finish()
     }
 }
@@ -611,7 +615,38 @@ impl<M: Model> Default for Query<M> {
 impl<M: Model> Query<M> {
     /// Every row of the table.
     pub fn new() -> Self {
-        Self { conds: Vec::new(), order: Vec::new(), limit: None, offset: None, lock: None, _marker: PhantomData }
+        Self {
+            conds: Vec::new(),
+            order: Vec::new(),
+            limit: None,
+            offset: None,
+            lock: None,
+            all_tenants: false,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Sees every tenant's rows, even through a
+    /// [tenant-scoped](crate::Db::for_tenant) `Db`: the explicit opt-out
+    /// for operator screens and cross-tenant jobs. Relations loaded with
+    /// [`with`](Query::with) are unscoped too.
+    pub fn all_tenants(mut self) -> Self {
+        self.all_tenants = true;
+        self
+    }
+
+    /// The tenant scope this query runs with on `conn`.
+    pub(crate) fn scope(&self, conn: &Conn<'_>) -> Scope {
+        if self.all_tenants {
+            Scope::All
+        } else {
+            conn.scope().clone()
+        }
+    }
+
+    /// The query's conditions plus its tenant filters.
+    fn scoped(&self, conn: &Conn<'_>) -> Result<Vec<Cond>> {
+        self.scope(conn).apply::<M>(&self.conds)
     }
 
     /// Keeps rows matching `expr`. Several filters must all match.
@@ -745,10 +780,10 @@ impl<M: Model> Query<M> {
         JoinQuery::new(self, relation.on())
     }
 
-    fn select(&self, backend: Backend) -> (String, Vec<Value>) {
+    fn select(&self, backend: Backend, conds: &[Cond]) -> (String, Vec<Value>) {
         let mut sql = Sql::new(backend);
         sql.push("SELECT ").push(&column_list::<M>(backend)).push(" FROM ").ident(M::TABLE);
-        sql.where_clause(&self.conds);
+        sql.where_clause(conds);
         sql.order_by(&self.order);
         sql.limit_offset(self.limit, self.offset);
         sql.lock(self.lock, None);
@@ -756,13 +791,15 @@ impl<M: Model> Query<M> {
     }
 
     /// The `SELECT` this query runs on `backend`, and its parameters: for
-    /// logging, or for `EXPLAIN` to check which indexes it uses.
+    /// logging, or for `EXPLAIN` to check which indexes it uses. Without
+    /// the tenant filter, which is added when the query runs.
     pub fn to_sql(&self, backend: Backend) -> (String, Vec<Value>) {
-        self.select(backend)
+        self.select(backend, &self.conds)
     }
 
     pub(crate) async fn fetch(&self, conn: &mut Conn<'_>) -> Result<Vec<M>> {
-        let (sql, args) = self.select(conn.backend());
+        let conds = self.scoped(conn)?;
+        let (sql, args) = self.select(conn.backend(), &conds);
         conn.fetch_all(sql, args).await?.iter().map(M::from_row).collect()
     }
 
@@ -782,7 +819,7 @@ impl<M: Model> Query<M> {
         sql.push("SELECT ").push(&column_list::<M>(backend)).push(", ");
         sql.ident(distance.column).push(" ").push(distance.metric.operator()).push(" ").arg(Value::Vector(distance.target.clone()));
         sql.push(" AS ").ident("__axeon_distance").push(" FROM ").ident(M::TABLE);
-        sql.where_clause(&self.conds);
+        sql.where_clause(&self.scoped(&conn)?);
         sql.push(" ORDER BY ").ident("__axeon_distance").push(" LIMIT ").push(&k.to_string());
         let (sql, args) = sql.finish();
         conn.fetch_all(sql, args)
@@ -807,7 +844,7 @@ impl<M: Model> Query<M> {
         sql.push("SELECT ").push(&column_list::<M>(backend)).push(", ");
         sql.score(&score.terms);
         sql.push(" AS ").ident("__axeon_score").push(" FROM ").ident(M::TABLE);
-        sql.where_clause(&self.conds);
+        sql.where_clause(&self.scoped(&conn)?);
         sql.push(" ORDER BY ").ident("__axeon_score").push(" DESC LIMIT ").push(&k.to_string());
         let (sql, args) = sql.finish();
         conn.fetch_all(sql, args)
@@ -836,7 +873,7 @@ impl<M: Model> Query<M> {
     async fn scalar<T: SqlType>(&self, conn: &mut Conn<'_>, expr: &str) -> Result<T> {
         let mut sql = Sql::new(conn.backend());
         sql.push("SELECT ").push(expr).push(" AS ").ident("value").push(" FROM ").ident(M::TABLE);
-        sql.where_clause(&self.conds);
+        sql.where_clause(&self.scoped(conn)?);
         let (sql, args) = sql.finish();
         let row = conn.fetch_optional(sql, args).await?.ok_or(Error::NotFound)?;
         row.get::<T>("value")
@@ -856,7 +893,7 @@ impl<M: Model> Query<M> {
         let mut conn = ex.into_conn();
         let mut sql = Sql::new(conn.backend());
         sql.push("SELECT 1 AS ").ident("one").push(" FROM ").ident(M::TABLE);
-        sql.where_clause(&self.conds);
+        sql.where_clause(&self.scoped(&conn)?);
         sql.push(" LIMIT 1");
         let (sql, args) = sql.finish();
         Ok(conn.fetch_optional(sql, args).await?.is_some())
@@ -922,7 +959,7 @@ impl<M: Model> Query<M> {
         let mut sql = Sql::new(conn.backend());
         sql.push("SELECT ").ident(column.name).push(" AS ").ident("key");
         sql.push(", COUNT(*) AS ").ident("count").push(" FROM ").ident(M::TABLE);
-        sql.where_clause(&self.conds);
+        sql.where_clause(&self.scoped(&conn)?);
         sql.where_clause(&[Cond::Null(column.name, true)]);
         sql.push(" GROUP BY ").ident(column.name).push(" ORDER BY ").ident(column.name);
         let (sql, args) = sql.finish();
@@ -1003,7 +1040,7 @@ impl<M: Model> Query<M> {
         let mut conn = ex.into_conn();
         let mut sql = Sql::new(conn.backend());
         sql.push("DELETE FROM ").ident(M::TABLE);
-        sql.where_clause(&self.conds);
+        sql.where_clause(&self.scoped(&conn)?);
         let (sql, args) = sql.finish();
         conn.execute(sql, args).await
     }
@@ -1020,10 +1057,18 @@ impl<M: Model> Query<M> {
     /// ```
     pub async fn update<'c>(self, ex: impl Executor<'c>, set: impl IntoIterator<Item = Assignment<M>>) -> Result<u64> {
         let mut conn = ex.into_conn();
+        let scope = self.scope(&conn);
+        let conds = scope.apply::<M>(&self.conds)?;
         let mut sql = Sql::new(conn.backend());
         sql.push("UPDATE ").ident(M::TABLE).push(" SET ");
         let mut empty = true;
         for assignment in set {
+            // Moving rows to another tenant is a write of that tenant's rows.
+            if let (Some(column), Scope::Tenant(tenant)) = (M::TENANT, &scope) {
+                if assignment.column == column && assignment.value.clone().key() != tenant.clone().key() {
+                    return Err(Error::WrongTenant(format!("can't move `{}` rows to another tenant", M::TABLE)));
+                }
+            }
             if !empty {
                 sql.push(", ");
             }
@@ -1033,7 +1078,7 @@ impl<M: Model> Query<M> {
         if empty {
             return Ok(0);
         }
-        sql.where_clause(&self.conds);
+        sql.where_clause(&conds);
         let (sql, args) = sql.finish();
         conn.execute(sql, args).await
     }
@@ -1179,14 +1224,24 @@ impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
         self
     }
 
-    fn write_from(&self, sql: &mut Sql) {
+    fn write_from(&self, sql: &mut Sql, conn: &Conn<'_>) -> Result<()> {
+        let scope = self.query.scope(conn);
+        let left = scope.apply::<M>(&self.query.conds)?;
+        let mut right = scope.apply::<T>(&self.related)?;
+        // The joined table's tenant filter goes in `ON` for a left join, so
+        // rows of the main table without an allowed match are kept.
+        let right_tenant = if O::LEFT { scope.filter_for::<T>()?.and_then(|_| right.pop()) } else { None };
         sql.push(" FROM ").ident(M::TABLE).push(" AS ").ident(LEFT_ALIAS);
         sql.push(if O::LEFT { " LEFT JOIN " } else { " INNER JOIN " });
         sql.ident(T::TABLE).push(" AS ").ident(RIGHT_ALIAS).push(" ON ");
         sql.ident(LEFT_ALIAS).push(".").ident(self.on.0).push(" = ");
         sql.ident(RIGHT_ALIAS).push(".").ident(self.on.1);
-        sql.where_clause_as(&self.query.conds, Some(LEFT_ALIAS));
-        sql.where_clause_as(&self.related, Some(RIGHT_ALIAS));
+        if let Some(Cond::Compare(column, op, value)) = right_tenant {
+            sql.push(" AND ").ident(RIGHT_ALIAS).push(".").ident(column).push(" ").push(op).push(" ").arg(value);
+        }
+        sql.where_clause_as(&left, Some(LEFT_ALIAS));
+        sql.where_clause_as(&right, Some(RIGHT_ALIAS));
+        Ok(())
     }
 
     /// Every matching pair.
@@ -1201,7 +1256,7 @@ impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
             }
             sql.ident(alias).push(".").ident(column).push(" AS ").ident(&format!("{}_{}", alias, column));
         }
-        self.write_from(&mut sql);
+        self.write_from(&mut sql, &conn)?;
         sql.order_by(&self.order);
         sql.limit_offset(self.query.limit, self.query.offset);
         // `OF`, since the nullable side of a left join can't be locked.
@@ -1226,7 +1281,7 @@ impl<M: Model, T: Model, O: JoinOutput<T>> JoinQuery<M, T, O> {
         let mut conn = ex.into_conn();
         let mut sql = Sql::new(conn.backend());
         sql.push("SELECT COUNT(*) AS ").ident("count");
-        self.write_from(&mut sql);
+        self.write_from(&mut sql, &conn)?;
         let (sql, args) = sql.finish();
         let row = conn.fetch_optional(sql, args).await?.ok_or(Error::NotFound)?;
         Ok(row.get::<i64>("count")?.max(0) as u64)

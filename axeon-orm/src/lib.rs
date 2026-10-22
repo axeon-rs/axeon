@@ -196,6 +196,7 @@ mod cursor;
 mod model;
 mod query;
 mod sql;
+mod tenant;
 mod value;
 
 pub mod migrate;
@@ -240,7 +241,7 @@ pub use sqlx;
 pub mod prelude {
     pub use crate::{Db, Executor, Model, Query, Transaction};
     #[cfg(feature = "axeon")]
-    pub use crate::server::{DbRequest, HealthExt, Transactional};
+    pub use crate::server::{DbRequest, HealthExt, TenantScope, Transactional};
 }
 
 #[cfg(feature = "json")]

@@ -32,6 +32,7 @@ struct FieldAttrs {
     on_delete: Option<LitStr>,
     skip: bool,
     dimensions: Option<syn::LitInt>,
+    tenant: bool,
 }
 
 struct Field {
@@ -139,6 +140,8 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                     attrs.on_delete = Some(action);
                 } else if path.is_ident("skip") {
                     attrs.skip = true;
+                } else if path.is_ident("tenant") {
+                    attrs.tenant = true;
                 } else if path.is_ident("dimensions") {
                     let lit: syn::LitInt = meta.value()?.parse()?;
                     let n: u32 = lit.base10_parse()?;
@@ -148,7 +151,7 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                     attrs.dimensions = Some(lit);
                 } else {
                     return Err(meta.error(
-                        "expected primary_key, column, unique, index, default, created_at, updated_at, belongs_to, on_delete, skip or dimensions",
+                        "expected primary_key, column, unique, index, default, created_at, updated_at, belongs_to, on_delete, skip, dimensions or tenant",
                     ));
                 }
                 Ok(())
@@ -157,8 +160,11 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         if attrs.on_delete.is_some() && attrs.belongs_to.is_none() {
             return Err(Error::new_spanned(&ident, "`on_delete` needs `belongs_to`"));
         }
-        if attrs.skip && (attrs.primary_key || attrs.belongs_to.is_some()) {
+        if attrs.skip && (attrs.primary_key || attrs.belongs_to.is_some() || attrs.tenant) {
             return Err(Error::new_spanned(&ident, "a `skip` field can't be a key"));
+        }
+        if attrs.tenant && attrs.primary_key {
+            return Err(Error::new_spanned(&ident, "the tenant column can't be the primary key"));
         }
         let column = attrs.column.as_ref().map(LitStr::value).unwrap_or_else(|| unraw(&ident));
         fields.push(Field { ident, ty: field.ty.clone(), column, attrs });
@@ -184,6 +190,16 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
     };
     let pk_column = &pk.column;
     let pk_ty = &pk.ty;
+
+    let tenants: Vec<&&Field> = columns.iter().filter(|f| f.attrs.tenant).collect();
+    let tenant = match tenants.as_slice() {
+        [] => quote! { ::core::option::Option::None },
+        [one] => {
+            let column = &one.column;
+            quote! { ::core::option::Option::Some(#column) }
+        }
+        [_, second, ..] => return Err(Error::new_spanned(&second.ident, "only one tenant column is supported")),
+    };
 
     // impl Model.
     let column_defs = columns.iter().map(|f| {
@@ -337,6 +353,7 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
             const TABLE: &'static str = #table;
             const PRIMARY_KEY: &'static str = #pk_column;
             const COLUMNS: &'static [::axeon_orm::ColumnDef] = &[#(#column_defs),*];
+            const TENANT: ::core::option::Option<&'static str> = #tenant;
 
             fn from_row_prefixed(row: &::axeon_orm::Row, prefix: &str) -> ::axeon_orm::Result<Self> {
                 ::core::result::Result::Ok(Self { #(#decode),* })

@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::Model;
+use crate::tenant::Scope;
 use crate::value::{Kind, SqlType, Value};
 use sqlx::AssertSqlSafe;
 use std::time::Duration;
@@ -87,6 +88,7 @@ impl DbOptions {
 #[derive(Clone, Debug)]
 pub struct Db {
     inner: Pool,
+    scope: Scope,
 }
 
 #[derive(Clone, Debug)]
@@ -119,7 +121,7 @@ impl Db {
                     .idle_timeout(options.idle_timeout)
                     .connect(url)
                     .await?;
-                return Ok(Db { inner: Pool::Postgres(pool) });
+                return Ok(Db { inner: Pool::Postgres(pool), scope: Scope::Unset });
             }
             #[cfg(not(feature = "postgres"))]
             return Err(Error::Config("PostgreSQL support needs the `postgres` feature".into()));
@@ -142,7 +144,7 @@ impl Db {
                     // connection open forever.
                     pool = pool.max_connections(1).min_connections(1).idle_timeout(None).max_lifetime(None);
                 }
-                return Ok(Db { inner: Pool::Sqlite(pool.connect_with(connect).await?) });
+                return Ok(Db { inner: Pool::Sqlite(pool.connect_with(connect).await?), scope: Scope::Unset });
             }
             #[cfg(not(feature = "sqlite"))]
             return Err(Error::Config("SQLite support needs the `sqlite` feature".into()));
@@ -160,7 +162,7 @@ impl Db {
                     .idle_timeout(options.idle_timeout)
                     .connect_with(connect)
                     .await?;
-                return Ok(Db { inner: Pool::MySql(pool) });
+                return Ok(Db { inner: Pool::MySql(pool), scope: Scope::Unset });
             }
             #[cfg(not(feature = "mysql"))]
             return Err(Error::Config("MySQL support needs the `mysql` feature".into()));
@@ -169,6 +171,51 @@ impl Db {
             "unsupported database URL `{}`: expected postgres://, sqlite: or mysql://",
             url.split('@').next_back().unwrap_or_default()
         )))
+    }
+
+    /// The same pool, scoped to one tenant: queries on models with a
+    /// `#[model(tenant)]` column see only rows whose tenant column equals
+    /// `tenant`, and writes of other tenants' rows fail with
+    /// [`Error::WrongTenant`]. Transactions begun on it keep the scope.
+    /// Cheap: the pool is shared.
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, Model};
+    /// #[derive(Model)]
+    /// struct Selection {
+    ///     id: i64,
+    ///     #[model(tenant)]
+    ///     org_id: i64,
+    ///     product_id: i64,
+    /// }
+    ///
+    /// # async fn run(db: Db, org_id: i64) -> axeon_orm::Result<()> {
+    /// let org = db.for_tenant(org_id);
+    /// let mine = Selection::query().all(&org).await?; // WHERE org_id = $1
+    /// // Without a scope, tenant-scoped models refuse to run:
+    /// assert!(Selection::query().all(&db).await.is_err());
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Not covered: raw SQL (`execute`, `postgres()` and the like), pivot
+    /// tables, and models without a tenant column.
+    pub fn for_tenant(&self, tenant: impl Into<Value>) -> Db {
+        Db { inner: self.inner.clone(), scope: Scope::Tenant(tenant.into()) }
+    }
+
+    /// The same pool, seeing every tenant's rows: for background jobs,
+    /// migrations and operator tools. The explicit opt-out from tenant
+    /// scopes; a plain `Db` refuses to touch tenant-scoped models.
+    pub fn all_tenants(&self) -> Db {
+        Db { inner: self.inner.clone(), scope: Scope::All }
+    }
+
+    /// The tenant this handle is scoped to, if any.
+    pub fn tenant(&self) -> Option<&Value> {
+        match &self.scope {
+            Scope::Tenant(tenant) => Some(tenant),
+            _ => None,
+        }
     }
 
     /// Which database this pool talks to.
@@ -194,7 +241,7 @@ impl Db {
             #[cfg(feature = "mysql")]
             Pool::MySql(pool) => Tx::MySql(pool.begin().await?),
         };
-        Ok(Transaction { inner, failed: false })
+        Ok(Transaction { inner, failed: false, scope: self.scope.clone() })
     }
 
     /// Checks the database answers, e.g. for a readiness probe.
@@ -273,21 +320,21 @@ impl Db {
 #[cfg(feature = "mysql")]
 impl From<sqlx::MySqlPool> for Db {
     fn from(pool: sqlx::MySqlPool) -> Self {
-        Db { inner: Pool::MySql(pool) }
+        Db { inner: Pool::MySql(pool), scope: Scope::Unset }
     }
 }
 
 #[cfg(feature = "postgres")]
 impl From<sqlx::PgPool> for Db {
     fn from(pool: sqlx::PgPool) -> Self {
-        Db { inner: Pool::Postgres(pool) }
+        Db { inner: Pool::Postgres(pool), scope: Scope::Unset }
     }
 }
 
 #[cfg(feature = "sqlite")]
 impl From<sqlx::SqlitePool> for Db {
     fn from(pool: sqlx::SqlitePool) -> Self {
-        Db { inner: Pool::Sqlite(pool) }
+        Db { inner: Pool::Sqlite(pool), scope: Scope::Unset }
     }
 }
 
@@ -300,6 +347,8 @@ pub struct Transaction {
     /// `COMMIT` into a silent rollback, so `commit` must report it.
     /// Tracked for SQLite too, so both databases behave alike.
     failed: bool,
+    /// The tenant scope, from the `Db` it began on.
+    scope: Scope,
 }
 
 #[derive(Debug)]
@@ -497,6 +546,32 @@ pub enum Conn<'c> {
     Tx(&'c mut Transaction),
 }
 
+/// A connection with a different tenant scope, from [`Conn::rescoped`];
+/// a transaction gets its own scope back when this is dropped.
+pub(crate) enum Rescoped<'a> {
+    Db(Db),
+    Tx(&'a mut Transaction, Option<Scope>),
+}
+
+impl Rescoped<'_> {
+    pub(crate) fn conn(&mut self) -> Conn<'_> {
+        match self {
+            Rescoped::Db(db) => Conn::Db(db),
+            Rescoped::Tx(tx, _) => Conn::Tx(tx),
+        }
+    }
+}
+
+impl Drop for Rescoped<'_> {
+    fn drop(&mut self) {
+        if let Rescoped::Tx(tx, previous) = self {
+            if let Some(previous) = previous.take() {
+                tx.scope = previous;
+            }
+        }
+    }
+}
+
 macro_rules! bind_all {
     ($query:expr, $args:expr) => {{
         let mut query = $query;
@@ -551,19 +626,19 @@ macro_rules! run {
     ($conn:expr, $sql:expr, $args:expr, |$q:ident, $ex:ident| $body:expr) => {
         match $conn {
             #[cfg(feature = "postgres")]
-            Conn::Db(Db { inner: Pool::Postgres(pool) }) => {
+            Conn::Db(Db { inner: Pool::Postgres(pool), .. }) => {
                 let $q = bind_all!(sqlx::query::<sqlx::Postgres>(AssertSqlSafe($sql)), $args);
                 let $ex = pool;
                 $body
             }
             #[cfg(feature = "sqlite")]
-            Conn::Db(Db { inner: Pool::Sqlite(pool) }) => {
+            Conn::Db(Db { inner: Pool::Sqlite(pool), .. }) => {
                 let $q = bind_all!(sqlx::query::<sqlx::Sqlite>(AssertSqlSafe($sql)), $args);
                 let $ex = pool;
                 $body
             }
             #[cfg(feature = "mysql")]
-            Conn::Db(Db { inner: Pool::MySql(pool) }) => {
+            Conn::Db(Db { inner: Pool::MySql(pool), .. }) => {
                 let $q = bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe($sql)), $args);
                 let $ex = pool;
                 $body
@@ -591,6 +666,24 @@ macro_rules! run {
 }
 
 impl Conn<'_> {
+    pub(crate) fn scope(&self) -> &Scope {
+        match self {
+            Conn::Db(db) => &db.scope,
+            Conn::Tx(tx) => &tx.scope,
+        }
+    }
+
+    /// Runs with another tenant scope, e.g. for a query that opted out.
+    pub(crate) fn rescoped(&mut self, scope: Scope) -> Rescoped<'_> {
+        match self {
+            Conn::Db(db) => Rescoped::Db(Db { inner: db.inner.clone(), scope }),
+            Conn::Tx(tx) => {
+                let previous = std::mem::replace(&mut tx.scope, scope);
+                Rescoped::Tx(tx, Some(previous))
+            }
+        }
+    }
+
     pub(crate) fn backend(&self) -> Backend {
         match self {
             Conn::Db(db) => db.backend(),
@@ -646,7 +739,7 @@ impl Conn<'_> {
     async fn insert_mysql_inner(&mut self, sql: String, args: Vec<Value>) -> Result<u64> {
         let query = bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe(sql)), args);
         let result = match self {
-            Conn::Db(Db { inner: Pool::MySql(pool) }) => query.execute(pool).await.map_err(Error::from),
+            Conn::Db(Db { inner: Pool::MySql(pool), .. }) => query.execute(pool).await.map_err(Error::from),
             Conn::Tx(Transaction { inner: Tx::MySql(tx), .. }) => query.execute(&mut **tx).await.map_err(Error::from),
             #[allow(unreachable_patterns)]
             _ => Err(Error::Config("insert_mysql on another database".into())),
@@ -664,11 +757,11 @@ impl Conn<'_> {
         let raw = sqlx::raw_sql(AssertSqlSafe(sql));
         match self {
             #[cfg(feature = "postgres")]
-            Conn::Db(Db { inner: Pool::Postgres(pool) }) => {
+            Conn::Db(Db { inner: Pool::Postgres(pool), .. }) => {
                 raw.execute(pool).await?;
             }
             #[cfg(feature = "sqlite")]
-            Conn::Db(Db { inner: Pool::Sqlite(pool) }) => {
+            Conn::Db(Db { inner: Pool::Sqlite(pool), .. }) => {
                 raw.execute(pool).await?;
             }
             #[cfg(feature = "postgres")]
@@ -680,7 +773,7 @@ impl Conn<'_> {
                 raw.execute(&mut **tx).await?;
             }
             #[cfg(feature = "mysql")]
-            Conn::Db(Db { inner: Pool::MySql(pool) }) => {
+            Conn::Db(Db { inner: Pool::MySql(pool), .. }) => {
                 raw.execute(pool).await?;
             }
             #[cfg(feature = "mysql")]

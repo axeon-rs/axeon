@@ -335,6 +335,48 @@ build the SQL text from user input. Fragments are parenthesized, so an
 `OR` inside one can't escape it. Column names inside them aren't quoted or
 qualified; in a join, the main table is `t0` and the joined one `t1`.
 
+## Tenant scopes
+
+Mark the column that says which tenant (organization, account, workspace)
+a row belongs to. Such a model only runs through a `Db` that names the
+tenant, or one that opts out explicitly, so a forgotten `org_id` filter is
+an error instead of a data leak.
+
+```rust
+#[derive(Model)]
+struct Selection {
+    id: i64,
+    #[model(tenant, index)]
+    org_id: i64,
+    product_id: i64,
+}
+
+let org = db.for_tenant(org_id);                       // cheap; shares the pool
+let mine = Selection::query().all(&org).await?;        // WHERE org_id = $1
+Selection::query().all(&db).await;                     // Err(Error::TenantScope)
+
+let everyone = db.all_tenants();                       // jobs, operator tools
+let n = Selection::query().count(&everyone).await?;
+let n = Selection::query().all_tenants().count(&org).await?; // per query
+```
+
+- Every read, aggregate, update and delete gets `org_id = <tenant>`, as do
+  `find`, eager loading (`with`), relation accessors, `has` / `where_has`
+  subqueries and both sides of joins (a left join keeps rows without an
+  allowed match).
+- Writes check the row: inserting, updating or bulk-inserting a row of
+  another tenant fails with `Error::WrongTenant` (403 in Axeon), as does
+  `update` setting the tenant column to another value. `update` and
+  `delete` on an instance also require the *stored* row to be the
+  tenant's, so a forged `org_id` gets `NotFound`.
+- Upserts never overwrite another tenant's row that conflicts on a global
+  unique key: `upsert` and `upsert_many` fail with `WrongTenant`, and
+  `insert_or_ignore` returns `None`.
+- Transactions keep the scope of the `Db` they began on.
+- Not covered: raw SQL (`db.execute`, `db.postgres()`, `Expr::raw` still
+  gets the filter added beside it), pivot tables, and models without a
+  tenant column.
+
 ## Transactions
 
 ```rust
@@ -430,6 +472,9 @@ app.get("/users/:id", |req| async move {
     let user = User::find_or_fail(req.db()?, req.param::<i64>("id")?).await?;
     Ok::<_, ServerError>(Json(user))
 });
+
+// Scope req.db() and transactions to the caller's tenant (after auth):
+app.middleware(TenantScope::new(|req| req.extension::<Member>().map(|m| m.org_id)));
 
 // Or one transaction per request, committed on success:
 app.middleware(Transactional::new(db));

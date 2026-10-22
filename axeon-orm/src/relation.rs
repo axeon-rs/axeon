@@ -186,7 +186,7 @@ fn filter_conds<T>(filter: Option<Expr<T>>) -> Vec<Cond> {
 impl<P: Model, C: Model> Related<P> for HasMany<P, C> {
     type Target = C;
     fn related_cond(&self, filter: Option<Expr<C>>, negated: bool) -> RelatedCond {
-        let sub = Subquery { table: C::TABLE, column: self.foreign_key, conds: filter_conds(filter) };
+        let sub = Subquery { table: C::TABLE, column: self.foreign_key, conds: filter_conds(filter), tenant: C::TENANT };
         RelatedCond(Cond::InSubquery(P::PRIMARY_KEY, Box::new(sub), negated))
     }
 }
@@ -194,7 +194,7 @@ impl<P: Model, C: Model> Related<P> for HasMany<P, C> {
 impl<P: Model, C: Model> Related<P> for HasOne<P, C> {
     type Target = C;
     fn related_cond(&self, filter: Option<Expr<C>>, negated: bool) -> RelatedCond {
-        let sub = Subquery { table: C::TABLE, column: self.foreign_key, conds: filter_conds(filter) };
+        let sub = Subquery { table: C::TABLE, column: self.foreign_key, conds: filter_conds(filter), tenant: C::TENANT };
         RelatedCond(Cond::InSubquery(P::PRIMARY_KEY, Box::new(sub), negated))
     }
 }
@@ -202,7 +202,7 @@ impl<P: Model, C: Model> Related<P> for HasOne<P, C> {
 impl<C: Model, P: Model> Related<C> for BelongsTo<C, P> {
     type Target = P;
     fn related_cond(&self, filter: Option<Expr<P>>, negated: bool) -> RelatedCond {
-        let sub = Subquery { table: P::TABLE, column: P::PRIMARY_KEY, conds: filter_conds(filter) };
+        let sub = Subquery { table: P::TABLE, column: P::PRIMARY_KEY, conds: filter_conds(filter), tenant: P::TENANT };
         RelatedCond(Cond::InSubquery(self.foreign_key, Box::new(sub), negated))
     }
 }
@@ -379,6 +379,7 @@ impl<P: Model, C: Model> BelongsToMany<P, C> {
             table: self.pivot,
             column: self.related_key,
             conds: vec![Cond::Compare(self.foreign_key, "=", Self::parent_key(parent))],
+            tenant: None,
         };
         Query::new().cond(Cond::InSubquery(C::PRIMARY_KEY, Box::new(sub), false))
     }
@@ -514,10 +515,10 @@ impl<P: Model, C: Model> Related<P> for BelongsToMany<P, C> {
     fn related_cond(&self, filter: Option<Expr<C>>, negated: bool) -> RelatedCond {
         let mut conds = Vec::new();
         if let Some(expr) = filter {
-            let related = Subquery { table: C::TABLE, column: C::PRIMARY_KEY, conds: vec![expr.cond] };
+            let related = Subquery { table: C::TABLE, column: C::PRIMARY_KEY, conds: vec![expr.cond], tenant: C::TENANT };
             conds.push(Cond::InSubquery(self.related_key, Box::new(related), false));
         }
-        let sub = Subquery { table: self.pivot, column: self.foreign_key, conds };
+        let sub = Subquery { table: self.pivot, column: self.foreign_key, conds, tenant: None };
         RelatedCond(Cond::InSubquery(P::PRIMARY_KEY, Box::new(sub), negated))
     }
 }
@@ -536,6 +537,11 @@ impl<M: Model, R: Relation<M>> WithQuery<M, R> {
     /// Every matching row with its relatives, in two queries.
     pub async fn all<'c>(self, ex: impl Executor<'c>) -> Result<Vec<(M, R::Output)>> {
         let mut conn = ex.into_conn();
+        // A query that opted out of tenant scopes loads its relations
+        // unscoped too.
+        let scope = self.query.scope(&conn);
+        let mut rescoped = conn.rescoped(scope);
+        let mut conn = rescoped.conn();
         let models = self.query.fetch(&mut conn).await?;
         let related = self.relation.load_for(&mut conn, &models).await?;
         Ok(models.into_iter().zip(related).collect())

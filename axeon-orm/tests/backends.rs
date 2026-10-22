@@ -1005,6 +1005,134 @@ async fn cursor_pagination(db: &Db) {
     assert_eq!(slugs, ["a", "b", "c", "d", "e"]);
 }
 
+#[derive(Model, Clone, Debug, PartialEq)]
+#[model(has_many(Task))]
+struct Project {
+    id: i64,
+    #[model(tenant, index)]
+    org_id: i64,
+    #[model(unique)]
+    code: String,
+    name: String,
+}
+
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Task {
+    id: i64,
+    #[model(tenant)]
+    org_id: i64,
+    #[model(belongs_to = Project)]
+    project_id: i64,
+    title: String,
+}
+
+async fn tenant_scopes(db: &Db) {
+    setup(db).await;
+    db.create_table::<Project>().await.unwrap();
+    db.create_table::<Task>().await.unwrap();
+    let project = |org: i64, code: &str| Project { id: 0, org_id: org, code: code.into(), name: format!("project {}", code) };
+    let task = |org: i64, project: &Project, title: &str| Task { id: 0, org_id: org, project_id: project.id, title: title.into() };
+    fn scope_missing<T>(r: &Result<T, Error>) -> bool {
+        matches!(r, Err(Error::TenantScope(_)))
+    }
+    fn wrong_tenant<T>(r: &Result<T, Error>) -> bool {
+        matches!(r, Err(Error::WrongTenant(_)))
+    }
+
+    // A plain Db refuses tenant-scoped models, but not other models.
+    assert!(scope_missing(&Project::query().all(db).await));
+    assert!(scope_missing(&Project::find(db, 1).await));
+    assert!(scope_missing(&Project::query().count(db).await));
+    assert!(scope_missing(&project(1, "X").insert(db).await));
+    assert!(scope_missing(&Project::query().delete(db).await));
+    assert_eq!(User::query().count(db).await.unwrap(), 0);
+
+    let (a, b, all) = (db.for_tenant(1i64), db.for_tenant(2i64), db.all_tenants());
+    assert_eq!(a.tenant(), Some(&axeon_orm::Value::I64(1)));
+    let pa = project(1, "A1").insert(&a).await.unwrap();
+    let pa2 = project(1, "A2").insert(&a).await.unwrap();
+    let pb = project(2, "B1").insert(&b).await.unwrap();
+    // Writing another tenant's row is refused.
+    assert!(wrong_tenant(&project(2, "B2").insert(&a).await));
+    task(1, &pa, "mine").insert(&a).await.unwrap();
+    task(2, &pb, "theirs").insert(&b).await.unwrap();
+    // A row of org 2 pointing at org 1's project, to check relations.
+    task(2, &pa, "foreign").insert(&all).await.unwrap();
+
+    // Reads see only the tenant's rows.
+    let codes = |ps: Vec<Project>| ps.into_iter().map(|p| p.code).collect::<Vec<_>>();
+    assert_eq!(codes(Project::query().order_by(Project::CODE.asc()).all(&a).await.unwrap()), ["A1", "A2"]);
+    assert_eq!(codes(Project::query().all(&b).await.unwrap()), ["B1"]);
+    assert_eq!(Project::query().count(&all).await.unwrap(), 3);
+    assert_eq!(Project::find(&a, pb.id).await.unwrap(), None);
+    assert!(matches!(Project::find_or_fail(&a, pb.id).await, Err(Error::NotFound)));
+    assert!(!Project::query().filter(Project::CODE.eq("B1")).exists(&a).await.unwrap());
+    let page = Project::query().cursor_paginate(&a, None, 10).await.unwrap();
+    assert_eq!(page.items.len(), 2);
+    // The query-level opt-out works on any Db.
+    assert_eq!(Project::query().all_tenants().count(db).await.unwrap(), 3);
+    assert_eq!(Project::query().all_tenants().count(&a).await.unwrap(), 3);
+
+    // Writes through instances can't touch other tenants' rows, even with
+    // a forged tenant column.
+    assert!(wrong_tenant(&pb.clone().update(&a).await));
+    let mut forged = pb.clone();
+    forged.org_id = 1;
+    forged.name = "hijacked".into();
+    assert!(matches!(forged.clone().update(&a).await, Err(Error::NotFound)));
+    assert!(matches!(forged.delete(&a).await, Err(Error::NotFound)));
+    assert_eq!(Project::find_or_fail(&b, pb.id).await.unwrap().name, "project B1");
+    let mut renamed = pa.clone();
+    renamed.name = "renamed".into();
+    renamed.update(&a).await.unwrap();
+    assert_eq!(Project::find_or_fail(&a, pa.id).await.unwrap().name, "renamed");
+
+    // Bulk updates and deletes stay inside the tenant.
+    assert_eq!(Project::query().update(&a, [Project::NAME.set("bulk")]).await.unwrap(), 2);
+    assert_eq!(Project::find_or_fail(&b, pb.id).await.unwrap().name, "project B1");
+    let moved = Project::query().update(&a, [Project::ORG_ID.set(2i64)]).await;
+    assert!(wrong_tenant(&moved));
+    assert_eq!(Project::query().filter(Project::CODE.like("%2")).delete(&a).await.unwrap(), 1);
+    assert_eq!(Project::query().count(&all).await.unwrap(), 2);
+    let _ = pa2;
+
+    // Upserts on a global unique key never overwrite another tenant's row.
+    let clash = Project { name: "stolen".into(), ..project(1, "B1") };
+    assert!(wrong_tenant(&clash.clone().upsert(&a, OnConflict::on(Project::CODE)).await));
+    assert!(wrong_tenant(&Project::upsert_many(&a, std::slice::from_ref(&clash), OnConflict::on(Project::CODE)).await));
+    assert_eq!(clash.clone().insert_or_ignore(&a, OnConflict::on(Project::CODE)).await.unwrap(), None);
+    assert_eq!(Project::find_or_fail(&b, pb.id).await.unwrap().name, "project B1");
+    let own = Project { name: "upserted".into(), ..project(1, "A1") };
+    assert_eq!(own.upsert(&a, OnConflict::on(Project::CODE)).await.unwrap().name, "upserted");
+
+    // Relation filters and eager loading are scoped on both sides.
+    let titles = |ts: &[Task]| ts.iter().map(|t| t.title.clone()).collect::<Vec<_>>();
+    let with_foreign = Project::query().where_has(Project::TASKS, Task::TITLE.eq("foreign"));
+    assert_eq!(with_foreign.clone().count(&a).await.unwrap(), 0);
+    assert_eq!(with_foreign.all_tenants().count(&a).await.unwrap(), 1);
+    let loaded = Project::query().with(Project::TASKS).all(&a).await.unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(titles(&loaded[0].1), ["mine"]);
+    let loaded = Project::query().filter(Project::ID.eq(pa.id)).all_tenants().with(Project::TASKS).all(db).await.unwrap();
+    let mut seen = titles(&loaded[0].1);
+    seen.sort();
+    assert_eq!(seen, ["foreign", "mine"]);
+    assert_eq!(titles(&pa.tasks().all(&a).await.unwrap()), ["mine"]);
+
+    // Joins filter the joined table too; a left join keeps the row.
+    let joined = Task::query().join(Task::PROJECT).all(&b).await.unwrap();
+    assert_eq!(joined.iter().map(|(t, _)| t.title.as_str()).collect::<Vec<_>>(), ["theirs"]);
+    let left = Task::query().left_join(Task::PROJECT).order_by(Task::TITLE.asc()).all(&b).await.unwrap();
+    let left: Vec<_> = left.iter().map(|(t, p)| (t.title.as_str(), p.as_ref().map(|p| p.code.as_str()))).collect();
+    assert_eq!(left, [("foreign", None), ("theirs", Some("B1"))]);
+
+    // Transactions keep the scope of the Db they began on.
+    let mut tx = b.begin().await.unwrap();
+    assert_eq!(codes(Project::query().all(&mut tx).await.unwrap()), ["B1"]);
+    assert!(wrong_tenant(&project(1, "T").insert(&mut tx).await));
+    tx.rollback().await.unwrap();
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -1091,6 +1219,7 @@ backend_tests!(
     json_filters,
     bulk_inserts,
     cursor_pagination,
+    tenant_scopes,
 );
 
 #[test]

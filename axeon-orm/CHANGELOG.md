@@ -11,6 +11,19 @@
   key as tie-breaker; cursors from another sort order, or damaged ones, are
   rejected with the new `Error::InvalidCursor` (400 in Axeon handlers).
 
+- **Tenant scopes:** `#[model(tenant)]` marks a model's tenant column.
+  Such models only run through `Db::for_tenant(id)` (rows of that tenant;
+  writes of other tenants' rows fail with the new `Error::WrongTenant`,
+  403 in Axeon) or an explicit opt-out, `Db::all_tenants()` or
+  `Query::all_tenants()`; a plain `Db` fails with the new
+  `Error::TenantScope`. Covers queries, aggregates, bulk updates and
+  deletes, instance writes, upserts (never overwriting another tenant's
+  conflicting row), eager loading, relation filters and joins;
+  transactions inherit the scope. `server::TenantScope` middleware scopes
+  `req.db()` and `Transactional` to the request's tenant.
+  `Model::TENANT` defaults to `None`, so hand-written `Model` impls keep
+  compiling.
+
 ### Changed
 
 - The `tls` feature uses rustls' aws-lc-rs provider
