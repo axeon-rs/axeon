@@ -24,7 +24,7 @@ use crate::message::{Method, Request};
 use crate::message::Response;
 use crate::middleware::{Chain, Middleware, MiddlewareManager, Next};
 use crate::plugins::State;
-use crate::router::{CompiledRouter, Route, RouteSlot, Router};
+use crate::router::{CompiledRouter, Route, MatchedRoute, Router};
 use crate::static_files::StaticFiles;
 use crate::body::{body_error, RequestBody, ResponseBody};
 use crate::message::convert::{normalize_path, PendingBody};
@@ -999,7 +999,7 @@ impl Routing {
             return Err(ServerError::NotFound);
         };
         req.params = params;
-        if let Some(slot) = req.extensions.get::<RouteSlot>() {
+        if let Some(slot) = req.extensions.get::<MatchedRoute>() {
             let _ = slot.0.set(Arc::clone(&pattern));
         }
         req.matched = Some(pattern);

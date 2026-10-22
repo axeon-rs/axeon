@@ -48,3 +48,7 @@ git_tag_name = "axeon-openapi-v{{ version }}"
 [[package]]
 name = "axeon-client"
 git_tag_name = "axeon-client-v{{ version }}"
+
+[[package]]
+name = "axeon-otel"
+git_tag_name = "axeon-otel-v{{ version }}"

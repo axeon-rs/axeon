@@ -42,6 +42,10 @@
   middleware gives successful `GET`/`HEAD` responses a weak ETag and turns
   matching conditional requests into `304 Not Modified`.
 
+- `MatchedRoute`: the route pattern a request matched, for global
+  middleware (which runs before routing). `MatchedRoute::watch(&mut req)`
+  shares one slot between middleware; `Metrics` uses it too.
+
 ### Fixed
 
 - `Server::with_tls` no longer panics with "Could not automatically

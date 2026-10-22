@@ -483,10 +483,11 @@ Optional crates that build on Axeon, each versioned on its own:
 | Crate | What it does |
 |---|---|
 | [axeon-orm](axeon-orm) | Models, typed queries, relations, migrations, search and pgvector |
-| [axeon-jobs](axeon-jobs) | Background jobs on PostgreSQL: retries, delays, unique jobs, graceful shutdown |
-| [axeon-redis](axeon-redis) | A shared session store and a broadcast backend on Redis |
+| [axeon-jobs](axeon-jobs) | Background jobs on PostgreSQL: retries, delays, unique jobs, cron schedules, priorities |
+| [axeon-redis](axeon-redis) | Shared sessions, rate limits, idempotency keys and broadcast on Redis |
 | [axeon-openapi](axeon-openapi) | OpenAPI 3.1 documents generated from your routes and Rust types |
 | [axeon-client](axeon-client) | An outbound HTTP client with SSRF protection, retries and circuit breaking |
+| [axeon-otel](axeon-otel) | OpenTelemetry: a server span per request, W3C trace context, OTLP export |
 
 ### Templates, static files and uploads
 
