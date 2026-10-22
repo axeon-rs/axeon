@@ -54,6 +54,7 @@
 //! | [`validate`] | Validated JSON, query and form input with per-field 422 errors |
 //! | [`auth`] | Bearer, Basic, API key (feature `api-keys`) and JWT (feature `jwt`) authentication |
 //! | [`cache`] | `Cache-Control`, ETags and `304 Not Modified` for API responses |
+//! | [`locale`] | The best supported language per request, from `Accept-Language` |
 //! | `cookies`, `session`, `csrf` | Signed/encrypted cookies, sessions, CSRF protection (feature `cookies`) |
 //! | [`config`] | Typed configuration from environment variables and `.env` |
 //! | `templates` | HTML templates (feature `templates`) |
@@ -124,6 +125,7 @@ pub mod csrf;
 pub(crate) mod error;
 pub(crate) mod handler;
 mod lifecycle;
+pub mod locale;
 mod static_files;
 pub(crate) mod message;
 pub mod broadcast;

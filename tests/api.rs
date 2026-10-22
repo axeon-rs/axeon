@@ -708,3 +708,43 @@ async fn conditional_get_with_compression() {
     let cached = gzip(Some(&etag)).await;
     assert_eq!((cached.status, cached.body.len(), cached.get_header("content-encoding")), (304, 0, None));
 }
+
+#[tokio::test]
+async fn locales_negotiate_per_request() {
+    use axeon::locale::Locales;
+    use axeon::{Method, Request};
+
+    let mut app = Server::new();
+    app.middleware(Locales::new(["en", "zh-CN"]).query_param("lang").cookie("lang"));
+    app.get("/hello", |req| async move {
+        match req.locale().map(|l| l.as_str()) {
+            Some("zh-CN") => "你好",
+            _ => "Hello",
+        }
+    });
+    app.get("/own", |_req| async {
+        Response::text("bonjour").with_header("Content-Language", "fr").with_header("Vary", "Origin")
+    });
+    let app = app.into_app().await.unwrap();
+    let get = |path: &str, headers: &[(&str, &str)]| {
+        let mut req = Request::new(Method::GET, path);
+        for (name, value) in headers {
+            req = req.with_header(name, value);
+        }
+        app.call(req)
+    };
+
+    let zh = get("/hello", &[("accept-language", "zh-TW,zh;q=0.9,en;q=0.8")]).await;
+    assert_eq!(zh.body_text(), "你好");
+    assert_eq!(zh.get_header("content-language"), Some("zh-CN"));
+    assert_eq!(zh.get_header("vary"), Some("Accept-Language"));
+    assert_eq!(get("/hello", &[]).await.body_text(), "Hello");
+    // An explicit choice wins over the header; unsupported ones are ignored.
+    assert_eq!(get("/hello?lang=en", &[("accept-language", "zh-CN")]).await.body_text(), "Hello");
+    assert_eq!(get("/hello?lang=xx", &[("accept-language", "zh-CN")]).await.body_text(), "你好");
+    assert_eq!(get("/hello", &[("cookie", "theme=dark; lang=zh-CN"), ("accept-language", "en")]).await.body_text(), "你好");
+    // Handlers keep their own Content-Language; Vary is extended.
+    let own = get("/own", &[("accept-language", "zh-CN")]).await;
+    assert_eq!(own.get_header("content-language"), Some("fr"));
+    assert_eq!(own.get_header("vary"), Some("Origin, Accept-Language"));
+}

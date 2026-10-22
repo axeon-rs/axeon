@@ -54,6 +54,12 @@
   `Request::grants`, `require_scope` and `require_role` for checks inside
   handlers. `ApiKeyAuth` attaches `Grants` with the key's scopes.
 
+- **Language negotiation:** `locale::Locales` picks the best supported
+  language per request from `Accept-Language` (quality values, RFC 4647
+  fallback, `q=0` exclusions), or from a query parameter or cookie;
+  as middleware it attaches a `Locale` (`Request::locale`) and sets
+  `Content-Language` and `Vary: Accept-Language`.
+
 ### Fixed
 
 - `Server::with_tls` no longer panics with "Could not automatically

@@ -250,6 +250,7 @@ app.get("/", |req| async move { req.state::<Config>().map(|config| config.greeti
 | `middleware::idempotency::Idempotency` | `Idempotency-Key`: retries replay the first response; memory, Redis or PostgreSQL store |
 | `middleware::Compression` | gzip/deflate |
 | `cache::ConditionalGet` | ETags, `Cache-Control` and `304 Not Modified` for API responses |
+| `locale::Locales` | The best supported language per request (`Accept-Language`, `?lang=`, cookie) |
 | `middleware::SetRequestId`, `RequestLogger` | Request IDs and structured logs |
 | `auth::BearerAuth`, `auth::BasicAuth`, `auth::jwt::Jwt` | Authentication |
 | `auth::api_key::ApiKeyAuth` | API keys: hashed, constant-time checked, cached, with scopes and batched `last_used_at` |
@@ -421,6 +422,25 @@ app.get("/v1/products/:id", |req| async move {
 `s-maxage`, `no-cache`, `stale-while-revalidate`...), and
 `with_last_modified` enables `If-Modified-Since`. Add `ConditionalGet`
 after `Compression`, so ETags describe the uncompressed data.
+
+### Languages
+
+```rust
+use axeon::locale::Locales;
+use axeon::Server;
+
+let mut app = Server::new();
+app.middleware(Locales::new(["en", "zh-CN"]).query_param("lang").cookie("lang"));
+app.get("/v1/products/:id", |req| async move {
+    let locale = req.locale().map(|l| l.as_str()).unwrap_or("en"); // "en" or "zh-CN"
+    format!("product text in {}", locale)
+});
+```
+
+`Accept-Language` is matched by quality with RFC 4647 fallback
+(`zh-Hant-TW` → `zh-Hant` → `zh`, and `zh` matches `zh-CN`); the query
+parameter or cookie, when set to a supported language, wins. Responses get
+`Content-Language` and `Vary: Accept-Language`.
 
 ### Cookies, sessions and CSRF
 
