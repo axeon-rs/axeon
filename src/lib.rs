@@ -52,7 +52,8 @@
 //! | Module | For |
 //! |---|---|
 //! | [`validate`] | Validated JSON, query and form input with per-field 422 errors |
-//! | [`auth`] | Bearer, Basic and JWT (feature `jwt`) authentication |
+//! | [`auth`] | Bearer, Basic, API key (feature `api-keys`) and JWT (feature `jwt`) authentication |
+//! | [`cache`] | `Cache-Control`, ETags and `304 Not Modified` for API responses |
 //! | `cookies`, `session`, `csrf` | Signed/encrypted cookies, sessions, CSRF protection (feature `cookies`) |
 //! | [`config`] | Typed configuration from environment variables and `.env` |
 //! | `templates` | HTML templates (feature `templates`) |
@@ -114,6 +115,7 @@ pub extern crate serde_json;
 pub(crate) mod app;
 pub mod auth;
 pub mod body;
+pub mod cache;
 pub mod config;
 #[cfg(feature = "cookies")]
 pub mod cookies;

@@ -1,6 +1,7 @@
 //! Static file serving: streamed from disk, with range requests and
 //! conditional (304) responses.
 
+use crate::cache::etag_matches;
 use crate::message::{Request, Response};
 use bytes::Bytes;
 use std::io::SeekFrom;
@@ -72,12 +73,6 @@ fn parse_range(header: &str, len: u64) -> ByteRange {
         },
         (true, true) => ByteRange::Full,
     }
-}
-
-/// Weak comparison of an `If-None-Match` list against our ETag.
-fn etag_matches(header: &str, etag: &str) -> bool {
-    let bare = |tag: &str| tag.trim().trim_start_matches("W/").to_string();
-    header.trim() == "*" || header.split(',').any(|tag| bare(tag) == bare(etag))
 }
 
 fn content_type(path: &Path) -> &'static str {
@@ -266,15 +261,6 @@ mod tests {
         assert_eq!(parse_range("bytes=abc", 100), Full);
         assert_eq!(parse_range("bytes=+1-2", 100), Full);
         assert_eq!(parse_range("items=0-1", 100), Full);
-    }
-
-    #[test]
-    fn compares_etags_weakly() {
-        assert!(etag_matches("\"a-1\"", "\"a-1\""));
-        assert!(etag_matches("W/\"a-1\"", "\"a-1\""));
-        assert!(etag_matches("\"x\", \"a-1\"", "\"a-1\""));
-        assert!(etag_matches("*", "\"a-1\""));
-        assert!(!etag_matches("\"a-2\"", "\"a-1\""));
     }
 
     mod properties {

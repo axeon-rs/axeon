@@ -249,6 +249,7 @@ app.get("/", |req| async move { req.state::<Config>().map(|config| config.greeti
 | `middleware::RateLimiter` | GCRA or daily quotas per IP, API key or user, plan-based limits, `RateLimit-*` and `Retry-After` headers; shared across instances with `axeon_redis::RedisRateLimitStore` |
 | `middleware::idempotency::Idempotency` | `Idempotency-Key`: retries replay the first response; memory, Redis or PostgreSQL store |
 | `middleware::Compression` | gzip/deflate |
+| `cache::ConditionalGet` | ETags, `Cache-Control` and `304 Not Modified` for API responses |
 | `middleware::SetRequestId`, `RequestLogger` | Request IDs and structured logs |
 | `auth::BearerAuth`, `auth::BasicAuth`, `auth::jwt::Jwt` | Authentication |
 | `auth::api_key::ApiKeyAuth` | API keys: hashed, constant-time checked, cached, with scopes and batched `last_used_at` |
@@ -366,6 +367,31 @@ app.get("/v1/products", |req| async move {
 Keys are sent as `Authorization: Bearer` or `X-API-Key` and compared by
 SHA-256 hash in constant time. Lookups are cached for 60 seconds
 (`cache_ttl`), which is also how long a revoked key keeps working.
+
+### Caching API responses
+
+```rust
+use axeon::cache::{CacheControl, ConditionalGet, ETag};
+use axeon::{Response, Server, ServerError};
+
+let mut app = Server::new();
+// Weak ETags from bodies and 304 for If-None-Match; the handler still runs.
+app.middleware(ConditionalGet::new().cache_control(CacheControl::revalidate()));
+
+// To skip the work too, compare a cheap validator such as a version column.
+app.get("/v1/products/:id", |req| async move {
+    let etag = ETag::strong(format!("{}-v{}", req.param::<i64>("id")?, 7));
+    if req.is_fresh(Some(&etag), None) {
+        return Ok(Response::not_modified(&etag));
+    }
+    Ok::<_, ServerError>(Response::text("...the product JSON...").with_etag(&etag))
+});
+```
+
+`CacheControl` builds the header (`public`, `private`, `max-age`,
+`s-maxage`, `no-cache`, `stale-while-revalidate`...), and
+`with_last_modified` enables `If-Modified-Since`. Add `ConditionalGet`
+after `Compression`, so ETags describe the uncompressed data.
 
 ### Cookies, sessions and CSRF
 

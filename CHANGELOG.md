@@ -34,6 +34,14 @@
   `IdempotencyStore` trait with `MemoryIdempotencyStore`; Redis and
   PostgreSQL stores in axeon-redis and axeon-orm.
 
+- **HTTP caching for API responses:** `cache::CacheControl` (a
+  `Cache-Control` builder), `cache::ETag` (strong, weak, or from a body),
+  `Response::with_etag`, `with_last_modified`, `with_cache_control` and
+  `not_modified`, and `Request::is_fresh` to answer `If-None-Match` /
+  `If-Modified-Since` before doing the work. `cache::ConditionalGet`
+  middleware gives successful `GET`/`HEAD` responses a weak ETag and turns
+  matching conditional requests into `304 Not Modified`.
+
 ### Fixed
 
 - `Server::with_tls` no longer panics with "Could not automatically

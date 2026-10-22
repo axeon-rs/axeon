@@ -603,3 +603,108 @@ async fn idempotency_keys_replay_the_first_response() {
     assert_eq!(strict.call(Request::new(Method::POST, "/")).await.status, 400);
     assert_eq!(strict.call(Request::new(Method::GET, "/")).await.status, 200);
 }
+
+#[tokio::test]
+async fn conditional_get_answers_304() {
+    use axeon::cache::{CacheControl, ConditionalGet, ETag};
+    use axeon::{Method, Request};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let expensive = Arc::new(AtomicUsize::new(0));
+    let mut app = Server::new();
+    app.middleware(ConditionalGet::new().cache_control(CacheControl::revalidate()));
+    app.get("/categories", |_req| async { axeon::Json(vec!["lighting", "furniture"]) });
+    app.get("/dated", |_req| async {
+        Response::text("dated").with_last_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+    });
+    app.get("/own", |_req| async {
+        Response::text("own").with_cache_control(CacheControl::new().public().max_age(Duration::from_secs(60)))
+    });
+    app.get("/missing", |_req| async { Err::<&str, _>(ServerError::NotFound) });
+    app.post("/categories", |_req| async { "created" });
+    let counter = Arc::clone(&expensive);
+    app.get("/products/:id", move |req| {
+        let counter = Arc::clone(&counter);
+        async move {
+            let etag = ETag::strong(format!("p{}-v3", req.param::<i64>("id")?));
+            if req.is_fresh(Some(&etag), None) {
+                return Ok(Response::not_modified(&etag));
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ServerError>(Response::text("product").with_etag(&etag))
+        }
+    });
+    let app = app.into_app().await.unwrap();
+    let get = |path: &str, header: Option<(&str, &str)>| {
+        let mut req = Request::new(Method::GET, path);
+        if let Some((name, value)) = header {
+            req = req.with_header(name, value);
+        }
+        app.call(req)
+    };
+
+    // An ETag from the body, then 304 without a body.
+    let full = get("/categories", None).await;
+    let etag = full.get_header("etag").unwrap().to_string();
+    assert!(etag.starts_with("W/\""), "{}", etag);
+    assert_eq!(full.get_header("cache-control"), Some("no-cache"));
+    let cached = get("/categories", Some(("if-none-match", &etag))).await;
+    assert_eq!((cached.status, cached.body.len()), (304, 0));
+    assert_eq!(cached.get_header("etag"), Some(etag.as_str()));
+    assert_eq!(cached.get_header("cache-control"), Some("no-cache"));
+    assert_eq!(cached.get_header("content-type"), None);
+    assert_eq!(get("/categories", Some(("if-none-match", "W/\"other\""))).await.status, 200);
+    assert_eq!(get("/categories", Some(("if-none-match", "*"))).await.status, 304);
+
+    // Last-Modified from the handler: If-Modified-Since works, and loses to If-None-Match.
+    let dated = get("/dated", None).await;
+    let modified = dated.get_header("last-modified").unwrap().to_string();
+    assert_eq!(get("/dated", Some(("if-modified-since", &modified))).await.status, 304);
+    assert_eq!(get("/dated", Some(("if-modified-since", "Sun, 01 Jan 2023 00:00:00 GMT"))).await.status, 200);
+
+    // Handlers keep their own Cache-Control; errors and POSTs are left alone.
+    assert_eq!(get("/own", None).await.get_header("cache-control"), Some("public, max-age=60"));
+    let missing = get("/missing", None).await;
+    assert_eq!((missing.status, missing.get_header("etag")), (404, None));
+    let created = app.call(Request::new(Method::POST, "/categories").with_header("if-none-match", "*")).await;
+    assert_eq!((created.status, created.get_header("etag")), (200, None));
+
+    // A handler that checks freshness itself skips the work.
+    let product = get("/products/9", None).await;
+    assert_eq!(product.get_header("etag"), Some("\"p9-v3\""));
+    let fresh = get("/products/9", Some(("if-none-match", "\"p9-v3\""))).await;
+    assert_eq!(fresh.status, 304);
+    assert_eq!(expensive.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn conditional_get_with_compression() {
+    use axeon::cache::ConditionalGet;
+    use axeon::middleware::Compression;
+    use axeon::{Method, Request};
+
+    let mut app = Server::new();
+    app.middleware(Compression::new());
+    app.middleware(ConditionalGet::new());
+    let big = "x".repeat(4096);
+    app.get("/big", move |_req| {
+        let big = big.clone();
+        async move { Response::text(big) }
+    });
+    let app = app.into_app().await.unwrap();
+    let gzip = |etag: Option<&str>| {
+        let mut req = Request::new(Method::GET, "/big").with_header("accept-encoding", "gzip");
+        if let Some(etag) = etag {
+            req = req.with_header("if-none-match", etag);
+        }
+        app.call(req)
+    };
+    let full = gzip(None).await;
+    assert_eq!(full.get_header("content-encoding"), Some("gzip"));
+    let etag = full.get_header("etag").unwrap().to_string();
+    let cached = gzip(Some(&etag)).await;
+    assert_eq!((cached.status, cached.body.len(), cached.get_header("content-encoding")), (304, 0, None));
+}
