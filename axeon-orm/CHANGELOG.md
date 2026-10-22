@@ -24,6 +24,10 @@
   `Model::TENANT` defaults to `None`, so hand-written `Model` impls keep
   compiling.
 
+- **Idempotency store:** `idempotency::PgIdempotencyStore` (features
+  `axeon` and `postgres`) keeps Axeon `Idempotency-Key` records in an
+  `axeon_idempotency` table (`install`, `migration`, `prune`).
+
 ### Changed
 
 - The `tls` feature uses rustls' aws-lc-rs provider

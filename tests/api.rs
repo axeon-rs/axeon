@@ -524,3 +524,82 @@ async fn builders_chain() {
     let app = app.into_app().await.unwrap();
     assert_eq!(app.call(axeon::Request::new(axeon::Method::GET, "/b")).await.body_text(), "5");
 }
+
+#[cfg(feature = "idempotency")]
+#[tokio::test]
+async fn idempotency_keys_replay_the_first_response() {
+    use axeon::middleware::idempotency::Idempotency;
+    use axeon::{Method, Request};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut app = Server::new();
+    app.middleware(Idempotency::new());
+    let counter = Arc::clone(&runs);
+    app.post("/orders", move |req| {
+        let counter = Arc::clone(&counter);
+        async move {
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            if req.query_param("slow").is_some() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if req.query_param("fail").is_some() {
+                return Err(ServerError::InternalError("boom".into()));
+            }
+            Ok(Response::json(&serde_json::json!({ "order": n })).with_header("Set-Cookie", "s=1").with_status(201))
+        }
+    });
+    app.get("/orders", |_req| async { "list" });
+    let app = Arc::new(app.into_app().await.unwrap());
+    let post = |key: Option<&str>, auth: &str, path: &str, body: &str| {
+        let mut req = Request::new(Method::POST, path).with_body("application/json", body.to_string()).with_header("authorization", auth);
+        if let Some(key) = key {
+            req = req.with_header("idempotency-key", key);
+        }
+        let app = Arc::clone(&app);
+        async move { app.call(req).await }
+    };
+
+    let first = post(Some("k1"), "Bearer a", "/orders", "{}").await;
+    assert_eq!((first.status, first.body_text().to_string()), (201, r#"{"order":1}"#.to_string()));
+    let again = post(Some("k1"), "Bearer a", "/orders", "{}").await;
+    assert_eq!((again.status, again.body_text().to_string()), (201, r#"{"order":1}"#.to_string()));
+    assert_eq!(again.get_header("idempotent-replayed"), Some("true"));
+    assert_eq!(again.get_header("content-type"), Some("application/json"));
+    assert_eq!(again.get_header("set-cookie"), None, "per-response headers aren't replayed");
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    // Same key, different request.
+    assert_eq!(post(Some("k1"), "Bearer a", "/orders", r#"{"x":1}"#).await.status, 422);
+    assert_eq!(post(Some("k1"), "Bearer a", "/orders?x=1", "{}").await.status, 422);
+    // Same key from another caller is a different key.
+    assert_eq!(post(Some("k1"), "Bearer b", "/orders", "{}").await.body_text(), r#"{"order":2}"#);
+    // No key, or a method it doesn't cover: runs normally.
+    assert_eq!(post(None, "Bearer a", "/orders", "{}").await.body_text(), r#"{"order":3}"#);
+    assert_eq!(post(Some(""), "Bearer a", "/orders", "{}").await.status, 400);
+
+    // While the first runs, a repeat gets 409.
+    let slow = tokio::spawn(post(Some("k2"), "Bearer a", "/orders?slow=1", "{}"));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let busy = post(Some("k2"), "Bearer a", "/orders?slow=1", "{}").await;
+    assert_eq!((busy.status, busy.get_header("retry-after")), (409, Some("1")));
+    assert_eq!(slow.await.unwrap().status, 201);
+    assert_eq!(post(Some("k2"), "Bearer a", "/orders?slow=1", "{}").await.get_header("idempotent-replayed"), Some("true"));
+
+    // Server errors aren't kept: the retry runs again.
+    let before = runs.load(Ordering::SeqCst);
+    assert_eq!(post(Some("k3"), "Bearer a", "/orders?fail=1", "{}").await.status, 500);
+    assert_eq!(post(Some("k3"), "Bearer a", "/orders?fail=1", "{}").await.status, 500);
+    assert_eq!(runs.load(Ordering::SeqCst), before + 2);
+
+    // Required keys.
+    let mut strict = Server::new();
+    strict.middleware(Idempotency::new().required(true));
+    strict.post("/", |_req| async { "ok" });
+    strict.get("/", |_req| async { "ok" });
+    let strict = strict.into_app().await.unwrap();
+    assert_eq!(strict.call(Request::new(Method::POST, "/")).await.status, 400);
+    assert_eq!(strict.call(Request::new(Method::GET, "/")).await.status, 200);
+}

@@ -206,6 +206,8 @@ pub mod search;
 pub mod vector;
 #[cfg(all(feature = "axeon", feature = "postgres"))]
 pub mod broadcast;
+#[cfg(all(feature = "axeon", feature = "postgres"))]
+pub mod idempotency;
 #[cfg(feature = "postgres")]
 pub mod notify;
 pub mod relation;

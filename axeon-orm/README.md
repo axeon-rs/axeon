@@ -473,6 +473,10 @@ app.get("/users/:id", |req| async move {
     Ok::<_, ServerError>(Json(user))
 });
 
+// Idempotency-Key records in PostgreSQL (prune them from a scheduled job):
+axeon_orm::idempotency::install(&db).await?;
+app.middleware(Idempotency::new().store(PgIdempotencyStore::new(db.clone())));
+
 // Scope req.db() and transactions to the caller's tenant (after auth):
 app.middleware(TenantScope::new(|req| req.extension::<Member>().map(|m| m.org_id)));
 

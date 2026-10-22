@@ -25,7 +25,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 uuid = { version = "1", optional = true }
 serde_json = "1"
 base64 = "0.23"
-axeon = { version = "1.1", path = "..", default-features = false, optional = true }
+axeon = { version = "1.1", path = "..", default-features = false, features = ["idempotency"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -48,5 +48,6 @@ uuid = ["dep:uuid", "sqlx/uuid"]
 json = ["sqlx/json"]
 # pgvector `vector` columns, distances and indexes (PostgreSQL).
 pgvector = ["postgres"]
-# `req.db()`, the `Transactional` middleware and error conversion for Axeon.
+# `req.db()`, the `Transactional` and `TenantScope` middleware, error
+# conversion, and (with `postgres`) broadcast and idempotency stores for Axeon.
 axeon = ["dep:axeon"]

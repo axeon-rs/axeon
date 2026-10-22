@@ -38,6 +38,7 @@ jobs:
           - --no-default-features --features cookies
           - --no-default-features --features jwt
           - --no-default-features --features api-keys
+          - --no-default-features --features idempotency
           - --no-default-features --features templates
     steps:
       - uses: actions/checkout@v7

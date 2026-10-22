@@ -23,6 +23,17 @@
   `ApiKey` extension (ID and scopes) plus your identity, and with
   `on_used` reports used IDs in batches for a `last_used_at` column.
 
+- **Idempotency keys:** `middleware::idempotency::Idempotency` (feature
+  `idempotency`, on by default). A `POST` or `PATCH` with an
+  `Idempotency-Key` header that repeats an earlier one gets the stored
+  response (`Idempotent-Replayed: true`) instead of running again; the
+  same key with a different method, path, query or body gets 422, and a
+  repeat while the first still runs gets 409 with `Retry-After`. Keys are
+  hashed with the caller's credentials (or `scope_by`), responses below 500
+  are kept for 24 hours, and server errors release the key for a retry.
+  `IdempotencyStore` trait with `MemoryIdempotencyStore`; Redis and
+  PostgreSQL stores in axeon-redis and axeon-orm.
+
 ### Fixed
 
 - `Server::with_tls` no longer panics with "Could not automatically

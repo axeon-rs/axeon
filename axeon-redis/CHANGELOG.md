@@ -4,6 +4,8 @@
 
 ### Added
 
+- `RedisIdempotencyStore`: Axeon `Idempotency-Key` records shared by
+  every instance.
 - `RedisRateLimitStore`: Axeon `RateLimiter` state shared by every
   instance (GCRA and fixed windows in one Lua call, Redis' clock, hashed
   keys that expire).

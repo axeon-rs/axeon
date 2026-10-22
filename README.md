@@ -247,6 +247,7 @@ app.get("/", |req| async move { req.state::<Config>().map(|config| config.greeti
 | `middleware::SecurityHeaders` | HSTS, nosniff, frame options, referrer and cross-origin policies, CSP |
 | `middleware::Cors` | CORS headers and preflights |
 | `middleware::RateLimiter` | GCRA or daily quotas per IP, API key or user, plan-based limits, `RateLimit-*` and `Retry-After` headers; shared across instances with `axeon_redis::RedisRateLimitStore` |
+| `middleware::idempotency::Idempotency` | `Idempotency-Key`: retries replay the first response; memory, Redis or PostgreSQL store |
 | `middleware::Compression` | gzip/deflate |
 | `middleware::SetRequestId`, `RequestLogger` | Request IDs and structured logs |
 | `auth::BearerAuth`, `auth::BasicAuth`, `auth::jwt::Jwt` | Authentication |
@@ -692,6 +693,7 @@ you need (a minimal build compiles about half as many crates):
 | `cookies` | Cookies, sessions and CSRF protection |
 | `jwt` | JSON Web Tokens |
 | `api-keys` | API keys (`auth::api_key`) |
+| `idempotency` | `Idempotency-Key` middleware |
 | `templates` | HTML templates (minijinja) |
 
 ## Examples

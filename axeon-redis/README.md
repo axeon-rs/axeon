@@ -73,6 +73,20 @@ app.middleware(
 - If Redis is down, requests go through and a warning is logged;
   `fail_open(false)` refuses them with 503 instead.
 
+## Idempotency keys
+
+```rust
+use axeon::middleware::idempotency::Idempotency;
+use axeon_redis::RedisIdempotencyStore;
+
+app.middleware(Idempotency::new().store(RedisIdempotencyStore::new(redis.clone())));
+```
+
+A retry that lands on another instance gets the first response. Claims
+are a `SET NX` with the lock's expiry, and only the claiming request can
+complete or release them. Keys are hashes: neither the client's key nor
+its credentials reach Redis.
+
 ## Testing
 
 ```bash

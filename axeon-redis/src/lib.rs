@@ -22,7 +22,9 @@
 //! ```
 //!
 //! [`RedisRateLimitStore`] shares [rate limits](axeon::middleware::rate_limit)
-//! between instances, and [`RedisBroadcast`] fans [broadcast](axeon::broadcast)
+//! between instances, [`RedisIdempotencyStore`] keeps
+//! [`Idempotency-Key`](axeon::middleware::idempotency) responses for
+//! retries on any instance, and [`RedisBroadcast`] fans [broadcast](axeon::broadcast)
 //! messages out to all of them.
 //!
 //! [`connect`] gives a [`ConnectionManager`]: one multiplexed connection,
@@ -33,12 +35,14 @@
 #![warn(missing_docs)]
 
 mod broadcast;
+mod idempotency;
 mod rate_limit;
 mod session;
 
 pub use redis;
 pub use redis::aio::ConnectionManager;
 pub use broadcast::RedisBroadcast;
+pub use idempotency::RedisIdempotencyStore;
 pub use rate_limit::RedisRateLimitStore;
 pub use session::RedisSessionStore;
 
