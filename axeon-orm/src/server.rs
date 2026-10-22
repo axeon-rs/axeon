@@ -47,6 +47,9 @@ impl From<Error> for ServerError {
         match error {
             Error::NotFound => ServerError::NotFound,
             Error::InvalidCursor(msg) => ServerError::BadRequest(format!("invalid cursor: {}", msg)),
+            Error::StaleRecord(_) => {
+                ServerError::Conflict("the record was changed by someone else; reload it and try again".to_string())
+            }
             Error::WrongTenant(_) => ServerError::Forbidden("the record belongs to another tenant".to_string()),
             Error::UniqueViolation(_) => ServerError::Conflict("record already exists".to_string()),
             Error::ForeignKeyViolation(_) => {

@@ -33,6 +33,9 @@ pub enum Error {
     /// transaction with no tenant scope: a bug, since it could have leaked
     /// another tenant's rows.
     TenantScope(String),
+    /// The row changed since it was loaded: its `#[model(version)]` column
+    /// no longer matches. Reload it and try again.
+    StaleRecord(String),
     /// A write named a row of another tenant than the scope's.
     WrongTenant(String),
     /// Bad configuration, e.g. an unsupported database URL.
@@ -61,6 +64,7 @@ impl fmt::Display for Error {
             Error::InvalidCursor(msg) => write!(f, "invalid cursor: {}", msg),
             Error::TenantScope(msg) => write!(f, "missing tenant scope: {}", msg),
             Error::WrongTenant(msg) => write!(f, "wrong tenant: {}", msg),
+            Error::StaleRecord(msg) => write!(f, "stale record: {}", msg),
             Error::Config(msg) => write!(f, "configuration error: {}", msg),
             Error::Transaction(msg) => write!(f, "transaction error: {}", msg),
             Error::Database(error) => write!(f, "database error: {}", error),

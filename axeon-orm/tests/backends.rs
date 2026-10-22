@@ -1133,6 +1133,67 @@ async fn tenant_scopes(db: &Db) {
     tx.rollback().await.unwrap();
 }
 
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Doc {
+    id: i64,
+    #[model(unique)]
+    slug: String,
+    title: String,
+    #[model(version)]
+    version: i64,
+}
+
+async fn optimistic_locking(db: &Db) {
+    db.create_table::<Doc>().await.unwrap();
+    let doc = |slug: &str, title: &str| Doc { id: 0, slug: slug.into(), title: title.into(), version: 0 };
+    fn stale<T>(r: &Result<T, Error>) -> bool {
+        matches!(r, Err(Error::StaleRecord(_)))
+    }
+
+    let stored = doc("terms", "Terms v1").insert(db).await.unwrap();
+    assert_eq!(stored.version, 0);
+
+    // Two editors load the same version; the second save loses.
+    let mut alice = Doc::find_or_fail(db, stored.id).await.unwrap();
+    let mut bob = alice.clone();
+    alice.title = "Alice's edit".into();
+    alice.update(db).await.unwrap();
+    assert_eq!(alice.version, 1, "update bumps the version and reloads it");
+    bob.title = "Bob's edit".into();
+    assert!(stale(&bob.update(db).await));
+    assert_eq!(Doc::find_or_fail(db, stored.id).await.unwrap().title, "Alice's edit");
+    // After reloading, Bob can save.
+    let mut bob = Doc::find_or_fail(db, stored.id).await.unwrap();
+    bob.title = "Bob's edit".into();
+    bob.update(db).await.unwrap();
+    assert_eq!(bob.version, 2);
+
+    // Bulk updates bump the version, so earlier copies are stale.
+    let before = Doc::find_or_fail(db, stored.id).await.unwrap();
+    assert_eq!(Doc::query().update(db, [Doc::TITLE.set("Bulk")]).await.unwrap(), 1);
+    let after = Doc::find_or_fail(db, stored.id).await.unwrap();
+    assert_eq!(after.version, 3);
+    let mut copy = before.clone();
+    assert!(stale(&copy.update(db).await));
+    // Unless the update sets the version itself.
+    Doc::query().update(db, [Doc::VERSION.set(10i64)]).await.unwrap();
+    assert_eq!(Doc::find_or_fail(db, stored.id).await.unwrap().version, 10);
+
+    // Upserts bump it as well.
+    let upserted = doc("terms", "Upserted").upsert(db, OnConflict::on(Doc::SLUG)).await.unwrap();
+    assert_eq!((upserted.title.as_str(), upserted.version), ("Upserted", 11));
+    let many = Doc::upsert_many(db, &[doc("terms", "Many"), doc("privacy", "Privacy")], OnConflict::on(Doc::SLUG)).await.unwrap();
+    assert_eq!(many.iter().map(|d| d.version).collect::<Vec<_>>(), [12, 0]);
+
+    // Deletes check the version; a missing row is still NotFound.
+    let current = Doc::find_or_fail(db, stored.id).await.unwrap();
+    assert!(stale(&before.clone().delete(db).await));
+    current.clone().delete(db).await.unwrap();
+    assert!(matches!(current.clone().delete(db).await, Err(Error::NotFound)));
+    let mut gone = current;
+    assert!(matches!(gone.update(db).await, Err(Error::NotFound)));
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -1220,6 +1281,7 @@ backend_tests!(
     bulk_inserts,
     cursor_pagination,
     tenant_scopes,
+    optimistic_locking,
 );
 
 #[test]

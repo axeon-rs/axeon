@@ -33,6 +33,7 @@ struct FieldAttrs {
     skip: bool,
     dimensions: Option<syn::LitInt>,
     tenant: bool,
+    version: bool,
 }
 
 struct Field {
@@ -142,6 +143,8 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                     attrs.skip = true;
                 } else if path.is_ident("tenant") {
                     attrs.tenant = true;
+                } else if path.is_ident("version") {
+                    attrs.version = true;
                 } else if path.is_ident("dimensions") {
                     let lit: syn::LitInt = meta.value()?.parse()?;
                     let n: u32 = lit.base10_parse()?;
@@ -151,7 +154,7 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                     attrs.dimensions = Some(lit);
                 } else {
                     return Err(meta.error(
-                        "expected primary_key, column, unique, index, default, created_at, updated_at, belongs_to, on_delete, skip, dimensions or tenant",
+                        "expected primary_key, column, unique, index, default, created_at, updated_at, belongs_to, on_delete, skip, dimensions, tenant or version",
                     ));
                 }
                 Ok(())
@@ -165,6 +168,9 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         }
         if attrs.tenant && attrs.primary_key {
             return Err(Error::new_spanned(&ident, "the tenant column can't be the primary key"));
+        }
+        if attrs.version && (attrs.primary_key || attrs.tenant || attrs.skip) {
+            return Err(Error::new_spanned(&ident, "the version column can't be the primary key, the tenant column or skipped"));
         }
         let column = attrs.column.as_ref().map(LitStr::value).unwrap_or_else(|| unraw(&ident));
         fields.push(Field { ident, ty: field.ty.clone(), column, attrs });
@@ -199,6 +205,22 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
             quote! { ::core::option::Option::Some(#column) }
         }
         [_, second, ..] => return Err(Error::new_spanned(&second.ident, "only one tenant column is supported")),
+    };
+
+    let versions: Vec<&&Field> = columns.iter().filter(|f| f.attrs.version).collect();
+    let (version, version_check) = match versions.as_slice() {
+        [] => (quote! { ::core::option::Option::None }, quote! {}),
+        [one] => {
+            let (column, ty) = (&one.column, &one.ty);
+            let check = quote! {
+                const _: () = ::core::assert!(
+                    <#ty as ::axeon_orm::SqlType>::KIND.is_integer() && !<#ty as ::axeon_orm::SqlType>::NULLABLE,
+                    "a #[model(version)] column must be a non-nullable i32 or i64"
+                );
+            };
+            (quote! { ::core::option::Option::Some(#column) }, check)
+        }
+        [_, second, ..] => return Err(Error::new_spanned(&second.ident, "only one version column is supported")),
     };
 
     // impl Model.
@@ -354,6 +376,7 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
             const PRIMARY_KEY: &'static str = #pk_column;
             const COLUMNS: &'static [::axeon_orm::ColumnDef] = &[#(#column_defs),*];
             const TENANT: ::core::option::Option<&'static str> = #tenant;
+            const VERSION: ::core::option::Option<&'static str> = #version;
 
             fn from_row_prefixed(row: &::axeon_orm::Row, prefix: &str) -> ::axeon_orm::Result<Self> {
                 ::core::result::Result::Ok(Self { #(#decode),* })
@@ -366,6 +389,8 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                 }
             }
         }
+
+        #version_check
 
         #[allow(dead_code)]
         impl #name {

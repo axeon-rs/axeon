@@ -1046,7 +1046,8 @@ impl<M: Model> Query<M> {
     }
 
     /// Updates every matching row; returns how many matched (MySQL counts
-    /// only rows whose values changed).
+    /// only rows whose values changed). A `#[model(version)]` column is
+    /// incremented too, unless `set` assigns it.
     ///
     /// ```no_run
     /// # use axeon_orm::{Db, Model};
@@ -1062,7 +1063,9 @@ impl<M: Model> Query<M> {
         let mut sql = Sql::new(conn.backend());
         sql.push("UPDATE ").ident(M::TABLE).push(" SET ");
         let mut empty = true;
+        let mut sets_version = false;
         for assignment in set {
+            sets_version |= Some(assignment.column) == M::VERSION;
             // Moving rows to another tenant is a write of that tenant's rows.
             if let (Some(column), Scope::Tenant(tenant)) = (M::TENANT, &scope) {
                 if assignment.column == column && assignment.value.clone().key() != tenant.clone().key() {
@@ -1077,6 +1080,10 @@ impl<M: Model> Query<M> {
         }
         if empty {
             return Ok(0);
+        }
+        // Instances loaded before this update must see it as a change.
+        if let Some(version) = M::VERSION.filter(|_| !sets_version) {
+            sql.push(", ").ident(version).push(" = ").ident(version).push(" + 1");
         }
         sql.where_clause(&conds);
         let (sql, args) = sql.finish();

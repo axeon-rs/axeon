@@ -40,6 +40,11 @@ pub trait Model: Sized + Send + Sync + Unpin + 'static {
     /// Queries on such a model then need a tenant scope; see
     /// [`Db::for_tenant`](crate::Db::for_tenant).
     const TENANT: Option<&'static str> = None;
+    /// The optimistic-locking version column (`#[model(version)]`), if
+    /// any: updates and deletes of an instance only apply while the stored
+    /// version still matches, and fail with
+    /// [`Error::StaleRecord`](crate::Error::StaleRecord) otherwise.
+    const VERSION: Option<&'static str> = None;
     /// Builds the model from a row holding all of its columns.
     fn from_row(row: &Row) -> Result<Self> {
         Self::from_row_prefixed(row, "")
@@ -386,13 +391,24 @@ fn other_tenants_row<M: Model>() -> Error {
     Error::WrongTenant(format!("a `{}` row with the same key belongs to another tenant", M::TABLE))
 }
 
-/// `col = excluded.col` on conflict; with a tenant column, only when the
-/// existing row has the same tenant (else the row is left as it is).
+/// `col = excluded.col` on conflict (and `version = version + 1`); with a
+/// tenant column, only when the existing row has the same tenant (else the
+/// row is left as it is).
 fn write_conflict_update<M: Model>(sql: &mut Sql, backend: Backend, update: &[&'static str], guarded: bool) {
     let tenant = M::TENANT.filter(|_| guarded);
+    let mut update: Vec<&'static str> = update.iter().copied().filter(|c| Some(*c) != M::VERSION).collect();
+    update.extend(M::VERSION);
+    let excluded = crate::sql::ident(backend, "excluded");
+    // The value a column gets: the new row's, or the bumped version.
+    let new_value = |sql: &mut Sql, column: &str| {
+        if Some(column) == M::VERSION {
+            sql.ident(M::TABLE).push(".").ident(column).push(" + 1");
+        } else {
+            sql.push(&excluded).push(".").ident(column);
+        }
+    };
     if backend == Backend::MySql {
-        let new = crate::sql::ident(backend, "excluded");
-        sql.push(" AS ").push(&new).push(" ON DUPLICATE KEY UPDATE ");
+        sql.push(" AS ").push(&excluded).push(" ON DUPLICATE KEY UPDATE ");
         for (i, column) in update.iter().enumerate() {
             if i > 0 {
                 sql.push(", ");
@@ -402,12 +418,12 @@ fn write_conflict_update<M: Model>(sql: &mut Sql, backend: Backend, update: &[&'
                 // Assignments run left to right and the tenant column never
                 // changes here, so it compares the existing row's tenant.
                 Some(tenant) => {
-                    sql.push("IF(").ident(M::TABLE).push(".").ident(tenant).push(" <=> ").push(&new).push(".").ident(tenant);
-                    sql.push(", ").push(&new).push(".").ident(column).push(", ").ident(M::TABLE).push(".").ident(column).push(")");
+                    sql.push("IF(").ident(M::TABLE).push(".").ident(tenant).push(" <=> ").push(&excluded).push(".").ident(tenant);
+                    sql.push(", ");
+                    new_value(sql, column);
+                    sql.push(", ").ident(M::TABLE).push(".").ident(column).push(")");
                 }
-                None => {
-                    sql.push(&new).push(".").ident(column);
-                }
+                None => new_value(sql, column),
             }
         }
         return;
@@ -417,7 +433,8 @@ fn write_conflict_update<M: Model>(sql: &mut Sql, backend: Backend, update: &[&'
         if i > 0 {
             sql.push(", ");
         }
-        sql.ident(column).push(" = ").ident("excluded").push(".").ident(column);
+        sql.ident(column).push(" = ");
+        new_value(sql, column);
     }
     if let Some(tenant) = tenant {
         sql.push(" WHERE ").ident(M::TABLE).push(".").ident(tenant).push(" = ").ident("excluded").push(".").ident(tenant);
@@ -515,14 +532,18 @@ pub async fn update<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M>
     sql.push("UPDATE ").ident(M::TABLE).push(" SET ");
     let mut first = true;
     for column in M::COLUMNS.iter().filter(|c| !c.primary_key) {
-        let value = match column.timestamp {
-            Some(Timestamp::UpdatedAt) => now(column.kind).unwrap_or_else(|| value_of(model, column.name)),
-            _ => value_of(model, column.name),
-        };
         if !first {
             sql.push(", ");
         }
         first = false;
+        if Some(column.name) == M::VERSION {
+            sql.ident(column.name).push(" = ").ident(column.name).push(" + 1");
+            continue;
+        }
+        let value = match column.timestamp {
+            Some(Timestamp::UpdatedAt) => now(column.kind).unwrap_or_else(|| value_of(model, column.name)),
+            _ => value_of(model, column.name),
+        };
         sql.ident(column.name).push(" = ").arg(value);
     }
     if first {
@@ -533,31 +554,58 @@ pub async fn update<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M>
     // The stored row must be the tenant's too, not only the new values.
     let mut conds = vec![Cond::Compare(M::PRIMARY_KEY, "=", key.clone())];
     conds.extend(tenant);
+    conds.extend(version_cond(model));
     sql.where_clause(&conds);
     if backend == Backend::MySql {
-        // No `RETURNING`, and affected rows count only changed rows: read
-        // the row back to both reload it and tell whether it exists.
+        // No `RETURNING`, and affected rows count only changed rows; with
+        // a version column every match changes it, so 0 means no match.
         let (sql, args) = sql.finish();
-        conn.execute(sql, args).await?;
+        let changed = conn.execute(sql, args).await?;
+        if changed == 0 && M::VERSION.is_some() {
+            return Err(missing_or_stale::<M>(&mut conn, key).await);
+        }
         return fetch_one_where(&mut conn, M::PRIMARY_KEY, key).await?.ok_or(Error::NotFound);
     }
     sql.push(" RETURNING ").push(&column_list::<M>(backend));
     let (sql, args) = sql.finish();
-    let row = conn.fetch_optional(sql, args).await?.ok_or(Error::NotFound)?;
-    M::from_row(&row)
+    match conn.fetch_optional(sql, args).await? {
+        Some(row) => M::from_row(&row),
+        None => Err(missing_or_stale::<M>(&mut conn, key).await),
+    }
+}
+
+/// `version = <loaded value>`, for models with a version column.
+fn version_cond<M: Model>(model: &M) -> Option<Cond> {
+    M::VERSION.map(|column| Cond::Compare(column, "=", value_of(model, column)))
+}
+
+/// Why a keyed write matched no row: the row is gone ([`Error::NotFound`])
+/// or, with a version column, another write changed it first
+/// ([`Error::StaleRecord`]).
+async fn missing_or_stale<M: Model>(conn: &mut Conn<'_>, key: Value) -> Error {
+    if M::VERSION.is_none() {
+        return Error::NotFound;
+    }
+    match fetch_one_where::<M>(conn, M::PRIMARY_KEY, key).await {
+        Ok(Some(_)) => Error::StaleRecord(format!("this `{}` row was changed since it was loaded", M::TABLE)),
+        Ok(None) => Error::NotFound,
+        Err(error) => error,
+    }
 }
 
 #[doc(hidden)]
 pub async fn delete<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<()> {
     let mut conn = ex.into_conn();
-    let mut conds = vec![Cond::Compare(M::PRIMARY_KEY, "=", value_of(model, M::PRIMARY_KEY))];
+    let key = value_of(model, M::PRIMARY_KEY);
+    let mut conds = vec![Cond::Compare(M::PRIMARY_KEY, "=", key.clone())];
     conds.extend(conn.scope().filter_for::<M>()?);
+    conds.extend(version_cond(model));
     let mut sql = Sql::new(conn.backend());
     sql.push("DELETE FROM ").ident(M::TABLE);
     sql.where_clause(&conds);
     let (sql, args) = sql.finish();
     match conn.execute(sql, args).await? {
-        0 => Err(Error::NotFound),
+        0 => Err(missing_or_stale::<M>(&mut conn, key).await),
         _ => Ok(()),
     }
 }

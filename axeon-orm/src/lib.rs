@@ -342,5 +342,24 @@ pub mod __private {
 /// struct Case { id: i64, status: Status }
 /// let _ = Case::query().filter(Case::STATUS.eq("open"));
 /// ```
+///
+/// A version column that isn't a non-nullable integer:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::Model)]
+/// struct Doc { id: i64, #[model(version)] version: String }
+/// ```
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::Model)]
+/// struct Doc { id: i64, #[model(version)] version: Option<i64> }
+/// ```
+///
+/// Two version columns:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::Model)]
+/// struct Doc { id: i64, #[model(version)] a: i64, #[model(version)] b: i64 }
+/// ```
 #[doc(hidden)]
 pub mod compile_fail_tests {}

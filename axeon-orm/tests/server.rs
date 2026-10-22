@@ -161,3 +161,10 @@ async fn tenant_scope_scopes_db_and_transactions() {
     assert_eq!(Selection::query().count(&db.for_tenant(1i64)).await.unwrap(), 3);
     assert_eq!(Selection::query().count(&db.for_tenant(2i64)).await.unwrap(), 1);
 }
+
+#[test]
+fn stale_records_are_conflicts() {
+    let error: ServerError = axeon_orm::Error::StaleRecord("changed".into()).into();
+    assert_eq!(error.status_code(), 409);
+    assert!(error.to_string().contains("reload"));
+}

@@ -335,6 +335,36 @@ build the SQL text from user input. Fragments are parenthesized, so an
 `OR` inside one can't escape it. Column names inside them aren't quoted or
 qualified; in a join, the main table is `t0` and the joined one `t1`.
 
+## Optimistic locking
+
+Mark an integer column with `#[model(version)]` to stop concurrent edits
+from overwriting each other silently:
+
+```rust
+#[derive(Model)]
+struct ProductVersion {
+    id: i64,
+    title: String,
+    #[model(version)]
+    version: i64,
+}
+
+let mut mine = ProductVersion::find_or_fail(&db, id).await?;
+mine.title = "New title".into();
+match mine.update(&db).await {                  // UPDATE ... WHERE id = $1 AND version = $2
+    Ok(()) => {}                                // mine.version is now one higher
+    Err(Error::StaleRecord(_)) => { /* someone saved first: reload, merge, retry */ }
+    Err(other) => return Err(other),
+}
+```
+
+- `update` and `delete` on an instance apply only while the stored version
+  equals the loaded one; otherwise they fail with `Error::StaleRecord`
+  (409 in Axeon handlers). A row that no longer exists is still `NotFound`.
+- `update` increments the version and reloads it into the struct.
+  `Query::update` and upserts increment it too, so copies loaded before
+  them are stale (`Query::update` leaves it alone if you assign it).
+
 ## Tenant scopes
 
 Mark the column that says which tenant (organization, account, workspace)

@@ -36,6 +36,13 @@
   factories with per-model sequence numbers, `with` / `each` overrides,
   `build`, `build_many`, `create` and `create_many` (bulk insert).
 
+- **Optimistic locking:** `#[model(version)]` on an `i32`/`i64` column.
+  Instance `update` and `delete` require the stored version to match
+  (`update` increments it and reloads), failing with the new
+  `Error::StaleRecord` (409 in Axeon) when another write got there first;
+  `Query::update` and upserts increment it too. `Model::VERSION` defaults
+  to `None`.
+
 ### Changed
 
 - The `tls` feature uses rustls' aws-lc-rs provider
