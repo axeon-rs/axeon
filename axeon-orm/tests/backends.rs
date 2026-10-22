@@ -1194,6 +1194,53 @@ async fn optimistic_locking(db: &Db) {
     assert!(matches!(gone.update(db).await, Err(Error::NotFound)));
 }
 
+async fn streaming(db: &Db) {
+    use futures::{StreamExt, TryStreamExt};
+    setup(db).await;
+    let users: Vec<User> = (0..1500).map(|i| user(&format!("s{:04}", i), i % 100)).collect();
+    User::insert_many(db, &users).await.unwrap();
+
+    // Every matching row, in order, without loading them all first.
+    let names: Vec<String> = User::query()
+        .filter(User::AGE.lt(50))
+        .order_by(User::NAME.asc())
+        .stream(db)
+        .map_ok(|u| u.name)
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(names.len(), 750);
+    assert!(names.windows(2).all(|w| w[0] < w[1]));
+
+    // In batches.
+    let sizes: Vec<usize> = User::query().stream(db).try_chunks(400).map_ok(|b| b.len()).try_collect().await.map_err(|e| e.1).unwrap();
+    assert_eq!(sizes, [400, 400, 400, 300]);
+
+    // Inside a transaction: sees its uncommitted rows; dropping the stream
+    // early leaves the transaction usable.
+    let mut tx = db.begin().await.unwrap();
+    user("in-tx", 7).insert(&mut tx).await.unwrap();
+    {
+        let mut early = User::query().order_by(User::ID.asc()).stream(&mut tx);
+        assert!(early.next().await.unwrap().is_ok());
+        assert!(early.next().await.unwrap().is_ok());
+    }
+    assert_eq!(User::query().filter(User::NAME.eq("in-tx")).stream(&mut tx).count().await, 1);
+    assert_eq!(User::query().count(&mut tx).await.unwrap(), 1501);
+    tx.rollback().await.unwrap();
+
+    // Errors arrive through the stream: a missing tenant scope...
+    let refused: Vec<_> = Project::query().stream(db).collect().await;
+    assert!(matches!(refused.as_slice(), [Err(Error::TenantScope(_))]), "{:?}", refused.len());
+    // ...and, on PostgreSQL, one raised mid-stream, which fails the transaction.
+    if db.backend() == Backend::Postgres {
+        let mut tx = db.begin().await.unwrap();
+        let rows: Vec<_> = User::query().filter(Expr::raw("1 / (age - 50) <> 0", ())).stream(&mut tx).collect().await;
+        assert!(rows.iter().any(|r| r.is_err()));
+        assert!(matches!(tx.commit().await, Err(Error::Transaction(_))));
+    }
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -1282,6 +1329,7 @@ backend_tests!(
     cursor_pagination,
     tenant_scopes,
     optimistic_locking,
+    streaming,
 );
 
 #[test]

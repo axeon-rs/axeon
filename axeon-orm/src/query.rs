@@ -854,6 +854,43 @@ impl<M: Model> Query<M> {
             .collect()
     }
 
+    /// The matching rows one at a time, as the database sends them, instead
+    /// of all at once: for reindexing, exports and jobs over whole tables,
+    /// in constant memory.
+    ///
+    /// The stream holds a pooled connection (or the transaction) until it
+    /// ends or is dropped, so don't keep many open at once, and keep
+    /// per-row work short or batch it.
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, Model};
+    /// # #[derive(Model)] struct Product { id: i64, active: bool }
+    /// use futures::TryStreamExt;
+    ///
+    /// # async fn run(db: Db) -> axeon_orm::Result<()> {
+    /// let mut batches = Product::query().filter(Product::ACTIVE.eq(true)).stream(&db).try_chunks(500);
+    /// while let Some(batch) = batches.try_next().await.map_err(|e| e.1)? {
+    ///     // reindex(batch).await?;
+    /// }
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// For work that is slow per batch, [`cursor_paginate`](Query::cursor_paginate)
+    /// releases the connection between pages instead.
+    pub fn stream<'c>(self, ex: impl Executor<'c>) -> futures::stream::BoxStream<'c, Result<M>>
+    where
+        M: 'c,
+    {
+        use futures::StreamExt;
+        let conn = ex.into_conn();
+        let conds = match self.scoped(&conn) {
+            Ok(conds) => conds,
+            Err(error) => return futures::stream::once(async move { Err(error) }).boxed(),
+        };
+        let (sql, args) = self.select(conn.backend(), &conds);
+        conn.fetch_stream(sql, args).map(|row| row.and_then(|row| M::from_row(&row))).boxed()
+    }
+
     /// Every matching row.
     pub async fn all<'c>(self, ex: impl Executor<'c>) -> Result<Vec<M>> {
         self.fetch(&mut ex.into_conn()).await

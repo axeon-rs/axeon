@@ -103,6 +103,9 @@ let page = Post::query().paginate(&db, 2, 20).await?;   // items, total, last_pa
 // Keyset pagination for public APIs: no OFFSET or COUNT(*), opaque cursor.
 let page = Post::query().order_by(Post::ID.desc()).cursor_paginate(&db, after.as_deref(), 20).await?;
 // page.items, page.next_cursor (None on the last page)
+
+// Whole tables in constant memory (reindexing, exports), e.g. in batches:
+let mut batches = Product::query().stream(&db).try_chunks(500);   // futures::TryStreamExt
 let n = Post::query().filter(Post::USER_ID.eq(ada.id)).count(&db).await?;
 
 let mut user = user;

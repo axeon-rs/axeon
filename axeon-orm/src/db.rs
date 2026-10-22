@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use crate::model::Model;
 use crate::tenant::Scope;
 use crate::value::{Kind, SqlType, Value};
+use futures::stream::BoxStream;
 use sqlx::AssertSqlSafe;
 use std::time::Duration;
 
@@ -704,6 +705,58 @@ impl Conn<'_> {
             q.fetch_all(ex).await.map(|rows| rows.into_iter().map(Into::into).collect()).map_err(Error::from)
         });
         self.track(result)
+    }
+
+    /// The rows as they arrive, holding the connection (or transaction)
+    /// until the stream is dropped. An error inside a transaction marks it
+    /// failed, as the other methods do.
+    pub(crate) fn fetch_stream<'c>(self, sql: String, args: Vec<Value>) -> BoxStream<'c, Result<Row>>
+    where
+        Self: 'c,
+    {
+        use futures::StreamExt;
+        fn rows<'s, R: Into<Row> + Send + 's>(
+            stream: BoxStream<'s, std::result::Result<R, sqlx::Error>>,
+            failed: Option<&'s mut bool>,
+        ) -> BoxStream<'s, Result<Row>> {
+            let mut failed = failed;
+            stream
+                .map(move |row| {
+                    if row.is_err() {
+                        if let Some(failed) = failed.as_deref_mut() {
+                            *failed = true;
+                        }
+                    }
+                    row.map(Into::into).map_err(Error::from)
+                })
+                .boxed()
+        }
+        match self {
+            #[cfg(feature = "postgres")]
+            Conn::Db(Db { inner: Pool::Postgres(pool), .. }) => {
+                rows(bind_all!(sqlx::query::<sqlx::Postgres>(AssertSqlSafe(sql)), args).fetch(pool), None)
+            }
+            #[cfg(feature = "sqlite")]
+            Conn::Db(Db { inner: Pool::Sqlite(pool), .. }) => {
+                rows(bind_all!(sqlx::query::<sqlx::Sqlite>(AssertSqlSafe(sql)), args).fetch(pool), None)
+            }
+            #[cfg(feature = "mysql")]
+            Conn::Db(Db { inner: Pool::MySql(pool), .. }) => {
+                rows(bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe(sql)), args).fetch(pool), None)
+            }
+            #[cfg(feature = "postgres")]
+            Conn::Tx(Transaction { inner: Tx::Postgres(tx), failed, .. }) => {
+                rows(bind_all!(sqlx::query::<sqlx::Postgres>(AssertSqlSafe(sql)), args).fetch(&mut **tx), Some(failed))
+            }
+            #[cfg(feature = "sqlite")]
+            Conn::Tx(Transaction { inner: Tx::Sqlite(tx), failed, .. }) => {
+                rows(bind_all!(sqlx::query::<sqlx::Sqlite>(AssertSqlSafe(sql)), args).fetch(&mut **tx), Some(failed))
+            }
+            #[cfg(feature = "mysql")]
+            Conn::Tx(Transaction { inner: Tx::MySql(tx), failed, .. }) => {
+                rows(bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe(sql)), args).fetch(&mut **tx), Some(failed))
+            }
+        }
     }
 
     pub(crate) async fn fetch_optional(&mut self, sql: String, args: Vec<Value>) -> Result<Option<Row>> {

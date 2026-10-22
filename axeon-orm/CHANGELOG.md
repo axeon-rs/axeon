@@ -43,6 +43,11 @@
   `Query::update` and upserts increment it too. `Model::VERSION` defaults
   to `None`.
 
+- **Row streaming:** `Query::stream(ex)` returns matching rows as an async
+  stream, as the database sends them, holding the connection (or
+  transaction) until it ends. Tenant scopes apply, and an error in a
+  transaction marks it failed.
+
 ### Changed
 
 - The `tls` feature uses rustls' aws-lc-rs provider
