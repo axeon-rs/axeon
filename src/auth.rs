@@ -1,5 +1,6 @@
 //! Authentication: reading credentials, bearer-token and basic-auth
-//! middleware, and JSON Web Tokens (feature `jwt`).
+//! middleware, API keys (feature `api-keys`, see [`api_key`]) and JSON Web
+//! Tokens (feature `jwt`).
 //!
 //! ```rust
 //! use axeon::{Server, ServerError};
@@ -27,6 +28,9 @@ use crate::middleware::{Middleware, MiddlewareResult, Next};
 use base64::Engine;
 use std::future::Future;
 use std::sync::Arc;
+
+#[cfg(feature = "api-keys")]
+pub mod api_key;
 
 /// Compares two byte strings in time that depends only on their lengths,
 /// so attackers can't guess secrets character by character from timing.

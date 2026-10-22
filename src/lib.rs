@@ -100,8 +100,8 @@
 //!
 //! All on by default: `tls` (HTTPS via rustls), `compression` (gzip/deflate
 //! middleware), `ws` (WebSockets), `multipart` (streaming uploads),
-//! `cookies` (cookies, sessions, CSRF), `jwt` (JSON Web Tokens) and
-//! `templates` (HTML templates).
+//! `cookies` (cookies, sessions, CSRF), `jwt` (JSON Web Tokens),
+//! `api-keys` (API key authentication) and `templates` (HTML templates).
 //!
 //! See the [README](https://github.com/axeon-rs/axeon#readme) for a full
 //! guide and the [changelog](https://github.com/axeon-rs/axeon/blob/master/CHANGELOG.md)
@@ -170,7 +170,8 @@ pub use serde_json::{json, Value};
     feature = "multipart",
     feature = "cookies",
     feature = "jwt",
-    feature = "templates"
+    feature = "templates",
+    feature = "api-keys"
 ))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;

@@ -181,3 +181,82 @@ mod csrf {
         assert!(again.get_header("set-cookie").is_none());
     }
 }
+
+#[cfg(feature = "api-keys")]
+#[tokio::test]
+async fn api_keys_authenticate_cache_and_report_use() {
+    use axeon::auth::api_key::{generate_key, ApiKey, ApiKeyAuth, ApiKeyRecord, KeyHash};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Org(i64);
+
+    let live = generate_key("vs_live");
+    let other = generate_key("vs_live");
+    // The "database": id -> (hash, scopes, org); `other` is not stored.
+    type Row = (KeyHash, Vec<String>, i64);
+    let table: Arc<HashMap<String, Row>> =
+        Arc::new([(live.id.clone(), (live.hash, vec!["catalog:read".to_string()], 7))].into_iter().collect());
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let used = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+    let mut app = Server::new();
+    let (t, l, u) = (Arc::clone(&table), Arc::clone(&lookups), Arc::clone(&used));
+    app.middleware(
+        ApiKeyAuth::new("vs_live", move |id: String| {
+            let (table, lookups) = (Arc::clone(&t), Arc::clone(&l));
+            async move {
+                lookups.fetch_add(1, Ordering::SeqCst);
+                if id == "aaaaaaaaaaaaaaaa" {
+                    return Err(ServerError::InternalError("database down".into()));
+                }
+                Ok(table.get(&id).map(|(hash, scopes, org)| ApiKeyRecord {
+                    hash: *hash,
+                    scopes: scopes.clone(),
+                    identity: Org(*org),
+                }))
+            }
+        })
+        .on_used(Duration::ZERO, move |ids| {
+            let used = Arc::clone(&u);
+            async move { used.lock().unwrap().push(ids) }
+        }),
+    );
+    app.get("/me", |req| async move {
+        let key = req.extension::<ApiKey>().unwrap();
+        let org = req.extension::<Org>().unwrap();
+        format!("{} {} {}", key.id, key.has_scope("catalog:read"), org.0)
+    });
+    let app = app.into_app().await.unwrap();
+    let get = |header: &'static str, value: String| app.call(Request::new(Method::GET, "/me").with_header(header, &value));
+
+    let ok = get("authorization", format!("Bearer {}", live.key)).await;
+    assert_eq!((ok.status, ok.body_text().to_string()), (200, format!("{} true 7", live.id)));
+    assert_eq!(get("x-api-key", live.key.clone()).await.status, 200);
+    // Cached: two requests, one lookup.
+    assert_eq!(lookups.load(Ordering::SeqCst), 1);
+
+    let missing = app.call(Request::new(Method::GET, "/me")).await;
+    assert_eq!(missing.status, 401);
+    assert_eq!(missing.get_header("www-authenticate"), Some("Bearer"));
+    for bad in [
+        format!("{}x", live.key),                       // wrong secret, known ID
+        other.key.clone(),                              // unknown ID
+        live.key.replacen("vs_live", "vs_test", 1),     // other prefix
+        "vs_live_nonsense".to_string(),                 // malformed
+    ] {
+        let response = get("x-api-key", bad.clone()).await;
+        assert_eq!(response.status, 401, "{}", bad);
+        assert!(response.get_header("www-authenticate").unwrap().contains("invalid_token"));
+    }
+    // Lookup failures are server errors, not 401s.
+    assert_eq!(get("x-api-key", "vs_live_aaaaaaaaaaaaaaaa_secret".to_string()).await.status, 500);
+
+    // Used IDs are reported (on a spawned task).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let reported: Vec<String> = used.lock().unwrap().concat();
+    assert!(!reported.is_empty() && reported.iter().all(|id| *id == live.id), "{:?}", reported);
+}

@@ -14,6 +14,15 @@
   `-Policy`. Existing `RateLimiter::per_minute(..).burst(..)` code behaves
   as before.
 
+- **API keys:** `auth::api_key` (feature `api-keys`, on by default).
+  `generate_key("vs_live")` makes `vs_live_<id>_<secret>` keys with a
+  256-bit secret, returning the key (show once), its ID and a `KeyHash` to
+  store. `ApiKeyAuth::new(prefix, lookup)` reads `Authorization: Bearer`
+  or `X-API-Key`, looks the ID up with your async function, compares the
+  hash in constant time, caches lookups (60 s by default), attaches an
+  `ApiKey` extension (ID and scopes) plus your identity, and with
+  `on_used` reports used IDs in batches for a `last_used_at` column.
+
 ### Fixed
 
 - `Server::with_tls` no longer panics with "Could not automatically

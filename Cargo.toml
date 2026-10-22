@@ -91,7 +91,7 @@ proptest = "1"
 rustls = { version = "0.23.46", features = ["ring"] }
 
 [features]
-default = ["tls", "compression", "ws", "multipart", "cookies", "jwt", "templates"]
+default = ["tls", "compression", "ws", "multipart", "cookies", "jwt", "templates", "api-keys"]
 # HTTPS with rustls (`Server::with_tls`), including HTTP/2 over ALPN.
 tls = ["dep:rustls", "dep:tokio-rustls"]
 # gzip/deflate response compression (`middleware::CompressionMiddleware`).
@@ -102,6 +102,8 @@ ws = ["dep:tokio-tungstenite"]
 multipart = ["dep:multer", "dep:sha2"]
 # Cookies (plain, signed, encrypted) and sessions (`axeon::cookies`, `axeon::session`).
 cookies = ["dep:cookie", "dep:getrandom"]
+# API keys: `axeon::auth::api_key` (`ApiKeyAuth`, `generate_key`).
+api-keys = ["dep:sha2", "dep:getrandom"]
 # JSON Web Token authentication (`axeon::auth::jwt`).
 jwt = ["dep:jsonwebtoken"]
 # HTML templates (`axeon::templates`), rendered with minijinja.

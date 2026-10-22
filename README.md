@@ -250,6 +250,7 @@ app.get("/", |req| async move { req.state::<Config>().map(|config| config.greeti
 | `middleware::Compression` | gzip/deflate |
 | `middleware::SetRequestId`, `RequestLogger` | Request IDs and structured logs |
 | `auth::BearerAuth`, `auth::BasicAuth`, `auth::jwt::Jwt` | Authentication |
+| `auth::api_key::ApiKeyAuth` | API keys: hashed, constant-time checked, cached, with scopes and batched `last_used_at` |
 | `cookies::CookieManager` | Cookie jar with signed and encrypted cookies |
 | `session::Sessions` | Server-side sessions |
 | `csrf::Csrf` | CSRF protection for forms and SPAs |
@@ -328,6 +329,42 @@ app.mount("/api", api);
 
 `BearerAuth` checks opaque tokens with your own async lookup, and
 `BasicAuth` protects internal tools.
+
+For public APIs, `ApiKeyAuth` handles API keys end to end:
+
+```rust
+use axeon::auth::api_key::{generate_key, ApiKey, ApiKeyAuth, ApiKeyRecord, KeyHash};
+use axeon::Server;
+use std::time::Duration;
+# use axeon::ServerError;
+# #[derive(Clone)] struct Org { id: i64 }
+# struct StoredKey { hash: KeyHash, scopes: Vec<String>, org: Org }
+# async fn find_key(_id: &str) -> Result<Option<StoredKey>, ServerError> { Ok(None) }
+# async fn touch_last_used(_ids: Vec<String>) {}
+
+// When a customer creates a key, show `new.key` once and store
+// `new.id` and `new.hash.to_hex()`.
+let new = generate_key("vs_live"); // vs_live_<id>_<secret>
+
+let mut app = Server::new();
+app.middleware(
+    ApiKeyAuth::new("vs_live", |id: String| async move {
+        // Look the key up by ID, not by secret; None if unknown or revoked.
+        let key = find_key(&id).await?;
+        Ok(key.map(|k| ApiKeyRecord { hash: k.hash, scopes: k.scopes, identity: k.org }))
+    })
+    .on_used(Duration::from_secs(60), |ids| async move { touch_last_used(ids).await }),
+);
+app.get("/v1/products", |req| async move {
+    let key = req.extension::<ApiKey>().unwrap(); // id and scopes
+    let org = req.extension::<Org>().unwrap();
+    format!("{} for org {}", key.id, org.id)
+});
+```
+
+Keys are sent as `Authorization: Bearer` or `X-API-Key` and compared by
+SHA-256 hash in constant time. Lookups are cached for 60 seconds
+(`cache_ttl`), which is also how long a revoked key keeps working.
 
 ### Cookies, sessions and CSRF
 
@@ -654,6 +691,7 @@ you need (a minimal build compiles about half as many crates):
 | `multipart` | Streaming multipart uploads |
 | `cookies` | Cookies, sessions and CSRF protection |
 | `jwt` | JSON Web Tokens |
+| `api-keys` | API keys (`auth::api_key`) |
 | `templates` | HTML templates (minijinja) |
 
 ## Examples
