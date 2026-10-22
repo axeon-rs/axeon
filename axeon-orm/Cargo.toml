@@ -48,6 +48,9 @@ uuid = ["dep:uuid", "sqlx/uuid"]
 json = ["sqlx/json"]
 # pgvector `vector` columns, distances and indexes (PostgreSQL).
 pgvector = ["postgres"]
+# Test helpers (`axeon_orm::testing`): isolated test databases, rolled-back
+# transactions and model factories. For `[dev-dependencies]`.
+testing = ["tokio/rt"]
 # `req.db()`, the `Transactional` and `TenantScope` middleware, error
 # conversion, and (with `postgres`) broadcast and idempotency stores for Axeon.
 axeon = ["dep:axeon"]

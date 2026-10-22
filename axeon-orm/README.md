@@ -503,6 +503,7 @@ app.post("/transfer", |req| async move {
 | `json` | yes | JSON columns (`serde_json::Value`, `sqlx::types::Json<T>`) |
 | `axeon` | yes | Axeon integration |
 | `uuid` | no | `Uuid` columns |
+| `testing` | no | Test helpers (`axeon_orm::testing`); enable it in `[dev-dependencies]` |
 
 ## Not yet
 
@@ -512,7 +513,43 @@ and down migrations. For anything
 the ORM can't express, use sqlx directly via `db.postgres()` /
 `db.sqlite()`.
 
-## Testing
+## Testing your app
+
+With the `testing` feature (in `[dev-dependencies]`), `axeon_orm::testing`
+gives each test its own database, and builds test records:
+
+```rust
+use axeon_orm::testing::{rollback, Factory, TestDb};
+
+impl Factory for User {
+    fn definition(n: u64) -> Self {
+        User { id: 0, name: format!("User {n}"), email: format!("user{n}@example.com"), ..Default::default() }
+    }
+}
+
+#[tokio::test]
+async fn deactivates_users() -> axeon_orm::Result<()> {
+    let db = TestDb::new().await?;                 // own schema on $AXEON_TEST_DATABASE_URL, else SQLite
+    Migrator::from_dir("migrations")?.run(&db).await?;
+
+    let ada = User::factory().with(|u| u.name = "Ada".into()).create(&*db).await?;
+    let others = User::factory().count(20).create_many(&*db).await?;   // one bulk insert
+
+    // Or keep a test's writes from sticking at all:
+    rollback(&db, async |tx| { /* ... queries with &mut *tx ... */ Ok(()) }).await?;
+
+    db.cleanup().await                             // drops the schema
+}
+```
+
+- `TestDb` makes a PostgreSQL schema or MySQL database per test (or an
+  in-memory SQLite database), so tests run in parallel against a real
+  server without seeing each other's rows. A test that panics before
+  `cleanup` still has its schema dropped when the `TestDb` is dropped.
+- Factory sequence numbers count up per model across the test process,
+  so unique columns built from them don't collide.
+
+## Testing axeon-orm
 
 SQLite tests always run. For PostgreSQL and MySQL, start the databases
 and point the tests at them:

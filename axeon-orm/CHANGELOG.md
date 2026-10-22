@@ -28,6 +28,14 @@
   `axeon` and `postgres`) keeps Axeon `Idempotency-Key` records in an
   `axeon_idempotency` table (`install`, `migration`, `prune`).
 
+- **Test helpers** (feature `testing`): `testing::TestDb`, an isolated
+  database per test (its own PostgreSQL schema or MySQL database, or
+  in-memory SQLite, from `$AXEON_TEST_DATABASE_URL`), dropped by
+  `cleanup` or on drop; `testing::rollback`, which runs a closure in a
+  transaction that is always rolled back; and `testing::Factory`, model
+  factories with per-model sequence numbers, `with` / `each` overrides,
+  `build`, `build_many`, `create` and `create_many` (bulk insert).
+
 ### Changed
 
 - The `tls` feature uses rustls' aws-lc-rs provider
