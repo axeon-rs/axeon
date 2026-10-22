@@ -155,8 +155,9 @@ const CACHE_LIMIT: usize = 10_000;
 /// The key's ID is looked up with your async function (usually a database
 /// query by ID), and the key is checked against the stored [`KeyHash`] in
 /// constant time. On success the request gets an [`ApiKey`] extension
-/// (ID and scopes) and an extension with the record's identity; otherwise
-/// it gets 401.
+/// (ID and scopes), [`Grants`](crate::auth::Grants) with the key's scopes
+/// (for [`require_scope`](crate::auth::require_scope)), and an extension
+/// with the record's identity; otherwise it gets 401.
 ///
 /// ```rust
 /// use axeon::auth::api_key::{ApiKey, ApiKeyAuth, ApiKeyRecord, KeyHash};
@@ -335,6 +336,7 @@ impl<T: Clone + Send + Sync + 'static> Middleware for ApiKeyAuth<T> {
             if let Some(used) = used {
                 used.record(&id);
             }
+            req.insert_extension(super::Grants::new().scopes(record.scopes.iter().cloned()));
             req.insert_extension(ApiKey { id, scopes: record.scopes });
             req.insert_extension(record.identity);
             next.handle(req).await

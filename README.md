@@ -253,6 +253,7 @@ app.get("/", |req| async move { req.state::<Config>().map(|config| config.greeti
 | `middleware::SetRequestId`, `RequestLogger` | Request IDs and structured logs |
 | `auth::BearerAuth`, `auth::BasicAuth`, `auth::jwt::Jwt` | Authentication |
 | `auth::api_key::ApiKeyAuth` | API keys: hashed, constant-time checked, cached, with scopes and batched `last_used_at` |
+| `auth::require_scope`, `auth::require_role` | Authorization guards over the caller's `Grants` (401 / 403) |
 | `cookies::CookieManager` | Cookie jar with signed and encrypted cookies |
 | `session::Sessions` | Server-side sessions |
 | `csrf::Csrf` | CSRF protection for forms and SPAs |
@@ -367,6 +368,34 @@ app.get("/v1/products", |req| async move {
 Keys are sent as `Authorization: Bearer` or `X-API-Key` and compared by
 SHA-256 hash in constant time. Lookups are cached for 60 seconds
 (`cache_ttl`), which is also how long a revoked key keeps working.
+
+Authentication attaches the caller's `Grants` (scopes and roles):
+`ApiKeyAuth` does it from the key's scopes, and your own JWT or session
+middleware can insert `Grants::new().scopes_from(&claims.scope).role("buyer")`.
+Guards then protect routes or whole routers:
+
+```rust
+use axeon::auth::{require_role, require_scope};
+use axeon::{Router, Server, ServerError};
+
+let mut app = Server::new();
+app.route("/v1/products").middleware(require_scope("catalog:read")).get(|_req| async { "[]" });
+
+let mut ops = Router::new();
+ops.middleware(require_role("operator"));
+ops.get("/cases", |_req| async { "[]" });
+app.mount("/ops", ops);
+
+// Or inside a handler, when the check depends on the request:
+app.post("/v1/exports", |req| async move {
+    req.require_scope("catalog:export")?;
+    Ok::<_, ServerError>("started")
+});
+```
+
+Without `Grants` a guard answers 401; without the scope or role, 403
+(with an RFC 6750 `insufficient_scope` challenge for scopes). A granted
+`catalog:*` covers every `catalog:` scope.
 
 ### Caching API responses
 

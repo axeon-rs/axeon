@@ -260,3 +260,89 @@ async fn api_keys_authenticate_cache_and_report_use() {
     let reported: Vec<String> = used.lock().unwrap().concat();
     assert!(!reported.is_empty() && reported.iter().all(|id| *id == live.id), "{:?}", reported);
 }
+
+#[tokio::test]
+async fn scope_and_role_guards() {
+    use axeon::auth::{require_any_scope, require_role, require_scope, Grants};
+    use axeon::middleware::from_fn;
+    use axeon::Router;
+
+    let mut app = Server::new();
+    // Stands in for authentication: grants from headers.
+    app.middleware(from_fn(|mut req, next| async move {
+        if let Some(scopes) = req.get_header("x-scopes").map(String::from) {
+            let roles = req.get_header("x-roles").unwrap_or_default().to_string();
+            req.insert_extension(Grants::new().scopes_from(&scopes).roles(roles.split_whitespace()));
+        }
+        next.handle(req).await
+    }));
+    app.route("/products").middleware(require_scope("catalog:read")).get(|_req| async { "products" });
+    app.route("/selections")
+        .middleware(require_any_scope(["selections:write", "admin"]))
+        .post(|_req| async { "saved" });
+    app.get("/export", |req| async move {
+        req.require_scope("catalog:export")?;
+        Ok::<_, ServerError>("exported")
+    });
+    let mut ops = Router::new();
+    ops.middleware(require_role("operator"));
+    ops.get("/cases", |req| async move { req.grants().map(|g| g.role_list().collect::<Vec<_>>().join(",")) });
+    app.mount("/ops", ops);
+    let app = app.into_app().await.unwrap();
+
+    let call = |method: Method, path: &str, scopes: Option<&str>, roles: &str| {
+        let mut req = Request::new(method, path).with_header("x-roles", roles);
+        if let Some(scopes) = scopes {
+            req = req.with_header("x-scopes", scopes);
+        }
+        app.call(req)
+    };
+
+    // Not authenticated: 401.
+    let anonymous = call(Method::GET, "/products", None, "").await;
+    assert_eq!((anonymous.status, anonymous.get_header("www-authenticate")), (401, Some("Bearer")));
+    // Authenticated without the scope: 403 with the RFC 6750 challenge.
+    let lacking = call(Method::GET, "/products", Some("selections:read"), "").await;
+    assert_eq!(lacking.status, 403);
+    assert_eq!(lacking.get_header("www-authenticate"), Some("Bearer error=\"insufficient_scope\", scope=\"catalog:read\""));
+    assert!(lacking.body_text().contains("requires scope catalog:read"));
+    // Granted, directly or by wildcard.
+    assert_eq!(call(Method::GET, "/products", Some("catalog:read"), "").await.status, 200);
+    assert_eq!(call(Method::GET, "/products", Some("catalog:*"), "").await.status, 200);
+    // Any of several.
+    assert_eq!(call(Method::POST, "/selections", Some("admin"), "").await.status, 200);
+    assert_eq!(call(Method::POST, "/selections", Some("selections:read"), "").await.status, 403);
+    // Checks inside handlers.
+    assert_eq!(call(Method::GET, "/export", Some("catalog:read"), "").await.status, 403);
+    assert_eq!(call(Method::GET, "/export", Some("catalog:export"), "").await.status, 200);
+    assert_eq!(call(Method::GET, "/export", None, "").await.status, 401);
+    // Roles on a whole router.
+    assert_eq!(call(Method::GET, "/ops/cases", Some(""), "buyer").await.status, 403);
+    let operator = call(Method::GET, "/ops/cases", Some(""), "operator reviewer").await;
+    assert_eq!((operator.status, operator.body_text().to_string()), (200, "operator,reviewer".to_string()));
+
+    // A guard without names is a setup error.
+    let mut broken = Server::new();
+    broken.middleware(require_any_scope(Vec::<String>::new()));
+    assert!(broken.into_app().await.is_err());
+}
+
+#[cfg(feature = "api-keys")]
+#[tokio::test]
+async fn api_keys_grant_their_scopes() {
+    use axeon::auth::api_key::{generate_key, ApiKeyAuth, ApiKeyRecord};
+    use axeon::auth::require_scope;
+
+    let key = generate_key("vs_test");
+    let hash = key.hash;
+    let mut app = Server::new();
+    app.middleware(ApiKeyAuth::new("vs_test", move |_id: String| async move {
+        Ok::<_, ServerError>(Some(ApiKeyRecord { hash, scopes: vec!["catalog:read".into()], identity: () }))
+    }));
+    app.route("/products").middleware(require_scope("catalog:read")).get(|_req| async { "ok" });
+    app.route("/admin").middleware(require_scope("admin")).get(|_req| async { "ok" });
+    let app = app.into_app().await.unwrap();
+    let get = |path: &str| app.call(Request::new(Method::GET, path).with_header("x-api-key", &key.key));
+    assert_eq!(get("/products").await.status, 200);
+    assert_eq!(get("/admin").await.status, 403);
+}

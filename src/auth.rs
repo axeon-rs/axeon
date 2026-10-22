@@ -21,6 +21,20 @@
 //!
 //! Failed authentication is answered with `401 Unauthorized` and a
 //! `WWW-Authenticate` header.
+//!
+//! For authorization, authentication attaches [`Grants`] (scopes and
+//! roles), and [`require_scope`] / [`require_role`] guard routes:
+//!
+//! ```rust
+//! use axeon::auth::{require_role, require_scope};
+//!
+//! # let mut app = axeon::Server::new();
+//! let mut ops = axeon::Router::new();
+//! ops.middleware(require_role("operator"));            // 403 for everyone else
+//! ops.get("/cases", |_req| async { "[]" });
+//! app.mount("/ops", ops);
+//! app.route("/v1/products").middleware(require_scope("catalog:read")).get(|_req| async { "[]" });
+//! ```
 
 use crate::error::ServerError;
 use crate::message::{Request, Response};
@@ -31,6 +45,9 @@ use std::sync::Arc;
 
 #[cfg(feature = "api-keys")]
 pub mod api_key;
+mod guard;
+
+pub use guard::{require_any_role, require_any_scope, require_role, require_scope, Grants, Require};
 
 /// Compares two byte strings in time that depends only on their lengths,
 /// so attackers can't guess secrets character by character from timing.

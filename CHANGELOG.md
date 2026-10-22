@@ -46,6 +46,14 @@
   middleware (which runs before routing). `MatchedRoute::watch(&mut req)`
   shares one slot between middleware; `Metrics` uses it too.
 
+- **Authorization guards:** `auth::Grants` (the caller's scopes and roles,
+  as a request extension; `catalog:*` and `*` wildcards) and the
+  `require_scope`, `require_any_scope`, `require_role` and
+  `require_any_role` middleware: 401 without grants, 403 (with an RFC 6750
+  `insufficient_scope` challenge for scopes) when lacking.
+  `Request::grants`, `require_scope` and `require_role` for checks inside
+  handlers. `ApiKeyAuth` attaches `Grants` with the key's scopes.
+
 ### Fixed
 
 - `Server::with_tls` no longer panics with "Could not automatically
