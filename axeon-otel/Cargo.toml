@@ -15,7 +15,7 @@ categories = ["web-programming", "development-tools::debugging"]
 all-features = true
 
 [dependencies]
-axeon = { version = "1.1", path = "..", default-features = false }
+axeon = { version = "1.2", path = "..", default-features = false }
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"] }

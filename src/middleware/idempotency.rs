@@ -114,7 +114,13 @@ pub trait IdempotencyStore: Send + Sync + 'static {
 /// dropped as new ones arrive.
 #[derive(Default)]
 pub struct MemoryIdempotencyStore {
-    records: Mutex<HashMap<String, Record>>,
+    records: Mutex<Records>,
+}
+
+#[derive(Default)]
+struct Records {
+    map: HashMap<String, Record>,
+    last_sweep: Option<Instant>,
 }
 
 struct Record {
@@ -132,10 +138,17 @@ impl MemoryIdempotencyStore {
 
 impl IdempotencyStore for MemoryIdempotencyStore {
     fn begin<'a>(&'a self, key: &'a str, fingerprint: &'a str, lock_ttl: Duration) -> BoxFuture<'a, Result<Begin, BoxError>> {
-        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        records.retain(|_, r| r.expires > now);
-        let begin = match records.get(key) {
+        // Dropping every expired record on each request would make this a
+        // scan of the whole map under the lock; once a second is enough,
+        // since lookups below check expiry themselves.
+        if guard.last_sweep.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1)) {
+            guard.map.retain(|_, r| r.expires > now);
+            guard.last_sweep = Some(now);
+        }
+        let records = &mut guard.map;
+        let begin = match records.get(key).filter(|r| r.expires > now) {
             Some(r) if r.fingerprint != fingerprint => Begin::Mismatch,
             Some(Record { response: Some(response), .. }) => Begin::Completed(response.clone()),
             Some(_) => Begin::InProgress,
@@ -155,8 +168,8 @@ impl IdempotencyStore for MemoryIdempotencyStore {
         response: &'a StoredResponse,
         ttl: Duration,
     ) -> BoxFuture<'a, Result<(), BoxError>> {
-        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(r) = records.get_mut(key).filter(|r| r.fingerprint == fingerprint && r.response.is_none()) {
+        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = guard.map.get_mut(key).filter(|r| r.fingerprint == fingerprint && r.response.is_none()) {
             r.response = Some(response.clone());
             r.expires = Instant::now() + ttl;
         }
@@ -164,9 +177,9 @@ impl IdempotencyStore for MemoryIdempotencyStore {
     }
 
     fn release<'a>(&'a self, key: &'a str, fingerprint: &'a str) -> BoxFuture<'a, Result<(), BoxError>> {
-        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        if records.get(key).is_some_and(|r| r.fingerprint == fingerprint && r.response.is_none()) {
-            records.remove(key);
+        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.map.get(key).is_some_and(|r| r.fingerprint == fingerprint && r.response.is_none()) {
+            guard.map.remove(key);
         }
         Box::pin(async { Ok(()) })
     }
@@ -193,8 +206,11 @@ type ScopeFn = Arc<dyn Fn(&Request) -> Option<String> + Send + Sync>;
 ///   requests without the header run normally unless
 ///   [`required`](Idempotency::required).
 /// - Keys are per caller: hashed together with the `Authorization` and
-///   `X-API-Key` headers, or with [`scope_by`](Idempotency::scope_by), so
-///   one client can never receive another's response.
+///   `X-API-Key` headers (or, when a request has neither, its `Cookie`
+///   header), or with [`scope_by`](Idempotency::scope_by), so one client can
+///   never receive another's response. With cookie sessions, prefer
+///   `scope_by` with the user ID: a retry that arrives with changed cookies
+///   would otherwise not find its key.
 /// - The same key with a different method, path, query or body gets
 ///   `422`. While the first request runs, repeats get `409` with
 ///   `Retry-After`.
@@ -297,10 +313,19 @@ impl Idempotency {
                 hasher.update(scope.as_bytes());
             }
             None => {
+                let mut credentials = false;
                 for header in ["authorization", "x-api-key"] {
+                    credentials |= req.get_header(header).is_some();
                     hasher.update(header.as_bytes());
                     hasher.update(b"\0");
                     hasher.update(req.get_header(header).unwrap_or_default().as_bytes());
+                    hasher.update(b"\0");
+                }
+                // Cookie-authenticated callers have neither header: scope them
+                // by their cookies, so two users can't share a key.
+                if !credentials {
+                    hasher.update(b"cookie\0");
+                    hasher.update(req.get_header("cookie").unwrap_or_default().as_bytes());
                     hasher.update(b"\0");
                 }
             }

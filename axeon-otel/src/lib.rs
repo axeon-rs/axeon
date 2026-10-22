@@ -252,6 +252,12 @@ impl Injector for Collect {
 /// installed; spans reach OpenTelemetry through [`Telemetry::layer`].
 ///
 /// Add it first, so the span covers the other middleware too.
+///
+/// A request's `traceparent` is trusted: its trace and parent are continued,
+/// and its sampling flag is followed (see
+/// [`sample_ratio`](Builder::sample_ratio)). On a public endpoint that lets
+/// any caller choose to have its requests traced, so strip `traceparent`
+/// at your edge proxy for untrusted clients if tracing volume matters.
 #[derive(Clone, Debug, Default)]
 pub struct TraceRequests {
     _private: (),

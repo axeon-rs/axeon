@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-10-22)
+
+**Upgrading from 0.1:** the schema changed (a `priority` column and the
+`axeon_jobs_schedules` table). Run `axeon_jobs::install(&db)` once, or add
+`axeon_jobs::migrations()` to your migrations, **before** starting 0.2
+workers: they read the new column, and fail against the old table.
 
 ### Added
 

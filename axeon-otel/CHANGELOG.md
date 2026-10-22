@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 (2026-10-22)
 
 First release: `TraceRequests`, middleware opening a `SERVER` span per
 request with the OpenTelemetry HTTP attributes (named by route pattern,

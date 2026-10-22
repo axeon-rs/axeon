@@ -185,7 +185,33 @@ fn clean(value: &str) -> String {
 /// Weak comparison of an `If-None-Match` list against an ETag header value.
 pub(crate) fn etag_matches(header: &str, etag: &str) -> bool {
     let bare = |tag: &str| tag.trim().trim_start_matches("W/").to_string();
-    header.trim() == "*" || header.split(',').any(|tag| bare(tag) == bare(etag))
+    header.trim() == "*" || tags(header).any(|tag| bare(tag) == bare(etag))
+}
+
+/// The entity tags in a comma-separated list. A quoted tag may itself
+/// contain commas, so only commas outside quotes separate tags.
+fn tags(list: &str) -> impl Iterator<Item = &str> {
+    let mut rest = list;
+    std::iter::from_fn(move || {
+        if rest.trim().is_empty() {
+            return None;
+        }
+        let mut quoted = false;
+        let mut end = rest.len();
+        for (i, c) in rest.char_indices() {
+            match c {
+                '"' => quoted = !quoted,
+                ',' if !quoted => {
+                    end = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let tag = &rest[..end];
+        rest = rest.get(end + 1..).unwrap_or("");
+        Some(tag)
+    })
 }
 
 /// Whether a resource last modified at `modified` is unchanged since an
@@ -355,6 +381,15 @@ mod tests {
         assert!(etag_matches("\"x\", \"a-1\"", "\"a-1\""));
         assert!(etag_matches("*", "\"a-1\""));
         assert!(!etag_matches("\"a-2\"", "\"a-1\""));
+    }
+
+    #[test]
+    fn tags_may_contain_commas() {
+        let tag = ETag::strong("a,b").header_value();
+        assert!(etag_matches(&tag, &tag));
+        assert!(etag_matches(&format!("\"x\", {}, \"y\"", tag), &tag));
+        assert!(!etag_matches("\"a\", \"b\"", &tag), "two tags are not one with a comma");
+        assert_eq!(tags("\"a,b\" , W/\"c\",").collect::<Vec<_>>(), ["\"a,b\" ", " W/\"c\""]);
     }
 
     #[test]

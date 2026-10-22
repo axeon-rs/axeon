@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-10-22)
+
+Requires Axeon 1.2.
 
 ### Added
 

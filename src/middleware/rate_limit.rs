@@ -214,7 +214,8 @@ struct MemoryState {
 
 enum Entry {
     Tat(u64),
-    Window(u64, u64),
+    /// The window index, the count in it, and when it ends (microseconds).
+    Window(u64, u64, u64),
 }
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -233,7 +234,7 @@ impl MemoryRateLimitStore {
         if state.last_sweep.is_none_or(|last| instant.duration_since(last) >= SWEEP_INTERVAL) {
             state.entries.retain(|_, entry| match *entry {
                 Entry::Tat(tat) => tat > now,
-                Entry::Window(..) => true,
+                Entry::Window(_, _, end) => end > now,
             });
             state.last_sweep = Some(instant);
         }
@@ -255,13 +256,13 @@ impl MemoryRateLimitStore {
                 let index = now / window_us;
                 let reset = Duration::from_micros((index + 1) * window_us - now);
                 let count = match state.entries.get(&key) {
-                    Some(Entry::Window(i, count)) if *i == index => *count,
+                    Some(Entry::Window(i, count, _)) if *i == index => *count,
                     _ => 0,
                 };
                 if count >= limit as u64 {
                     return RateLimitDecision::window(quota, count + 1, reset);
                 }
-                state.entries.insert(key, Entry::Window(index, count + 1));
+                state.entries.insert(key, Entry::Window(index, count + 1, (index + 1) * window_us));
                 RateLimitDecision::window(quota, count + 1, reset)
             }
         }
@@ -519,6 +520,21 @@ mod tests {
         assert!(!refused.allowed);
         assert_eq!(refused.retry_after, Some(Duration::from_micros(7_000_000)));
         assert!(check(start + 10_000_000).allowed);
+    }
+
+    #[test]
+    fn finished_windows_are_swept() {
+        let store = MemoryRateLimitStore::new();
+        let quota = Quota::fixed_window(5, Duration::from_secs(10));
+        let start = 10_000_000 * 7;
+        for i in 0..100 {
+            store.check_now(&format!("client-{}", i), &quota, start + 1);
+        }
+        assert_eq!(store.state.lock().unwrap().entries.len(), 100);
+        // The sweep runs at most once a minute of real time: force it.
+        store.state.lock().unwrap().last_sweep = None;
+        store.check_now("late", &quota, start + 20_000_000);
+        assert_eq!(store.state.lock().unwrap().entries.len(), 1, "only the live window is kept");
     }
 
     #[test]

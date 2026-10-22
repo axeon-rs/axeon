@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 (2026-10-22)
+
+More for public, multi-tenant APIs, all additive: no breaking changes, and
+nothing to do when upgrading from 1.1. Released alongside:
+[axeon-orm 0.4](axeon-orm/CHANGELOG.md), [axeon-jobs 0.2](axeon-jobs/CHANGELOG.md),
+[axeon-redis 0.2](axeon-redis/CHANGELOG.md) and the new
+[axeon-otel](axeon-otel/CHANGELOG.md) and
+[axeon-webhooks](axeon-webhooks/CHANGELOG.md).
 
 ### Added
 
@@ -70,6 +77,24 @@
 
 ### Fixed
 
+- Idempotency keys of cookie-authenticated callers are now scoped by their
+  `Cookie` header when a request has no `Authorization` or `X-API-Key`.
+  Before, two users with the same key and body shared a scope, and the
+  second was given the first's stored response. With cookie sessions,
+  `Idempotency::scope_by` (the user ID) is still the better scope.
+- The in-memory `RateLimiter` store dropped no finished fixed windows, so
+  daily and other window quotas grew its memory with every client seen. They
+  are swept like rate quotas.
+- The in-memory idempotency store scanned every record on each request; it
+  now sweeps expired ones at most once a second.
+- Host routing: `Request::host` and `Request::subdomain` only accept host
+  names (letters, digits, `-`, `_`, `.`, or an IP literal). A `Host` such as
+  `x/y.stores.example.com` used to match `*.stores.example.com` with the
+  label `x/y`.
+- `ResolveHost` no longer empties its cache when full, which let a flood of
+  made-up `Host` values push real domains out and onto the database. Expired
+  entries are dropped, and new hosts go uncached until there is room.
+- `ETag`s containing commas now match their own `If-None-Match`.
 - `Server::with_tls` no longer panics with "Could not automatically
   determine the process-level CryptoProvider" when another dependency
   compiles in rustls' ring provider next to aws-lc-rs (as axeon-orm 0.3's

@@ -35,7 +35,12 @@ pub(crate) fn normalize(raw: &str) -> Option<String> {
         raw.rsplit_once(':').map_or(raw, |(host, port)| if port.bytes().all(|b| b.is_ascii_digit()) { host } else { raw })
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    (!host.is_empty()).then_some(host)
+    // Only what a host name or an IP literal can hold. The value comes from
+    // the client, and ends up in `Request::subdomain` and in lookups.
+    let plain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_');
+    let ipv6 = |b: u8| b.is_ascii_hexdigit() || matches!(b, b'[' | b']' | b':' | b'.');
+    let valid = if host.starts_with('[') { host.bytes().all(ipv6) } else { host.bytes().all(plain) };
+    (!host.is_empty() && valid).then_some(host)
 }
 
 /// The request's host from its headers or URI.
@@ -75,7 +80,8 @@ impl HostPattern {
             HostPattern::Exact(exact) => (host == exact).then_some(None),
             HostPattern::Wildcard(suffix) => {
                 let label = host.strip_suffix(suffix.as_str())?;
-                (!label.is_empty() && !label.contains('.')).then_some(Some(label))
+                let valid = !label.is_empty() && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+                valid.then_some(Some(label))
             }
         }
     }
@@ -104,7 +110,8 @@ type Lookup<T> = Arc<dyn Fn(String) -> BoxFuture<'static, Result<Option<T>, Serv
 /// Host → what the lookup returned and when.
 type Cache<T> = Arc<Mutex<HashMap<String, (Option<T>, Instant)>>>;
 
-/// Most cached hosts; the cache is emptied when full.
+/// Most cached hosts; when full, expired entries are dropped and new hosts
+/// go uncached until some expire.
 const CACHE_LIMIT: usize = 10_000;
 
 /// Middleware for hosts known only at runtime, such as customers' own
@@ -199,9 +206,14 @@ impl<T: Clone + Send + Sync + 'static> Middleware for ResolveHost<T> {
                     if !ttl.is_zero() {
                         let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
                         if cache.len() >= CACHE_LIMIT {
-                            cache.clear();
+                            // Make room by dropping what has expired. Never
+                            // clear the lot: a flood of made-up Host values
+                            // could then keep real domains out of the cache.
+                            cache.retain(|_, (_, at)| at.elapsed() < ttl);
                         }
-                        cache.insert(host, (found.clone(), Instant::now()));
+                        if cache.len() < CACHE_LIMIT {
+                            cache.insert(host, (found.clone(), Instant::now()));
+                        }
                     }
                     found
                 }
@@ -228,6 +240,18 @@ mod tests {
         assert_eq!(normalize("[::1]:8080").as_deref(), Some("[::1]"));
         assert_eq!(normalize("127.0.0.1:3000").as_deref(), Some("127.0.0.1"));
         assert_eq!(normalize("  ").as_deref(), None);
+        for bad in ["x/y.example.com", "a'b.example.com", "u@v.example.com", "a b.example.com", "ex%41mple.com", "a,b.example.com"] {
+            assert_eq!(normalize(bad), None, "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn wildcard_labels_are_plain() {
+        let wild = HostPattern::parse("*.stores.example.com").unwrap();
+        assert_eq!(wild.matches("my-shop_2.stores.example.com"), Some(Some("my-shop_2")));
+        for bad in ["x/y.stores.example.com", "a'b.stores.example.com", "u@v.stores.example.com", "<s>.stores.example.com"] {
+            assert_eq!(wild.matches(bad), None, "{:?}", bad);
+        }
     }
 
     #[test]

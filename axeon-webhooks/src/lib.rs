@@ -186,11 +186,14 @@ impl Verifier {
         if now.abs_diff(timestamp) > self.tolerance.as_secs() {
             return Err(VerifyError::Expired);
         }
+        // One HMAC per secret, however many signatures the header carries: a
+        // sender controls how many there are, and hashing the whole body for
+        // each one would multiply the cost of an unauthenticated request.
         // `verify_slice` compares in constant time.
-        let matched = self
-            .secrets
-            .iter()
-            .any(|secret| signatures.iter().any(|signature| mac(secret, timestamp, body).verify_slice(signature).is_ok()));
+        let matched = self.secrets.iter().any(|secret| {
+            let expected = mac(secret, timestamp, body);
+            signatures.iter().any(|signature| expected.clone().verify_slice(signature).is_ok())
+        });
         if matched {
             Ok(())
         } else {
@@ -276,6 +279,17 @@ mod tests {
         for bad in ["", "garbage", "t=abc,v1=00", "t=1700000000", "t=1700000000,v1=zz", "v1=00"] {
             assert_eq!(verifier.verify_at(bad, body, 1_700_000_000), Err(VerifyError::Malformed), "{:?}", bad);
         }
+    }
+
+    #[test]
+    fn many_signatures_cost_one_hash() {
+        // Not a timing test: just that a header full of signatures is judged right.
+        let verifier = Verifier::new("secret");
+        let body = b"payload";
+        let good = Signer::new("secret").sign(body, 10);
+        let junk = format!(",v1={}", "ab".repeat(32)).repeat(100);
+        assert!(verifier.verify_at(&format!("{}{}", good, junk), body, 10).is_ok());
+        assert_eq!(verifier.verify_at(&format!("t=10{}", junk), body, 10), Err(VerifyError::Mismatch));
     }
 
     #[test]

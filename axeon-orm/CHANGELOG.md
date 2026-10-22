@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-10-22)
+
+Additive: everything from 0.3 keeps working. The minor version marks the size
+of the release and moves `axeon-orm-macros` and `axeon-orm-cli` in step.
+Requires Axeon 1.2 with the `axeon` feature.
 
 ### Added
 

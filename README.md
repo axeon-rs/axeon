@@ -39,7 +39,7 @@ fn main() {
 
 ```toml
 [dependencies]
-axeon = "1.1"
+axeon = "1.2"
 tokio = { version = "1", features = ["full"] } # for #[tokio::main], tokio::spawn, etc.
 serde = { version = "1", features = ["derive"] }
 ```
