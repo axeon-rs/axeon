@@ -23,7 +23,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 futures = { version = "0.3.31", default-features = false, features = ["std"] }
 tracing = "0.1"
-axeon = { version = "1.1", path = "..", default-features = false, optional = true }
+axeon = { version = "1.2", path = "..", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

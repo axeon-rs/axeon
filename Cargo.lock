@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "axeon-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axeon",
  "reqwest",
@@ -298,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "axeon-openapi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axeon",
  "serde",

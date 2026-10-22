@@ -1,6 +1,6 @@
 [package]
 name = "axeon-client"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.88"
 description = "An outbound HTTP client for Axeon apps: SSRF-safe egress, timeouts, retries, circuit breaking, request-ID propagation and metrics"
@@ -15,7 +15,7 @@ categories = ["web-programming::http-client"]
 all-features = true
 
 [dependencies]
-axeon = { version = "1.1", path = "..", default-features = false }
+axeon = { version = "1.2", path = "..", default-features = false }
 # No `system-proxy`: a proxy from the environment would resolve hosts
 # itself, around the egress checks.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset", "json", "query", "form"] }
