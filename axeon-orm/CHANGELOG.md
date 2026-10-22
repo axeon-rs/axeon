@@ -1,5 +1,100 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Keyset pagination:** `Query::cursor_paginate(ex, after, limit)` returns
+  a `CursorPage` with `items` and an opaque, URL-safe `next_cursor`. No
+  `OFFSET` or `COUNT(*)`, so deep pages cost the same as the first. Orders
+  by the query's `order_by` columns (any mix of directions) plus the primary
+  key as tie-breaker; cursors from another sort order, or damaged ones, are
+  rejected with the new `Error::InvalidCursor` (400 in Axeon handlers).
+
+- **Tenant scopes:** `#[model(tenant)]` marks a model's tenant column.
+  Such models only run through `Db::for_tenant(id)` (rows of that tenant;
+  writes of other tenants' rows fail with the new `Error::WrongTenant`,
+  403 in Axeon) or an explicit opt-out, `Db::all_tenants()` or
+  `Query::all_tenants()`; a plain `Db` fails with the new
+  `Error::TenantScope`. Covers queries, aggregates, bulk updates and
+  deletes, instance writes, upserts (never overwriting another tenant's
+  conflicting row), eager loading, relation filters and joins;
+  transactions inherit the scope. `server::TenantScope` middleware scopes
+  `req.db()` and `Transactional` to the request's tenant.
+  `Model::TENANT` defaults to `None`, so hand-written `Model` impls keep
+  compiling.
+
+- **Idempotency store:** `idempotency::PgIdempotencyStore` (features
+  `axeon` and `postgres`) keeps Axeon `Idempotency-Key` records in an
+  `axeon_idempotency` table (`install`, `migration`, `prune`).
+
+- **Test helpers** (feature `testing`): `testing::TestDb`, an isolated
+  database per test (its own PostgreSQL schema or MySQL database, or
+  in-memory SQLite, from `$AXEON_TEST_DATABASE_URL`), dropped by
+  `cleanup` or on drop; `testing::rollback`, which runs a closure in a
+  transaction that is always rolled back; and `testing::Factory`, model
+  factories with per-model sequence numbers, `with` / `each` overrides,
+  `build`, `build_many`, `create` and `create_many` (bulk insert).
+
+- **Optimistic locking:** `#[model(version)]` on an `i32`/`i64` column.
+  Instance `update` and `delete` require the stored version to match
+  (`update` increments it and reloads), failing with the new
+  `Error::StaleRecord` (409 in Axeon) when another write got there first;
+  `Query::update` and upserts increment it too. `Model::VERSION` defaults
+  to `None`.
+
+- **Row streaming:** `Query::stream(ex)` returns matching rows as an async
+  stream, as the database sends them, holding the connection (or
+  transaction) until it ends. Tenant scopes apply, and an error in a
+  transaction marks it failed.
+
+- **Query observability:** `DbOptions::metrics` records
+  `db_query_duration_seconds` and `db_query_errors_total` (by operation and
+  table) on an Axeon registry; `DbOptions::slow_query` logs slow statements
+  (target `axeon_orm::slow_query`, SQL with placeholders only, plus a
+  fingerprint); `DbOptions::statement_timeout` (PostgreSQL
+  `statement_timeout`, MySQL `max_execution_time`) and
+  `Transaction::statement_timeout` (PostgreSQL) cancel long statements with
+  the new `Error::StatementTimeout` (503 in Axeon).
+
+- **Reports:** `select::Select` joins any number of tables through their
+  relations (inner or left), selects typed columns and aggregates
+  (`Agg::count`, `count_of`, `count_distinct`, `sum`, `avg`, `min`, `max`),
+  filters on any joined model, and supports `GROUP BY`, `HAVING`, ordering
+  by column or alias, and `LIMIT`/`OFFSET`. Rows decode into a
+  `Deserialize` struct (`fetch`) or JSON objects (`fetch_json`). Tenant
+  scopes apply to every table.
+
+- **Partitioned tables** (PostgreSQL, feature `chrono`):
+  `partition::Partitioning::monthly` / `daily` creates a table
+  `PARTITION BY RANGE` of a time column (primary key including it),
+  `ensure` creates the current and upcoming partitions, `drop_before`
+  detaches and drops partitions that ended before a cutoff, and
+  `partitions` lists them with UTC bounds.
+
+- **Composite primary keys:** several `#[model(primary_key)]` fields;
+  `Model::PRIMARY_KEYS` lists them, `find` / `find_or_fail` take a tuple,
+  and inserts (including MySQL's read-back), updates, deletes, bulk
+  inserts, upserts, cursor pagination and generated tables use every key
+  column. Pivot tables with extra columns are modelled this way. Relations
+  from composite-key models, and `belongs_to` targeting one, are compile
+  errors.
+
+- **Read replicas:** `Db::with_replicas` attaches replica pools;
+  `Db::replica()` hands out a handle on the next one in turn (or the
+  primary when there are none) that keeps the tenant scope and metrics and
+  refuses writes, also in transactions begun on it. `replica_count` and
+  `is_replica` describe a handle.
+
+### Changed
+
+- The `tls` feature uses rustls' aws-lc-rs provider
+  (`sqlx/tls-rustls-aws-lc-rs`) instead of ring, like Axeon and
+  axeon-client. Apps combining them no longer compile in two providers,
+  which made `Server::with_tls` and Redis TLS panic.
+- `serde_json` is always a dependency (cursors are JSON); the `json`
+  feature still controls JSON columns.
+
 ## 0.3.0 (2026-10-22)
 
 Additive: everything from 0.2 keeps working. The minor version marks the size

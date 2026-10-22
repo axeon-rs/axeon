@@ -436,6 +436,65 @@ async fn rate_limited_responses_say_when_to_retry() {
 }
 
 #[tokio::test]
+async fn rate_limits_by_plan_with_headers() {
+    use axeon::middleware::rate_limit::{Quota, RateLimiter};
+    let mut app = Server::new();
+    app.middleware(
+        RateLimiter::new(Quota::per_minute(60).burst(1))
+            .key_by(|req| req.get_header("x-api-key").map(String::from))
+            .quota_by(|req| match req.get_header("x-plan") {
+                Some("pro") => Some(Quota::daily(3)),
+                _ => None,
+            })
+            .headers(true),
+    );
+    app.get("/", |_req| async { "ok" });
+    let app = app.into_app().await.unwrap();
+    let call = |key: &'static str, plan: &'static str| {
+        app.call(axeon::Request::new(axeon::Method::GET, "/").with_header("x-api-key", key).with_header("x-plan", plan))
+    };
+
+    let first = call("free", "free").await;
+    assert_eq!(first.status, 200);
+    assert_eq!(first.get_header("ratelimit-limit"), Some("1"));
+    assert_eq!(first.get_header("ratelimit-remaining"), Some("0"));
+    assert_eq!(first.get_header("ratelimit-policy"), Some("60;w=60;burst=1"));
+    let limited = call("free", "free").await;
+    assert_eq!(limited.status, 429);
+    assert_eq!(limited.get_header("ratelimit-remaining"), Some("0"));
+    assert!(limited.get_header("retry-after").is_some());
+
+    // A daily plan quota, on its own state.
+    let mut remaining = Vec::new();
+    for _ in 0..4 {
+        remaining.push(call("pro", "pro").await.get_header("ratelimit-remaining").unwrap().to_string());
+    }
+    assert_eq!(remaining, ["2", "1", "0", "0"]);
+}
+
+#[tokio::test]
+async fn rate_limit_store_failures_fail_open_or_closed() {
+    use axeon::middleware::rate_limit::{Quota, RateLimitDecision, RateLimitStore, RateLimiter};
+    struct Down;
+    impl RateLimitStore for Down {
+        fn check<'a>(
+            &'a self,
+            _key: &'a str,
+            _quota: &'a Quota,
+        ) -> futures::future::BoxFuture<'a, Result<RateLimitDecision, Box<dyn std::error::Error + Send + Sync>>> {
+            Box::pin(async { Err("connection refused".into()) })
+        }
+    }
+    for (open, status) in [(true, 200), (false, 503)] {
+        let mut app = Server::new();
+        app.middleware(RateLimiter::per_minute(1).store(Down).fail_open(open));
+        app.get("/", |_req| async { "ok" });
+        let app = app.into_app().await.unwrap();
+        assert_eq!(app.call(axeon::Request::new(axeon::Method::GET, "/")).await.status, status);
+    }
+}
+
+#[tokio::test]
 async fn security_headers_defaults_and_overrides() {
     use axeon::middleware::SecurityHeaders;
     let mut app = Server::new();
@@ -464,4 +523,228 @@ async fn builders_chain() {
         .get("/b", |req| async move { req.state::<u32>().map(|n| n.to_string()) });
     let app = app.into_app().await.unwrap();
     assert_eq!(app.call(axeon::Request::new(axeon::Method::GET, "/b")).await.body_text(), "5");
+}
+
+#[cfg(feature = "idempotency")]
+#[tokio::test]
+async fn idempotency_keys_replay_the_first_response() {
+    use axeon::middleware::idempotency::Idempotency;
+    use axeon::{Method, Request};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut app = Server::new();
+    app.middleware(Idempotency::new());
+    let counter = Arc::clone(&runs);
+    app.post("/orders", move |req| {
+        let counter = Arc::clone(&counter);
+        async move {
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            if req.query_param("slow").is_some() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if req.query_param("fail").is_some() {
+                return Err(ServerError::InternalError("boom".into()));
+            }
+            Ok(Response::json(&serde_json::json!({ "order": n })).with_header("Set-Cookie", "s=1").with_status(201))
+        }
+    });
+    app.get("/orders", |_req| async { "list" });
+    let app = Arc::new(app.into_app().await.unwrap());
+    let post = |key: Option<&str>, auth: &str, path: &str, body: &str| {
+        let mut req = Request::new(Method::POST, path).with_body("application/json", body.to_string()).with_header("authorization", auth);
+        if let Some(key) = key {
+            req = req.with_header("idempotency-key", key);
+        }
+        let app = Arc::clone(&app);
+        async move { app.call(req).await }
+    };
+
+    let first = post(Some("k1"), "Bearer a", "/orders", "{}").await;
+    assert_eq!((first.status, first.body_text().to_string()), (201, r#"{"order":1}"#.to_string()));
+    let again = post(Some("k1"), "Bearer a", "/orders", "{}").await;
+    assert_eq!((again.status, again.body_text().to_string()), (201, r#"{"order":1}"#.to_string()));
+    assert_eq!(again.get_header("idempotent-replayed"), Some("true"));
+    assert_eq!(again.get_header("content-type"), Some("application/json"));
+    assert_eq!(again.get_header("set-cookie"), None, "per-response headers aren't replayed");
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    // Same key, different request.
+    assert_eq!(post(Some("k1"), "Bearer a", "/orders", r#"{"x":1}"#).await.status, 422);
+    assert_eq!(post(Some("k1"), "Bearer a", "/orders?x=1", "{}").await.status, 422);
+    // Same key from another caller is a different key.
+    assert_eq!(post(Some("k1"), "Bearer b", "/orders", "{}").await.body_text(), r#"{"order":2}"#);
+    // No key, or a method it doesn't cover: runs normally.
+    assert_eq!(post(None, "Bearer a", "/orders", "{}").await.body_text(), r#"{"order":3}"#);
+    assert_eq!(post(Some(""), "Bearer a", "/orders", "{}").await.status, 400);
+
+    // While the first runs, a repeat gets 409.
+    let slow = tokio::spawn(post(Some("k2"), "Bearer a", "/orders?slow=1", "{}"));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let busy = post(Some("k2"), "Bearer a", "/orders?slow=1", "{}").await;
+    assert_eq!((busy.status, busy.get_header("retry-after")), (409, Some("1")));
+    assert_eq!(slow.await.unwrap().status, 201);
+    assert_eq!(post(Some("k2"), "Bearer a", "/orders?slow=1", "{}").await.get_header("idempotent-replayed"), Some("true"));
+
+    // Server errors aren't kept: the retry runs again.
+    let before = runs.load(Ordering::SeqCst);
+    assert_eq!(post(Some("k3"), "Bearer a", "/orders?fail=1", "{}").await.status, 500);
+    assert_eq!(post(Some("k3"), "Bearer a", "/orders?fail=1", "{}").await.status, 500);
+    assert_eq!(runs.load(Ordering::SeqCst), before + 2);
+
+    // Required keys.
+    let mut strict = Server::new();
+    strict.middleware(Idempotency::new().required(true));
+    strict.post("/", |_req| async { "ok" });
+    strict.get("/", |_req| async { "ok" });
+    let strict = strict.into_app().await.unwrap();
+    assert_eq!(strict.call(Request::new(Method::POST, "/")).await.status, 400);
+    assert_eq!(strict.call(Request::new(Method::GET, "/")).await.status, 200);
+}
+
+#[tokio::test]
+async fn conditional_get_answers_304() {
+    use axeon::cache::{CacheControl, ConditionalGet, ETag};
+    use axeon::{Method, Request};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let expensive = Arc::new(AtomicUsize::new(0));
+    let mut app = Server::new();
+    app.middleware(ConditionalGet::new().cache_control(CacheControl::revalidate()));
+    app.get("/categories", |_req| async { axeon::Json(vec!["lighting", "furniture"]) });
+    app.get("/dated", |_req| async {
+        Response::text("dated").with_last_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+    });
+    app.get("/own", |_req| async {
+        Response::text("own").with_cache_control(CacheControl::new().public().max_age(Duration::from_secs(60)))
+    });
+    app.get("/missing", |_req| async { Err::<&str, _>(ServerError::NotFound) });
+    app.post("/categories", |_req| async { "created" });
+    let counter = Arc::clone(&expensive);
+    app.get("/products/:id", move |req| {
+        let counter = Arc::clone(&counter);
+        async move {
+            let etag = ETag::strong(format!("p{}-v3", req.param::<i64>("id")?));
+            if req.is_fresh(Some(&etag), None) {
+                return Ok(Response::not_modified(&etag));
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ServerError>(Response::text("product").with_etag(&etag))
+        }
+    });
+    let app = app.into_app().await.unwrap();
+    let get = |path: &str, header: Option<(&str, &str)>| {
+        let mut req = Request::new(Method::GET, path);
+        if let Some((name, value)) = header {
+            req = req.with_header(name, value);
+        }
+        app.call(req)
+    };
+
+    // An ETag from the body, then 304 without a body.
+    let full = get("/categories", None).await;
+    let etag = full.get_header("etag").unwrap().to_string();
+    assert!(etag.starts_with("W/\""), "{}", etag);
+    assert_eq!(full.get_header("cache-control"), Some("no-cache"));
+    let cached = get("/categories", Some(("if-none-match", &etag))).await;
+    assert_eq!((cached.status, cached.body.len()), (304, 0));
+    assert_eq!(cached.get_header("etag"), Some(etag.as_str()));
+    assert_eq!(cached.get_header("cache-control"), Some("no-cache"));
+    assert_eq!(cached.get_header("content-type"), None);
+    assert_eq!(get("/categories", Some(("if-none-match", "W/\"other\""))).await.status, 200);
+    assert_eq!(get("/categories", Some(("if-none-match", "*"))).await.status, 304);
+
+    // Last-Modified from the handler: If-Modified-Since works, and loses to If-None-Match.
+    let dated = get("/dated", None).await;
+    let modified = dated.get_header("last-modified").unwrap().to_string();
+    assert_eq!(get("/dated", Some(("if-modified-since", &modified))).await.status, 304);
+    assert_eq!(get("/dated", Some(("if-modified-since", "Sun, 01 Jan 2023 00:00:00 GMT"))).await.status, 200);
+
+    // Handlers keep their own Cache-Control; errors and POSTs are left alone.
+    assert_eq!(get("/own", None).await.get_header("cache-control"), Some("public, max-age=60"));
+    let missing = get("/missing", None).await;
+    assert_eq!((missing.status, missing.get_header("etag")), (404, None));
+    let created = app.call(Request::new(Method::POST, "/categories").with_header("if-none-match", "*")).await;
+    assert_eq!((created.status, created.get_header("etag")), (200, None));
+
+    // A handler that checks freshness itself skips the work.
+    let product = get("/products/9", None).await;
+    assert_eq!(product.get_header("etag"), Some("\"p9-v3\""));
+    let fresh = get("/products/9", Some(("if-none-match", "\"p9-v3\""))).await;
+    assert_eq!(fresh.status, 304);
+    assert_eq!(expensive.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn conditional_get_with_compression() {
+    use axeon::cache::ConditionalGet;
+    use axeon::middleware::Compression;
+    use axeon::{Method, Request};
+
+    let mut app = Server::new();
+    app.middleware(Compression::new());
+    app.middleware(ConditionalGet::new());
+    let big = "x".repeat(4096);
+    app.get("/big", move |_req| {
+        let big = big.clone();
+        async move { Response::text(big) }
+    });
+    let app = app.into_app().await.unwrap();
+    let gzip = |etag: Option<&str>| {
+        let mut req = Request::new(Method::GET, "/big").with_header("accept-encoding", "gzip");
+        if let Some(etag) = etag {
+            req = req.with_header("if-none-match", etag);
+        }
+        app.call(req)
+    };
+    let full = gzip(None).await;
+    assert_eq!(full.get_header("content-encoding"), Some("gzip"));
+    let etag = full.get_header("etag").unwrap().to_string();
+    let cached = gzip(Some(&etag)).await;
+    assert_eq!((cached.status, cached.body.len(), cached.get_header("content-encoding")), (304, 0, None));
+}
+
+#[tokio::test]
+async fn locales_negotiate_per_request() {
+    use axeon::locale::Locales;
+    use axeon::{Method, Request};
+
+    let mut app = Server::new();
+    app.middleware(Locales::new(["en", "zh-CN"]).query_param("lang").cookie("lang"));
+    app.get("/hello", |req| async move {
+        match req.locale().map(|l| l.as_str()) {
+            Some("zh-CN") => "你好",
+            _ => "Hello",
+        }
+    });
+    app.get("/own", |_req| async {
+        Response::text("bonjour").with_header("Content-Language", "fr").with_header("Vary", "Origin")
+    });
+    let app = app.into_app().await.unwrap();
+    let get = |path: &str, headers: &[(&str, &str)]| {
+        let mut req = Request::new(Method::GET, path);
+        for (name, value) in headers {
+            req = req.with_header(name, value);
+        }
+        app.call(req)
+    };
+
+    let zh = get("/hello", &[("accept-language", "zh-TW,zh;q=0.9,en;q=0.8")]).await;
+    assert_eq!(zh.body_text(), "你好");
+    assert_eq!(zh.get_header("content-language"), Some("zh-CN"));
+    assert_eq!(zh.get_header("vary"), Some("Accept-Language"));
+    assert_eq!(get("/hello", &[]).await.body_text(), "Hello");
+    // An explicit choice wins over the header; unsupported ones are ignored.
+    assert_eq!(get("/hello?lang=en", &[("accept-language", "zh-CN")]).await.body_text(), "Hello");
+    assert_eq!(get("/hello?lang=xx", &[("accept-language", "zh-CN")]).await.body_text(), "你好");
+    assert_eq!(get("/hello", &[("cookie", "theme=dark; lang=zh-CN"), ("accept-language", "en")]).await.body_text(), "你好");
+    // Handlers keep their own Content-Language; Vary is extended.
+    let own = get("/own", &[("accept-language", "zh-CN")]).await;
+    assert_eq!(own.get_header("content-language"), Some("fr"));
+    assert_eq!(own.get_header("vary"), Some("Origin, Accept-Language"));
 }

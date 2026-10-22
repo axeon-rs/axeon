@@ -34,6 +34,7 @@ pub struct Enqueue {
     unique_key: Option<String>,
     queue: Option<String>,
     max_attempts: Option<u32>,
+    priority: Option<i16>,
 }
 
 impl Enqueue {
@@ -76,6 +77,54 @@ impl Enqueue {
         self.max_attempts = Some(attempts);
         self
     }
+
+    /// Overrides [`Job::PRIORITY`] for this job: among due jobs on a queue,
+    /// higher priorities run first.
+    pub fn priority(mut self, priority: i16) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+}
+
+/// A row to insert into `axeon_jobs`.
+pub(crate) struct NewJob<'a> {
+    pub queue: &'a str,
+    pub name: &'a str,
+    pub payload: &'a serde_json::Value,
+    pub max_attempts: i32,
+    pub timeout: Duration,
+    pub priority: i16,
+    pub run_at: Option<DateTime<Utc>>,
+    pub delay: Option<Duration>,
+    pub unique_key: Option<&'a str>,
+}
+
+impl NewJob<'_> {
+    /// Inserts the job, skipping a taken unique key, and wakes workers on
+    /// commit. The wake-up also goes out for delayed jobs, so sleeping
+    /// workers learn about an earlier due time.
+    pub(crate) async fn insert<'e>(&self, ex: impl sqlx::PgExecutor<'e>) -> sqlx::Result<Option<i64>> {
+        sqlx::query_scalar::<_, i64>(
+            "WITH inserted AS ( \
+                 INSERT INTO axeon_jobs (queue, name, payload, max_attempts, timeout_secs, run_at, unique_key, priority) \
+                 VALUES ($1, $2, $3, $4, $5, COALESCE($6, now() + make_interval(secs => $7)), $8, $9) \
+                 ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL AND state <> 'failed' DO NOTHING \
+                 RETURNING id, queue \
+             ) \
+             SELECT id FROM inserted CROSS JOIN LATERAL (SELECT pg_notify('axeon_jobs', inserted.queue)) AS notified",
+        )
+        .bind(self.queue)
+        .bind(self.name)
+        .bind(sqlx::types::Json(self.payload))
+        .bind(self.max_attempts)
+        .bind(self.timeout.as_secs_f64())
+        .bind(self.run_at)
+        .bind(self.delay.map(|d| d.as_secs_f64()).unwrap_or(0.0))
+        .bind(self.unique_key)
+        .bind(self.priority)
+        .fetch_optional(ex)
+        .await
+    }
 }
 
 /// Adds a job to run as soon as a worker is free; returns its ID.
@@ -114,34 +163,23 @@ pub async fn enqueue<'c, J: Job>(target: impl Into<Target<'c>>, job: &J) -> Resu
 /// ```
 pub async fn enqueue_with<'c, J: Job>(target: impl Into<Target<'c>>, job: &J, options: Enqueue) -> Result<Option<i64>> {
     let payload = serde_json::to_value(job).map_err(Error::Payload)?;
-    let delay = options.delay.map(|d| d.as_secs_f64()).unwrap_or(0.0);
-    let max_attempts = options.max_attempts.unwrap_or(J::MAX_ATTEMPTS).max(1) as i32;
     let queue = options.queue.unwrap_or_else(|| J::QUEUE.to_string());
-    // Insert, skipping a taken unique key, and wake workers on commit. The
-    // wake-up also goes out for delayed jobs, so sleeping workers learn
-    // about an earlier due time.
-    let query = sqlx::query_scalar::<_, i64>(
-        "WITH inserted AS ( \
-             INSERT INTO axeon_jobs (queue, name, payload, max_attempts, timeout_secs, run_at, unique_key) \
-             VALUES ($1, $2, $3, $4, $5, COALESCE($6, now() + make_interval(secs => $7)), $8) \
-             ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL AND state <> 'failed' DO NOTHING \
-             RETURNING id, queue \
-         ) \
-         SELECT id FROM inserted CROSS JOIN LATERAL (SELECT pg_notify('axeon_jobs', inserted.queue)) AS notified",
-    )
-    .bind(&queue)
-    .bind(J::NAME)
-    .bind(sqlx::types::Json(payload))
-    .bind(max_attempts)
-    .bind(J::TIMEOUT.as_secs_f64())
-    .bind(options.run_at)
-    .bind(delay)
-    .bind(options.unique_key);
+    let row = NewJob {
+        queue: &queue,
+        name: J::NAME,
+        payload: &payload,
+        max_attempts: options.max_attempts.unwrap_or(J::MAX_ATTEMPTS).max(1) as i32,
+        timeout: J::TIMEOUT,
+        priority: options.priority.unwrap_or(J::PRIORITY),
+        run_at: options.run_at,
+        delay: options.delay,
+        unique_key: options.unique_key.as_deref(),
+    };
     let id = match target.into() {
-        Target::Db(db) => query.fetch_optional(crate::pool(db)?).await,
+        Target::Db(db) => row.insert(crate::pool(db)?).await,
         Target::Tx(tx) => {
             let conn = tx.postgres().ok_or_else(|| Error::Config("axeon-jobs needs PostgreSQL".into()))?;
-            query.fetch_optional(conn).await
+            row.insert(conn).await
         }
     };
     id.map_err(|e| Error::Database(e.into()))

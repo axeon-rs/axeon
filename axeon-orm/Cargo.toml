@@ -23,11 +23,14 @@ serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["sync"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 uuid = { version = "1", optional = true }
-serde_json = { version = "1", optional = true }
-axeon = { version = "1.1", path = "..", default-features = false, optional = true }
+serde_json = "1"
+base64 = "0.23"
+tracing = "0.1"
+axeon = { version = "1.1", path = "..", default-features = false, features = ["idempotency"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 serde_json = "1"
 
 [features]
@@ -38,12 +41,18 @@ sqlite = ["sqlx/sqlite"]
 mysql = ["sqlx/mysql"]
 # Encrypted connections to PostgreSQL and MySQL (rustls with webpki roots).
 # Needed for most managed databases, and for MySQL 8's default login method.
-tls = ["sqlx/tls-rustls-ring-webpki"]
+# Uses the aws-lc-rs crypto provider, like Axeon and axeon-client, so an app
+# that combines them compiles in only one rustls provider.
+tls = ["sqlx/tls-rustls-aws-lc-rs"]
 # Column types.
 chrono = ["dep:chrono", "sqlx/chrono"]
 uuid = ["dep:uuid", "sqlx/uuid"]
-json = ["dep:serde_json", "sqlx/json"]
+json = ["sqlx/json"]
 # pgvector `vector` columns, distances and indexes (PostgreSQL).
 pgvector = ["postgres"]
-# `req.db()`, the `Transactional` middleware and error conversion for Axeon.
+# Test helpers (`axeon_orm::testing`): isolated test databases, rolled-back
+# transactions and model factories. For `[dev-dependencies]`.
+testing = ["tokio/rt"]
+# `req.db()`, the `Transactional` and `TenantScope` middleware, error
+# conversion, and (with `postgres`) broadcast and idempotency stores for Axeon.
 axeon = ["dep:axeon"]

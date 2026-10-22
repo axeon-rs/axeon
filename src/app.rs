@@ -24,7 +24,8 @@ use crate::message::{Method, Request};
 use crate::message::Response;
 use crate::middleware::{Chain, Middleware, MiddlewareManager, Next};
 use crate::plugins::State;
-use crate::router::{CompiledRouter, Route, RouteSlot, Router};
+use crate::host::HostPattern;
+use crate::router::{CompiledRouter, Route, MatchedRoute, Router};
 use crate::static_files::StaticFiles;
 use crate::body::{body_error, RequestBody, ResponseBody};
 use crate::message::convert::{normalize_path, PendingBody};
@@ -115,6 +116,10 @@ pub struct Server {
     handler_timeout: Option<Duration>,
     limits: Limits,
     router: Router,
+    /// Routers for other hosts, from `host`.
+    hosts: Vec<(HostPattern, Router)>,
+    /// Bad `host` patterns, reported when the server is built.
+    host_errors: Vec<String>,
     /// Middleware that wraps every request.
     global: MiddlewareManager,
     static_dir: Option<PathBuf>,
@@ -149,6 +154,8 @@ impl Server {
                 max_body_size: 2 * 1024 * 1024,
             },
             router: Router::new(),
+            hosts: Vec::new(),
+            host_errors: Vec::new(),
             global: MiddlewareManager::default(),
             static_dir: None,
             static_cache_control: "no-cache".to_string(),
@@ -437,6 +444,38 @@ impl Server {
     /// * `router` - The router to mount
     pub fn mount(&mut self, path: &str, router: Router) -> &mut Self {
         self.router.mount(path, router);
+        self
+    }
+
+    /// Serves requests for `host` with `router` instead of the server's
+    /// own routes: an exact host (`admin.example.com`) or one wildcard
+    /// label (`*.stores.example.com`; handlers read the label with
+    /// [`Request::subdomain`]). The first matching pattern wins; other
+    /// hosts get the server's routes and static files.
+    ///
+    /// A host's router owns it entirely: paths it doesn't route are `404`,
+    /// not the server's routes. Global middleware runs for every host.
+    /// For hosts known only at runtime (customers' own domains), see
+    /// [`ResolveHost`](crate::host::ResolveHost).
+    ///
+    /// ```rust
+    /// use axeon::{Router, Server};
+    ///
+    /// let mut admin = Router::new();
+    /// admin.get("/", |_req| async { "admin" });
+    ///
+    /// let mut app = Server::new();
+    /// app.host("admin.example.com", admin);
+    /// app.get("/", |_req| async { "public site" });
+    /// ```
+    pub fn host(&mut self, pattern: &str, router: Router) -> &mut Self {
+        match HostPattern::parse(pattern) {
+            Ok(parsed) if self.hosts.iter().any(|(p, _)| *p == parsed) => {
+                self.host_errors.push(format!("host {:?} is routed twice", pattern));
+            }
+            Ok(parsed) => self.hosts.push((parsed, router)),
+            Err(error) => self.host_errors.push(error),
+        }
         self
     }
 
@@ -737,7 +776,14 @@ impl App {
         if !server.global.errors.is_empty() {
             return Err(format!("invalid middleware configuration: {}", server.global.errors.join("; ")).into());
         }
+        if !server.host_errors.is_empty() {
+            return Err(server.host_errors.join("; ").into());
+        }
         let router = server.router.compile(on_error.clone(), server.handler_timeout)?;
+        let mut hosts = Vec::with_capacity(server.hosts.len());
+        for (pattern, host_router) in server.hosts {
+            hosts.push((pattern, host_router.compile(on_error.clone(), server.handler_timeout)?));
+        }
         if HeaderValue::from_str(&server.static_cache_control).is_err() {
             return Err(format!("invalid static Cache-Control value {:?}", server.static_cache_control).into());
         }
@@ -754,7 +800,7 @@ impl App {
             None => None,
         };
 
-        let routing = Arc::new(Routing { router, static_files });
+        let routing = Arc::new(Routing { router, static_files, hosts });
         let entry = (!server.global.middlewares.is_empty()).then(|| {
             let terminal = Arc::clone(&routing);
             Arc::new(Chain {
@@ -886,7 +932,9 @@ impl App {
         };
         let (mut parts, body) = req.into_parts();
         let path = normalize_path(parts.uri.path());
-        let config = self.routing.router.body_config(&path, method);
+        // Only apps with host routes pay for reading the host.
+        let host = if self.routing.hosts.is_empty() { None } else { crate::host::host_of(&parts.headers, Some(&parts.uri)) };
+        let config = self.routing.router_for(host.as_deref()).0.body_config(&path, method);
         let limit = config.limit.unwrap_or(self.limits.max_body_size);
 
         // Refuse a declared oversized body before reading any of it.
@@ -980,13 +1028,33 @@ impl App {
 struct Routing {
     router: CompiledRouter,
     static_files: Option<StaticFiles>,
+    /// Routers for other hosts, tried in order.
+    hosts: Vec<(HostPattern, CompiledRouter)>,
 }
 
 impl Routing {
+    /// The router for a host, the wildcard label it matched, and whether
+    /// it is the server's own (with static files).
+    fn router_for<'h>(&self, host: Option<&'h str>) -> (&CompiledRouter, Option<&'h str>, bool) {
+        if let Some(host) = host {
+            for (pattern, router) in &self.hosts {
+                if let Some(label) = pattern.matches(host) {
+                    return (router, label, false);
+                }
+            }
+        }
+        (&self.router, None, true)
+    }
+
     async fn handle(&self, mut req: Request) -> HttpResponse {
         let method = req.method;
-        let Some((routes, params, pattern)) = self.router.lookup(&req.path) else {
-            if method == Method::GET || method == Method::HEAD {
+        let host = if self.hosts.is_empty() { None } else { req.host() };
+        let (router, label, own) = self.router_for(host.as_deref());
+        if let Some(label) = label {
+            req.insert_extension(crate::host::Subdomain(Arc::from(label)));
+        }
+        let Some((routes, params, pattern)) = router.lookup(&req.path) else {
+            if own && (method == Method::GET || method == Method::HEAD) {
                 if let Some(static_files) = &self.static_files {
                     if let Some(response) = static_files.serve(&req).await {
                         return Ok(response);
@@ -999,7 +1067,7 @@ impl Routing {
             return Err(ServerError::NotFound);
         };
         req.params = params;
-        if let Some(slot) = req.extensions.get::<RouteSlot>() {
+        if let Some(slot) = req.extensions.get::<MatchedRoute>() {
             let _ = slot.0.set(Arc::clone(&pattern));
         }
         req.matched = Some(pattern);

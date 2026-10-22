@@ -36,6 +36,7 @@ impl RedisBroadcast {
     /// Connects to Redis at `url`, like [`connect`](crate::connect). The
     /// wake-up subscription gets its own connection.
     pub async fn connect(url: &str) -> redis::RedisResult<Self> {
+        crate::install_crypto_provider();
         let client = redis::Client::open(url)?;
         let connection = ConnectionManager::new(client.clone()).await?;
         Ok(Self { connection, client, prefix: "axeon:broadcast:".to_string(), max_len: 1000, idle_ttl: Duration::from_secs(24 * 3600) })

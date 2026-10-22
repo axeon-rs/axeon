@@ -54,7 +54,7 @@
 
 use crate::message::{Method, Request, Response};
 use crate::middleware::{Middleware, MiddlewareResult, Next};
-use crate::router::{RouteSlot, Router};
+use crate::router::{MatchedRoute, Router};
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -186,8 +186,7 @@ impl Drop for InFlight {
 
 impl Middleware for Metrics {
     fn call(&self, mut req: Request, next: Next) -> MiddlewareResult {
-        let slot = RouteSlot::default();
-        req.insert_extension(slot.clone());
+        let slot = MatchedRoute::watch(&mut req);
         let method = req.method();
         let metrics = self.clone();
         self.registry.in_flight.fetch_add(1, Ordering::Relaxed);

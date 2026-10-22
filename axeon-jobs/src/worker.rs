@@ -1,7 +1,8 @@
 //! Claiming and running jobs.
 
+use crate::enqueue::NewJob;
 use crate::job::State;
-use crate::{Error, Job, JobContext, JobError, JobResult, Result};
+use crate::{Cron, Error, Job, JobContext, JobError, JobResult, Result};
 use axeon_orm::Db;
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -28,6 +29,19 @@ struct Registered {
     run: RunFn,
     backoff: fn(u32) -> Duration,
     queue: &'static str,
+    type_id: std::any::TypeId,
+}
+
+/// A job enqueued on a cron schedule.
+struct Schedule {
+    name: String,
+    cron: Cron,
+    job: &'static str,
+    queue: &'static str,
+    payload: serde_json::Value,
+    max_attempts: i32,
+    timeout: Duration,
+    priority: i16,
 }
 
 /// Runs jobs from the `axeon_jobs` table: register the job types it
@@ -61,6 +75,9 @@ pub struct Worker {
     shutdown_timeout: Duration,
     state: State,
     id: String,
+    schedules: Vec<Schedule>,
+    /// Setup mistakes, reported by `run_until`.
+    errors: Vec<String>,
     #[cfg(feature = "metrics")]
     metrics: Option<crate::metrics::WorkerMetrics>,
 }
@@ -78,17 +95,24 @@ impl Worker {
             shutdown_timeout: Duration::from_secs(30),
             state: State::default(),
             id: format!("{}:{}", host, std::process::id()),
+            schedules: Vec::new(),
+            errors: Vec::new(),
             #[cfg(feature = "metrics")]
             metrics: None,
         }
     }
 
-    /// Runs jobs of type `J`, on its [`QUEUE`](Job::QUEUE).
+    /// Runs jobs of type `J`, on its [`QUEUE`](Job::QUEUE). Registering
+    /// the same type again does nothing.
     ///
     /// # Panics
     ///
     /// When another registered job type has the same [`NAME`](Job::NAME).
     pub fn register<J: Job>(mut self) -> Self {
+        if let Some(existing) = self.jobs.get(J::NAME) {
+            assert!(existing.type_id == std::any::TypeId::of::<J>(), "two job types are named {:?}", J::NAME);
+            return self;
+        }
         let run: RunFn = Arc::new(|payload, ctx| {
             Box::pin(async move {
                 let job: J = serde_json::from_value(payload)
@@ -96,8 +120,80 @@ impl Worker {
                 job.run(ctx).await
             })
         });
-        let previous = self.jobs.insert(J::NAME, Registered { run, backoff: J::backoff, queue: J::QUEUE });
-        assert!(previous.is_none(), "two job types are named {:?}", J::NAME);
+        let type_id = std::any::TypeId::of::<J>();
+        self.jobs.insert(J::NAME, Registered { run, backoff: J::backoff, queue: J::QUEUE, type_id });
+        self
+    }
+
+    /// Enqueues `job` on a [`Cron`] schedule (in UTC), and registers its
+    /// type if needed. `name` identifies the schedule across deploys.
+    ///
+    /// ```no_run
+    /// # use axeon_jobs::{Job, JobContext, JobResult, Worker};
+    /// # #[derive(serde::Serialize, serde::Deserialize)] struct RescreenAll;
+    /// # impl Job for RescreenAll { const NAME: &'static str = "rescreen_all"; async fn run(self, _: JobContext) -> JobResult { Ok(()) } }
+    /// # #[derive(serde::Serialize, serde::Deserialize)] struct DeleteExpired { days: u32 }
+    /// # impl Job for DeleteExpired { const NAME: &'static str = "delete_expired"; async fn run(self, _: JobContext) -> JobResult { Ok(()) } }
+    /// # async fn run(db: axeon_orm::Db) -> axeon_jobs::Result<()> {
+    /// Worker::new(db)
+    ///     .schedule("rescreen-sanctions", "0 3 * * *", RescreenAll)
+    ///     .schedule("retention", "@hourly", DeleteExpired { days: 90 })
+    ///     .run_until(async { tokio::signal::ctrl_c().await.unwrap() })
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Every worker may declare the same schedules: the schedule's next run
+    /// time is kept in the `axeon_jobs_schedules` table and advanced by
+    /// exactly one worker, which enqueues the job in the same transaction.
+    /// So each run is enqueued once, by whichever worker sees it first.
+    ///
+    /// - A run is skipped while the schedule's previous job is still
+    ///   waiting or running (its [unique key](crate::Enqueue::unique_key)
+    ///   is `cron:<name>`), so slow jobs don't pile up.
+    /// - Runs missed while no worker was up are made up once, not once per
+    ///   missed run.
+    /// - Changing the expression takes effect when a worker with the new
+    ///   expression starts. Two versions running side by side keep
+    ///   switching the next run time; avoid that during long rollouts.
+    ///
+    /// An invalid expression, or a duplicate `name`, makes
+    /// [`run_until`](Worker::run_until) fail.
+    pub fn schedule<J: Job>(mut self, name: impl Into<String>, expression: &str, job: J) -> Self {
+        let name = name.into();
+        if self.schedules.iter().any(|s| s.name == name) {
+            self.errors.push(format!("two schedules are named {:?}", name));
+            return self;
+        }
+        let cron = match Cron::parse(expression) {
+            Ok(cron) if cron.next_after(chrono::Utc::now()).is_some() => cron,
+            Ok(_) => {
+                self.errors.push(format!("schedule {:?}: {:?} never matches", name, expression));
+                return self;
+            }
+            Err(error) => {
+                self.errors.push(format!("schedule {:?}: {}", name, error));
+                return self;
+            }
+        };
+        let payload = match serde_json::to_value(&job) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.errors.push(format!("schedule {:?}: can't serialize the job: {}", name, error));
+                return self;
+            }
+        };
+        self = self.register::<J>();
+        self.schedules.push(Schedule {
+            name,
+            cron,
+            job: J::NAME,
+            queue: J::QUEUE,
+            payload,
+            max_attempts: J::MAX_ATTEMPTS.max(1) as i32,
+            timeout: J::TIMEOUT,
+            priority: J::PRIORITY,
+        });
         self
     }
 
@@ -157,10 +253,16 @@ impl Worker {
     /// so an outage doesn't stop the worker. It fails only when it can't
     /// start: no registered jobs, not PostgreSQL, or no connection.
     pub async fn run_until(self, signal: impl Future<Output = ()>) -> Result<()> {
+        if let Some(error) = self.errors.first() {
+            return Err(Error::Config(error.clone()));
+        }
         if self.jobs.is_empty() {
             return Err(Error::Config("register at least one job type".into()));
         }
         let pool = crate::pool(&self.db)?.clone();
+        for schedule in &self.schedules {
+            declare(&pool, schedule).await.map_err(|e| Error::Database(e.into()))?;
+        }
         let mut queues = self.concurrency.clone();
         for job in self.jobs.values() {
             queues.entry(job.queue.to_string()).or_insert(DEFAULT_CONCURRENCY);
@@ -213,6 +315,9 @@ impl Worker {
         let mut loops = JoinSet::new();
         for (queue, concurrency) in queues {
             loops.spawn(queue_loop(Arc::clone(&shared), Arc::from(queue), concurrency, stopped.clone()));
+        }
+        if !self.schedules.is_empty() {
+            loops.spawn(scheduler(shared.pool.clone(), self.schedules, stopped.clone()));
         }
         signal.await;
         info!(worker = %shared.id, "job worker stopping");
@@ -354,7 +459,7 @@ async fn claim(shared: &Shared, queue: &str, limit: usize) -> sqlx::Result<Vec<C
              WHERE queue = $1 AND name = ANY($2) \
                AND ((state = 'pending' AND run_at <= now()) \
                     OR (state = 'running' AND locked_until < now() AND attempts < max_attempts)) \
-             ORDER BY run_at, id \
+             ORDER BY priority DESC, run_at, id \
              LIMIT $5 \
              FOR UPDATE SKIP LOCKED) \
          RETURNING j.id, j.name, j.payload, j.attempts, j.max_attempts, j.timeout_secs",
@@ -489,4 +594,100 @@ async fn release(pool: &PgPool, id: i64, attempt: i32) -> sqlx::Result<()> {
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Records a schedule, keeping its next run time unless the expression
+/// changed.
+async fn declare(pool: &PgPool, schedule: &Schedule) -> sqlx::Result<()> {
+    let next = schedule.cron.next_after(chrono::Utc::now());
+    sqlx::query(
+        "INSERT INTO axeon_jobs_schedules (name, expression, next_run_at) VALUES ($1, $2, $3) \
+         ON CONFLICT (name) DO UPDATE SET expression = EXCLUDED.expression, \
+             next_run_at = EXCLUDED.next_run_at, updated_at = now() \
+         WHERE axeon_jobs_schedules.expression <> EXCLUDED.expression",
+    )
+    .bind(&schedule.name)
+    .bind(schedule.cron.as_str())
+    .bind(next)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Enqueues scheduled jobs as they come due, until stopped.
+async fn scheduler(pool: PgPool, schedules: Vec<Schedule>, mut stopped: watch::Receiver<bool>) {
+    // Wake up at least this often, to notice a schedule another worker
+    // re-declared with an earlier time.
+    const MAX_SLEEP: Duration = Duration::from_secs(60);
+    loop {
+        if *stopped.borrow() {
+            break;
+        }
+        let mut wait = MAX_SLEEP;
+        for schedule in &schedules {
+            match tick(&pool, schedule).await {
+                Ok(until_next) => wait = wait.min(until_next),
+                Err(error) => {
+                    error!(%error, schedule = %schedule.name, "couldn't run the schedule; retrying");
+                    wait = wait.min(Duration::from_secs(5));
+                }
+            }
+        }
+        tokio::select! {
+            _ = sleep(wait.max(Duration::from_millis(10))) => {}
+            _ = stopped.changed() => {}
+        }
+    }
+}
+
+/// Enqueues the schedule's job if it is due; returns how long until its
+/// next run. The next run time is advanced with a compare-and-swap in the
+/// same transaction as the insert, so only one worker enqueues each run.
+async fn tick(pool: &PgPool, schedule: &Schedule) -> sqlx::Result<Duration> {
+    let row: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as("SELECT next_run_at, now() FROM axeon_jobs_schedules WHERE name = $1")
+            .bind(&schedule.name)
+            .fetch_optional(pool)
+            .await?;
+    let Some((due, now)) = row else {
+        // Deleted by hand: declare it again.
+        declare(pool, schedule).await?;
+        return Ok(Duration::ZERO);
+    };
+    let until = |t: chrono::DateTime<chrono::Utc>| (t - now).to_std().unwrap_or_default();
+    if due > now {
+        return Ok(until(due));
+    }
+    // Checked to match when the schedule was added, so this is always set.
+    let Some(next) = schedule.cron.next_after(now) else { return Ok(Duration::from_secs(3600)) };
+    let mut tx = pool.begin().await?;
+    let advanced = sqlx::query(
+        "UPDATE axeon_jobs_schedules SET next_run_at = $3, last_run_at = $2, updated_at = now() \
+         WHERE name = $1 AND next_run_at = $2",
+    )
+    .bind(&schedule.name)
+    .bind(due)
+    .bind(next)
+    .execute(&mut *tx)
+    .await?;
+    if advanced.rows_affected() == 1 {
+        let unique_key = format!("cron:{}", schedule.name);
+        let job = NewJob {
+            queue: schedule.queue,
+            name: schedule.job,
+            payload: &schedule.payload,
+            max_attempts: schedule.max_attempts,
+            timeout: schedule.timeout,
+            priority: schedule.priority,
+            run_at: Some(due),
+            delay: None,
+            unique_key: Some(&unique_key),
+        };
+        match job.insert(&mut *tx).await? {
+            Some(id) => debug!(job = id, schedule = %schedule.name, "scheduled job enqueued"),
+            None => warn!(schedule = %schedule.name, "skipping a run: the previous one is still waiting or running"),
+        }
+    }
+    tx.commit().await?;
+    Ok(until(next))
 }

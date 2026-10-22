@@ -661,7 +661,15 @@ async fn tls_negotiates_http2_and_http11() {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.cert.der().clone()).unwrap();
     let connect = |alpn: &[u8]| {
-        let mut config = rustls::ClientConfig::builder().with_root_certificates(roots.clone()).with_no_client_auth();
+        // Both aws-lc-rs and ring are compiled into this test (see the ring
+        // dev-dependency), as in an app that mixes crates on different
+        // providers, so the client names its provider explicitly.
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots.clone())
+            .with_no_client_auth();
         config.alpn_protocols = vec![alpn.to_vec()];
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
         async move {

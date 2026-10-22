@@ -1,0 +1,33 @@
+[package]
+name = "axeon-otel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "OpenTelemetry for Axeon apps: a server span per request, W3C trace context propagation and OTLP export"
+license = "MIT"
+repository = "https://github.com/axeon-rs/axeon"
+documentation = "https://docs.rs/axeon-otel"
+readme = "README.md"
+keywords = ["opentelemetry", "tracing", "otlp", "observability", "axeon"]
+categories = ["web-programming", "development-tools::debugging"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+axeon = { version = "1.1", path = "..", default-features = false }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"] }
+tracing = "0.1"
+tracing-opentelemetry = { version = "0.34", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+[features]
+# `https://` collector endpoints (rustls with aws-lc-rs, like the other Axeon crates).
+tls = ["opentelemetry-otlp/reqwest-rustls"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }

@@ -918,6 +918,403 @@ async fn bulk_inserts(db: &Db) {
     assert_eq!(Product::query().count(db).await.unwrap(), 2501);
 }
 
+async fn cursor_pagination(db: &Db) {
+    setup(db).await;
+    // Repeated ages, so ties are broken by the primary key.
+    let ages = [30, 20, 30, 40, 20, 30, 10, 40, 30, 20, 50];
+    for (i, age) in ages.into_iter().enumerate() {
+        user(&format!("u{:02}", i), age).insert(db).await.unwrap();
+    }
+
+    // Walks every page and checks it matches the same order read in one go.
+    async fn walk(db: &Db, query: axeon_orm::Query<User>, per_page: u64) -> Vec<i64> {
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = query.clone().cursor_paginate(db, after.as_deref(), per_page).await.unwrap();
+            assert!(page.items.len() as u64 <= per_page);
+            seen.extend(page.items.iter().map(|u| u.id));
+            pages += 1;
+            assert!(pages < 50, "cursor pagination doesn't advance");
+            match page.next_cursor {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        seen
+    }
+    let ids = |users: Vec<User>| users.into_iter().map(|u| u.id).collect::<Vec<_>>();
+
+    // Default order: primary key ascending.
+    let expected = ids(User::query().order_by(User::ID.asc()).all(db).await.unwrap());
+    assert_eq!(walk(db, User::query(), 4).await, expected);
+
+    // One direction (a row comparison on PostgreSQL and SQLite).
+    let expected = ids(User::query().order_by(User::AGE.desc()).order_by(User::ID.desc()).all(db).await.unwrap());
+    for per_page in [1, 3, 11, 20] {
+        assert_eq!(walk(db, User::query().order_by(User::AGE.desc()), per_page).await, expected);
+    }
+
+    // Mixed directions, a filter and a timestamp key.
+    let expected = ids(
+        User::query()
+            .filter(User::AGE.gte(20))
+            .order_by(User::AGE.asc())
+            .order_by(User::CREATED_AT.desc())
+            .order_by(User::ID.desc())
+            .all(db)
+            .await
+            .unwrap(),
+    );
+    let mixed = User::query().filter(User::AGE.gte(20)).order_by(User::AGE.asc()).order_by(User::CREATED_AT.desc());
+    assert_eq!(walk(db, mixed.clone(), 2).await, expected);
+
+    // The last page has no cursor; an exact fit doesn't leave an empty page.
+    let all = User::query().cursor_paginate(db, None, 11).await.unwrap();
+    assert_eq!((all.items.len(), all.has_more()), (11, false));
+
+    // Cursors are checked.
+    let first = User::query().order_by(User::AGE.desc()).cursor_paginate(db, None, 2).await.unwrap();
+    let cursor = first.next_cursor.unwrap();
+    let other_order = User::query().order_by(User::AGE.asc()).cursor_paginate(db, Some(&cursor), 2).await;
+    assert!(matches!(&other_order, Err(Error::InvalidCursor(m)) if m.contains("sort order")), "{:?}", other_order.map(|p| p.items.len()));
+    for bad in ["", "not a cursor", "eyJrIjoxfQ"] {
+        let result = User::query().cursor_paginate(db, Some(bad), 2).await;
+        assert!(matches!(result, Err(Error::InvalidCursor(_))), "{:?}", bad);
+    }
+    let nullable = User::query().order_by(User::BIO.asc()).cursor_paginate(db, None, 2).await;
+    assert!(matches!(&nullable, Err(Error::Config(m)) if m.contains("nullable")));
+    let raw = User::query().order_by(Order::raw("age * 2", ())).cursor_paginate(db, None, 2).await;
+    assert!(matches!(raw, Err(Error::Config(_))));
+
+    // A text primary key works too.
+    for slug in ["c", "a", "e", "b", "d"] {
+        Tag { slug: slug.into(), label: slug.to_uppercase(), uses: 0 }.insert(db).await.unwrap();
+    }
+    let mut after = None;
+    let mut slugs = Vec::new();
+    loop {
+        let page = Tag::query().cursor_paginate(db, after.as_deref(), 2).await.unwrap();
+        slugs.extend(page.items.into_iter().map(|t| t.slug));
+        match page.next_cursor {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(slugs, ["a", "b", "c", "d", "e"]);
+}
+
+#[derive(Model, Clone, Debug, PartialEq)]
+#[model(has_many(Task))]
+struct Project {
+    id: i64,
+    #[model(tenant, index)]
+    org_id: i64,
+    #[model(unique)]
+    code: String,
+    name: String,
+}
+
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Task {
+    id: i64,
+    #[model(tenant)]
+    org_id: i64,
+    #[model(belongs_to = Project)]
+    project_id: i64,
+    title: String,
+}
+
+async fn tenant_scopes(db: &Db) {
+    setup(db).await;
+    db.create_table::<Project>().await.unwrap();
+    db.create_table::<Task>().await.unwrap();
+    let project = |org: i64, code: &str| Project { id: 0, org_id: org, code: code.into(), name: format!("project {}", code) };
+    let task = |org: i64, project: &Project, title: &str| Task { id: 0, org_id: org, project_id: project.id, title: title.into() };
+    fn scope_missing<T>(r: &Result<T, Error>) -> bool {
+        matches!(r, Err(Error::TenantScope(_)))
+    }
+    fn wrong_tenant<T>(r: &Result<T, Error>) -> bool {
+        matches!(r, Err(Error::WrongTenant(_)))
+    }
+
+    // A plain Db refuses tenant-scoped models, but not other models.
+    assert!(scope_missing(&Project::query().all(db).await));
+    assert!(scope_missing(&Project::find(db, 1).await));
+    assert!(scope_missing(&Project::query().count(db).await));
+    assert!(scope_missing(&project(1, "X").insert(db).await));
+    assert!(scope_missing(&Project::query().delete(db).await));
+    assert_eq!(User::query().count(db).await.unwrap(), 0);
+
+    let (a, b, all) = (db.for_tenant(1i64), db.for_tenant(2i64), db.all_tenants());
+    assert_eq!(a.tenant(), Some(&axeon_orm::Value::I64(1)));
+    let pa = project(1, "A1").insert(&a).await.unwrap();
+    let pa2 = project(1, "A2").insert(&a).await.unwrap();
+    let pb = project(2, "B1").insert(&b).await.unwrap();
+    // Writing another tenant's row is refused.
+    assert!(wrong_tenant(&project(2, "B2").insert(&a).await));
+    task(1, &pa, "mine").insert(&a).await.unwrap();
+    task(2, &pb, "theirs").insert(&b).await.unwrap();
+    // A row of org 2 pointing at org 1's project, to check relations.
+    task(2, &pa, "foreign").insert(&all).await.unwrap();
+
+    // Reads see only the tenant's rows.
+    let codes = |ps: Vec<Project>| ps.into_iter().map(|p| p.code).collect::<Vec<_>>();
+    assert_eq!(codes(Project::query().order_by(Project::CODE.asc()).all(&a).await.unwrap()), ["A1", "A2"]);
+    assert_eq!(codes(Project::query().all(&b).await.unwrap()), ["B1"]);
+    assert_eq!(Project::query().count(&all).await.unwrap(), 3);
+    assert_eq!(Project::find(&a, pb.id).await.unwrap(), None);
+    assert!(matches!(Project::find_or_fail(&a, pb.id).await, Err(Error::NotFound)));
+    assert!(!Project::query().filter(Project::CODE.eq("B1")).exists(&a).await.unwrap());
+    let page = Project::query().cursor_paginate(&a, None, 10).await.unwrap();
+    assert_eq!(page.items.len(), 2);
+    // The query-level opt-out works on any Db.
+    assert_eq!(Project::query().all_tenants().count(db).await.unwrap(), 3);
+    assert_eq!(Project::query().all_tenants().count(&a).await.unwrap(), 3);
+
+    // Writes through instances can't touch other tenants' rows, even with
+    // a forged tenant column.
+    assert!(wrong_tenant(&pb.clone().update(&a).await));
+    let mut forged = pb.clone();
+    forged.org_id = 1;
+    forged.name = "hijacked".into();
+    assert!(matches!(forged.clone().update(&a).await, Err(Error::NotFound)));
+    assert!(matches!(forged.delete(&a).await, Err(Error::NotFound)));
+    assert_eq!(Project::find_or_fail(&b, pb.id).await.unwrap().name, "project B1");
+    let mut renamed = pa.clone();
+    renamed.name = "renamed".into();
+    renamed.update(&a).await.unwrap();
+    assert_eq!(Project::find_or_fail(&a, pa.id).await.unwrap().name, "renamed");
+
+    // Bulk updates and deletes stay inside the tenant.
+    assert_eq!(Project::query().update(&a, [Project::NAME.set("bulk")]).await.unwrap(), 2);
+    assert_eq!(Project::find_or_fail(&b, pb.id).await.unwrap().name, "project B1");
+    let moved = Project::query().update(&a, [Project::ORG_ID.set(2i64)]).await;
+    assert!(wrong_tenant(&moved));
+    assert_eq!(Project::query().filter(Project::CODE.like("%2")).delete(&a).await.unwrap(), 1);
+    assert_eq!(Project::query().count(&all).await.unwrap(), 2);
+    let _ = pa2;
+
+    // Upserts on a global unique key never overwrite another tenant's row.
+    let clash = Project { name: "stolen".into(), ..project(1, "B1") };
+    assert!(wrong_tenant(&clash.clone().upsert(&a, OnConflict::on(Project::CODE)).await));
+    assert!(wrong_tenant(&Project::upsert_many(&a, std::slice::from_ref(&clash), OnConflict::on(Project::CODE)).await));
+    assert_eq!(clash.clone().insert_or_ignore(&a, OnConflict::on(Project::CODE)).await.unwrap(), None);
+    assert_eq!(Project::find_or_fail(&b, pb.id).await.unwrap().name, "project B1");
+    let own = Project { name: "upserted".into(), ..project(1, "A1") };
+    assert_eq!(own.upsert(&a, OnConflict::on(Project::CODE)).await.unwrap().name, "upserted");
+
+    // Relation filters and eager loading are scoped on both sides.
+    let titles = |ts: &[Task]| ts.iter().map(|t| t.title.clone()).collect::<Vec<_>>();
+    let with_foreign = Project::query().where_has(Project::TASKS, Task::TITLE.eq("foreign"));
+    assert_eq!(with_foreign.clone().count(&a).await.unwrap(), 0);
+    assert_eq!(with_foreign.all_tenants().count(&a).await.unwrap(), 1);
+    let loaded = Project::query().with(Project::TASKS).all(&a).await.unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(titles(&loaded[0].1), ["mine"]);
+    let loaded = Project::query().filter(Project::ID.eq(pa.id)).all_tenants().with(Project::TASKS).all(db).await.unwrap();
+    let mut seen = titles(&loaded[0].1);
+    seen.sort();
+    assert_eq!(seen, ["foreign", "mine"]);
+    assert_eq!(titles(&pa.tasks().all(&a).await.unwrap()), ["mine"]);
+
+    // Joins filter the joined table too; a left join keeps the row.
+    let joined = Task::query().join(Task::PROJECT).all(&b).await.unwrap();
+    assert_eq!(joined.iter().map(|(t, _)| t.title.as_str()).collect::<Vec<_>>(), ["theirs"]);
+    let left = Task::query().left_join(Task::PROJECT).order_by(Task::TITLE.asc()).all(&b).await.unwrap();
+    let left: Vec<_> = left.iter().map(|(t, p)| (t.title.as_str(), p.as_ref().map(|p| p.code.as_str()))).collect();
+    assert_eq!(left, [("foreign", None), ("theirs", Some("B1"))]);
+
+    // Transactions keep the scope of the Db they began on.
+    let mut tx = b.begin().await.unwrap();
+    assert_eq!(codes(Project::query().all(&mut tx).await.unwrap()), ["B1"]);
+    assert!(wrong_tenant(&project(1, "T").insert(&mut tx).await));
+    tx.rollback().await.unwrap();
+}
+
+#[derive(Model, Clone, Debug, PartialEq)]
+struct Doc {
+    id: i64,
+    #[model(unique)]
+    slug: String,
+    title: String,
+    #[model(version)]
+    version: i64,
+}
+
+async fn optimistic_locking(db: &Db) {
+    db.create_table::<Doc>().await.unwrap();
+    let doc = |slug: &str, title: &str| Doc { id: 0, slug: slug.into(), title: title.into(), version: 0 };
+    fn stale<T>(r: &Result<T, Error>) -> bool {
+        matches!(r, Err(Error::StaleRecord(_)))
+    }
+
+    let stored = doc("terms", "Terms v1").insert(db).await.unwrap();
+    assert_eq!(stored.version, 0);
+
+    // Two editors load the same version; the second save loses.
+    let mut alice = Doc::find_or_fail(db, stored.id).await.unwrap();
+    let mut bob = alice.clone();
+    alice.title = "Alice's edit".into();
+    alice.update(db).await.unwrap();
+    assert_eq!(alice.version, 1, "update bumps the version and reloads it");
+    bob.title = "Bob's edit".into();
+    assert!(stale(&bob.update(db).await));
+    assert_eq!(Doc::find_or_fail(db, stored.id).await.unwrap().title, "Alice's edit");
+    // After reloading, Bob can save.
+    let mut bob = Doc::find_or_fail(db, stored.id).await.unwrap();
+    bob.title = "Bob's edit".into();
+    bob.update(db).await.unwrap();
+    assert_eq!(bob.version, 2);
+
+    // Bulk updates bump the version, so earlier copies are stale.
+    let before = Doc::find_or_fail(db, stored.id).await.unwrap();
+    assert_eq!(Doc::query().update(db, [Doc::TITLE.set("Bulk")]).await.unwrap(), 1);
+    let after = Doc::find_or_fail(db, stored.id).await.unwrap();
+    assert_eq!(after.version, 3);
+    let mut copy = before.clone();
+    assert!(stale(&copy.update(db).await));
+    // Unless the update sets the version itself.
+    Doc::query().update(db, [Doc::VERSION.set(10i64)]).await.unwrap();
+    assert_eq!(Doc::find_or_fail(db, stored.id).await.unwrap().version, 10);
+
+    // Upserts bump it as well.
+    let upserted = doc("terms", "Upserted").upsert(db, OnConflict::on(Doc::SLUG)).await.unwrap();
+    assert_eq!((upserted.title.as_str(), upserted.version), ("Upserted", 11));
+    let many = Doc::upsert_many(db, &[doc("terms", "Many"), doc("privacy", "Privacy")], OnConflict::on(Doc::SLUG)).await.unwrap();
+    assert_eq!(many.iter().map(|d| d.version).collect::<Vec<_>>(), [12, 0]);
+
+    // Deletes check the version; a missing row is still NotFound.
+    let current = Doc::find_or_fail(db, stored.id).await.unwrap();
+    assert!(stale(&before.clone().delete(db).await));
+    current.clone().delete(db).await.unwrap();
+    assert!(matches!(current.clone().delete(db).await, Err(Error::NotFound)));
+    let mut gone = current;
+    assert!(matches!(gone.update(db).await, Err(Error::NotFound)));
+}
+
+async fn streaming(db: &Db) {
+    use futures::{StreamExt, TryStreamExt};
+    setup(db).await;
+    let users: Vec<User> = (0..1500).map(|i| user(&format!("s{:04}", i), i % 100)).collect();
+    User::insert_many(db, &users).await.unwrap();
+
+    // Every matching row, in order, without loading them all first.
+    let names: Vec<String> = User::query()
+        .filter(User::AGE.lt(50))
+        .order_by(User::NAME.asc())
+        .stream(db)
+        .map_ok(|u| u.name)
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(names.len(), 750);
+    assert!(names.windows(2).all(|w| w[0] < w[1]));
+
+    // In batches.
+    let sizes: Vec<usize> = User::query().stream(db).try_chunks(400).map_ok(|b| b.len()).try_collect().await.map_err(|e| e.1).unwrap();
+    assert_eq!(sizes, [400, 400, 400, 300]);
+
+    // Inside a transaction: sees its uncommitted rows; dropping the stream
+    // early leaves the transaction usable.
+    let mut tx = db.begin().await.unwrap();
+    user("in-tx", 7).insert(&mut tx).await.unwrap();
+    {
+        let mut early = User::query().order_by(User::ID.asc()).stream(&mut tx);
+        assert!(early.next().await.unwrap().is_ok());
+        assert!(early.next().await.unwrap().is_ok());
+    }
+    assert_eq!(User::query().filter(User::NAME.eq("in-tx")).stream(&mut tx).count().await, 1);
+    assert_eq!(User::query().count(&mut tx).await.unwrap(), 1501);
+    tx.rollback().await.unwrap();
+
+    // Errors arrive through the stream: a missing tenant scope...
+    let refused: Vec<_> = Project::query().stream(db).collect().await;
+    assert!(matches!(refused.as_slice(), [Err(Error::TenantScope(_))]), "{:?}", refused.len());
+    // ...and, on PostgreSQL, one raised mid-stream, which fails the transaction.
+    if db.backend() == Backend::Postgres {
+        let mut tx = db.begin().await.unwrap();
+        let rows: Vec<_> = User::query().filter(Expr::raw("1 / (age - 50) <> 0", ())).stream(&mut tx).collect().await;
+        assert!(rows.iter().any(|r| r.is_err()));
+        assert!(matches!(tx.commit().await, Err(Error::Transaction(_))));
+    }
+}
+
+/// A pivot row with data: a user's selection of a product, with a margin.
+#[derive(Model, Clone, Debug, PartialEq)]
+#[model(table = "selections")]
+struct Selection {
+    #[model(primary_key, belongs_to = User)]
+    user_id: i64,
+    #[model(primary_key)]
+    product_code: String,
+    margin: f64,
+}
+
+async fn composite_keys(db: &Db) {
+    setup(db).await;
+    db.create_table::<Selection>().await.unwrap();
+    let ada = user("Ada", 36).insert(db).await.unwrap();
+    let bob = user("Bob", 41).insert(db).await.unwrap();
+    let pick = |user: &User, code: &str, margin: f64| Selection { user_id: user.id, product_code: code.into(), margin };
+
+    // Insert, and the key is the pair.
+    let lamp = pick(&ada, "lamp", 0.2).insert(db).await.unwrap();
+    assert_eq!(lamp, pick(&ada, "lamp", 0.2));
+    pick(&ada, "desk", 0.3).insert(db).await.unwrap();
+    pick(&bob, "lamp", 0.1).insert(db).await.unwrap();
+    assert!(matches!(pick(&ada, "lamp", 0.9).insert(db).await, Err(Error::UniqueViolation(_))));
+
+    // Find by the tuple.
+    assert_eq!(Selection::find(db, (ada.id, "lamp")).await.unwrap(), Some(lamp.clone()));
+    assert_eq!(Selection::find(db, (bob.id, "desk")).await.unwrap(), None);
+    assert!(matches!(Selection::find_or_fail(db, (bob.id, "desk")).await, Err(Error::NotFound)));
+
+    // Updates and deletes touch exactly one row.
+    let mut changed = lamp.clone();
+    changed.margin = 0.25;
+    changed.update(db).await.unwrap();
+    assert_eq!(Selection::find_or_fail(db, (ada.id, "lamp")).await.unwrap().margin, 0.25);
+    assert_eq!(Selection::find_or_fail(db, (bob.id, "lamp")).await.unwrap().margin, 0.1);
+    assert_eq!(Selection::find_or_fail(db, (ada.id, "desk")).await.unwrap().margin, 0.3);
+    Selection::find_or_fail(db, (ada.id, "desk")).await.unwrap().delete(db).await.unwrap();
+    assert_eq!(Selection::query().count(db).await.unwrap(), 2);
+    let mut gone = pick(&ada, "desk", 0.3);
+    assert!(matches!(gone.update(db).await, Err(Error::NotFound)));
+
+    // Upserts on the key, bulk inserts and insert-or-ignore.
+    let key = || OnConflict::on(Selection::USER_ID).and(Selection::PRODUCT_CODE);
+    assert_eq!(pick(&ada, "lamp", 0.5).upsert(db, key()).await.unwrap().margin, 0.5);
+    assert_eq!(pick(&ada, "lamp", 0.7).insert_or_ignore(db, key()).await.unwrap(), None);
+    let many = Selection::insert_many(db, &[pick(&bob, "desk", 0.4), pick(&bob, "chair", 0.6), pick(&ada, "chair", 0.6)]).await.unwrap();
+    assert_eq!(many.iter().map(|s| (s.user_id, s.product_code.as_str())).collect::<Vec<_>>(), [(bob.id, "desk"), (bob.id, "chair"), (ada.id, "chair")]);
+    let upserted = Selection::upsert_many(db, &[pick(&bob, "desk", 0.45), pick(&ada, "rug", 0.2)], key()).await.unwrap();
+    assert_eq!(upserted.iter().map(|s| s.margin).collect::<Vec<_>>(), [0.45, 0.2]);
+
+    // Cursor pagination breaks ties on every key column.
+    let mut after = None;
+    let mut seen = Vec::new();
+    loop {
+        let page = Selection::query().order_by(Selection::MARGIN.asc()).cursor_paginate(db, after.as_deref(), 2).await.unwrap();
+        seen.extend(page.items.into_iter().map(|s| (s.margin, s.user_id, s.product_code)));
+        match page.next_cursor {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    let mut expected = seen.clone();
+    expected.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(seen.len(), 6);
+    assert_eq!(seen, expected);
+
+    // A pivot model joins to its parents through belongs_to.
+    let rows = Selection::query().join(Selection::USER).filter(Selection::PRODUCT_CODE.eq("chair")).order_by(Selection::USER_ID.asc()).all(db).await.unwrap();
+    assert_eq!(rows.iter().map(|(s, u)| (s.margin, u.name.as_str())).collect::<Vec<_>>(), [(0.6, "Ada"), (0.6, "Bob")]);
+    // The key's belongs_to column is a real foreign key.
+    assert!(matches!(ada.clone().delete(db).await, Err(Error::ForeignKeyViolation(_))));
+}
+
 #[cfg(feature = "sqlite")]
 async fn sqlite(_name: &str) -> Option<Db> {
     Some(Db::connect("sqlite::memory:").await.unwrap())
@@ -1003,6 +1400,11 @@ backend_tests!(
     upserts,
     json_filters,
     bulk_inserts,
+    cursor_pagination,
+    tenant_scopes,
+    optimistic_locking,
+    streaming,
+    composite_keys,
 );
 
 #[test]

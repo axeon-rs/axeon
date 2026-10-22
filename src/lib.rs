@@ -52,7 +52,10 @@
 //! | Module | For |
 //! |---|---|
 //! | [`validate`] | Validated JSON, query and form input with per-field 422 errors |
-//! | [`auth`] | Bearer, Basic and JWT (feature `jwt`) authentication |
+//! | [`auth`] | Bearer, Basic, API key (feature `api-keys`) and JWT (feature `jwt`) authentication |
+//! | [`cache`] | `Cache-Control`, ETags and `304 Not Modified` for API responses |
+//! | [`locale`] | The best supported language per request, from `Accept-Language` |
+//! | [`host`] | Routes per host and subdomain, and custom domains resolved at runtime |
 //! | `cookies`, `session`, `csrf` | Signed/encrypted cookies, sessions, CSRF protection (feature `cookies`) |
 //! | [`config`] | Typed configuration from environment variables and `.env` |
 //! | `templates` | HTML templates (feature `templates`) |
@@ -100,8 +103,9 @@
 //!
 //! All on by default: `tls` (HTTPS via rustls), `compression` (gzip/deflate
 //! middleware), `ws` (WebSockets), `multipart` (streaming uploads),
-//! `cookies` (cookies, sessions, CSRF), `jwt` (JSON Web Tokens) and
-//! `templates` (HTML templates).
+//! `cookies` (cookies, sessions, CSRF), `jwt` (JSON Web Tokens),
+//! `api-keys` (API key authentication), `idempotency` (`Idempotency-Key`
+//! middleware) and `templates` (HTML templates).
 //!
 //! See the [README](https://github.com/axeon-rs/axeon#readme) for a full
 //! guide and the [changelog](https://github.com/axeon-rs/axeon/blob/master/CHANGELOG.md)
@@ -113,6 +117,7 @@ pub extern crate serde_json;
 pub(crate) mod app;
 pub mod auth;
 pub mod body;
+pub mod cache;
 pub mod config;
 #[cfg(feature = "cookies")]
 pub mod cookies;
@@ -120,7 +125,9 @@ pub mod cookies;
 pub mod csrf;
 pub(crate) mod error;
 pub(crate) mod handler;
+pub mod host;
 mod lifecycle;
+pub mod locale;
 mod static_files;
 pub(crate) mod message;
 pub mod broadcast;
@@ -146,7 +153,7 @@ mod tls;
 pub use app::{shutdown_signal, App, Server};
 pub use crate::tower::AppService;
 pub use lifecycle::Shutdown;
-pub use router::{RouteBuilder, RouteInfo, Router};
+pub use router::{MatchedRoute, RouteBuilder, RouteInfo, Router};
 
 pub use crate::error::{ServerError, ServerResult};
 pub use crate::handler::{Html, IntoResponse, Json};
@@ -170,7 +177,9 @@ pub use serde_json::{json, Value};
     feature = "multipart",
     feature = "cookies",
     feature = "jwt",
-    feature = "templates"
+    feature = "templates",
+    feature = "api-keys",
+    feature = "idempotency"
 ))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;

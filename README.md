@@ -246,10 +246,15 @@ app.get("/", |req| async move { req.state::<Config>().map(|config| config.greeti
 |---|---|
 | `middleware::SecurityHeaders` | HSTS, nosniff, frame options, referrer and cross-origin policies, CSP |
 | `middleware::Cors` | CORS headers and preflights |
-| `middleware::RateLimiter` | Token bucket per IP, API key or user, with `Retry-After` |
+| `middleware::RateLimiter` | GCRA or daily quotas per IP, API key or user, plan-based limits, `RateLimit-*` and `Retry-After` headers; shared across instances with `axeon_redis::RedisRateLimitStore` |
+| `middleware::idempotency::Idempotency` | `Idempotency-Key`: retries replay the first response; memory, Redis or PostgreSQL store |
 | `middleware::Compression` | gzip/deflate |
+| `cache::ConditionalGet` | ETags, `Cache-Control` and `304 Not Modified` for API responses |
+| `locale::Locales` | The best supported language per request (`Accept-Language`, `?lang=`, cookie) |
 | `middleware::SetRequestId`, `RequestLogger` | Request IDs and structured logs |
 | `auth::BearerAuth`, `auth::BasicAuth`, `auth::jwt::Jwt` | Authentication |
+| `auth::api_key::ApiKeyAuth` | API keys: hashed, constant-time checked, cached, with scopes and batched `last_used_at` |
+| `auth::require_scope`, `auth::require_role` | Authorization guards over the caller's `Grants` (401 / 403) |
 | `cookies::CookieManager` | Cookie jar with signed and encrypted cookies |
 | `session::Sessions` | Server-side sessions |
 | `csrf::Csrf` | CSRF protection for forms and SPAs |
@@ -328,6 +333,143 @@ app.mount("/api", api);
 
 `BearerAuth` checks opaque tokens with your own async lookup, and
 `BasicAuth` protects internal tools.
+
+For public APIs, `ApiKeyAuth` handles API keys end to end:
+
+```rust
+use axeon::auth::api_key::{generate_key, ApiKey, ApiKeyAuth, ApiKeyRecord, KeyHash};
+use axeon::Server;
+use std::time::Duration;
+# use axeon::ServerError;
+# #[derive(Clone)] struct Org { id: i64 }
+# struct StoredKey { hash: KeyHash, scopes: Vec<String>, org: Org }
+# async fn find_key(_id: &str) -> Result<Option<StoredKey>, ServerError> { Ok(None) }
+# async fn touch_last_used(_ids: Vec<String>) {}
+
+// When a customer creates a key, show `new.key` once and store
+// `new.id` and `new.hash.to_hex()`.
+let new = generate_key("vs_live"); // vs_live_<id>_<secret>
+
+let mut app = Server::new();
+app.middleware(
+    ApiKeyAuth::new("vs_live", |id: String| async move {
+        // Look the key up by ID, not by secret; None if unknown or revoked.
+        let key = find_key(&id).await?;
+        Ok(key.map(|k| ApiKeyRecord { hash: k.hash, scopes: k.scopes, identity: k.org }))
+    })
+    .on_used(Duration::from_secs(60), |ids| async move { touch_last_used(ids).await }),
+);
+app.get("/v1/products", |req| async move {
+    let key = req.extension::<ApiKey>().unwrap(); // id and scopes
+    let org = req.extension::<Org>().unwrap();
+    format!("{} for org {}", key.id, org.id)
+});
+```
+
+Keys are sent as `Authorization: Bearer` or `X-API-Key` and compared by
+SHA-256 hash in constant time. Lookups are cached for 60 seconds
+(`cache_ttl`), which is also how long a revoked key keeps working.
+
+Authentication attaches the caller's `Grants` (scopes and roles):
+`ApiKeyAuth` does it from the key's scopes, and your own JWT or session
+middleware can insert `Grants::new().scopes_from(&claims.scope).role("buyer")`.
+Guards then protect routes or whole routers:
+
+```rust
+use axeon::auth::{require_role, require_scope};
+use axeon::{Router, Server, ServerError};
+
+let mut app = Server::new();
+app.route("/v1/products").middleware(require_scope("catalog:read")).get(|_req| async { "[]" });
+
+let mut ops = Router::new();
+ops.middleware(require_role("operator"));
+ops.get("/cases", |_req| async { "[]" });
+app.mount("/ops", ops);
+
+// Or inside a handler, when the check depends on the request:
+app.post("/v1/exports", |req| async move {
+    req.require_scope("catalog:export")?;
+    Ok::<_, ServerError>("started")
+});
+```
+
+Without `Grants` a guard answers 401; without the scope or role, 403
+(with an RFC 6750 `insufficient_scope` challenge for scopes). A granted
+`catalog:*` covers every `catalog:` scope.
+
+### Caching API responses
+
+```rust
+use axeon::cache::{CacheControl, ConditionalGet, ETag};
+use axeon::{Response, Server, ServerError};
+
+let mut app = Server::new();
+// Weak ETags from bodies and 304 for If-None-Match; the handler still runs.
+app.middleware(ConditionalGet::new().cache_control(CacheControl::revalidate()));
+
+// To skip the work too, compare a cheap validator such as a version column.
+app.get("/v1/products/:id", |req| async move {
+    let etag = ETag::strong(format!("{}-v{}", req.param::<i64>("id")?, 7));
+    if req.is_fresh(Some(&etag), None) {
+        return Ok(Response::not_modified(&etag));
+    }
+    Ok::<_, ServerError>(Response::text("...the product JSON...").with_etag(&etag))
+});
+```
+
+`CacheControl` builds the header (`public`, `private`, `max-age`,
+`s-maxage`, `no-cache`, `stale-while-revalidate`...), and
+`with_last_modified` enables `If-Modified-Since`. Add `ConditionalGet`
+after `Compression`, so ETags describe the uncompressed data.
+
+### Hosts and custom domains
+
+```rust
+use axeon::host::ResolveHost;
+use axeon::{Router, Server, ServerError};
+
+#[derive(Clone)]
+struct Storefront { id: i64 }
+
+let mut stores = Router::new();
+stores.get("/", |req| async move { format!("store {}", req.subdomain().unwrap_or("")) });
+
+let mut app = Server::new();
+app.host("*.stores.example.com", stores);   // acme.stores.example.com → "acme"
+app.get("/", |_req| async { "main site" }); // every other host
+
+// Customers' own domains, looked up at runtime (cached for a minute):
+app.middleware(
+    ResolveHost::new(|host: String| async move {
+        Ok::<_, ServerError>((host == "shop.acme.com").then_some(Storefront { id: 7 }))
+    })
+    .skip(["example.com", "acme.stores.example.com"]),
+);
+```
+
+A host's router owns that host (no fallthrough to the main routes), body
+limits follow its routes, and global middleware runs for every host.
+`req.host()` gives the requested host, lowercased and without the port.
+
+### Languages
+
+```rust
+use axeon::locale::Locales;
+use axeon::Server;
+
+let mut app = Server::new();
+app.middleware(Locales::new(["en", "zh-CN"]).query_param("lang").cookie("lang"));
+app.get("/v1/products/:id", |req| async move {
+    let locale = req.locale().map(|l| l.as_str()).unwrap_or("en"); // "en" or "zh-CN"
+    format!("product text in {}", locale)
+});
+```
+
+`Accept-Language` is matched by quality with RFC 4647 fallback
+(`zh-Hant-TW` → `zh-Hant` → `zh`, and `zh` matches `zh-CN`); the query
+parameter or cookie, when set to a supported language, wins. Responses get
+`Content-Language` and `Vary: Accept-Language`.
 
 ### Cookies, sessions and CSRF
 
@@ -419,10 +561,12 @@ Optional crates that build on Axeon, each versioned on its own:
 | Crate | What it does |
 |---|---|
 | [axeon-orm](axeon-orm) | Models, typed queries, relations, migrations, search and pgvector |
-| [axeon-jobs](axeon-jobs) | Background jobs on PostgreSQL: retries, delays, unique jobs, graceful shutdown |
-| [axeon-redis](axeon-redis) | A shared session store and a broadcast backend on Redis |
+| [axeon-jobs](axeon-jobs) | Background jobs on PostgreSQL: retries, delays, unique jobs, cron schedules, priorities |
+| [axeon-redis](axeon-redis) | Shared sessions, rate limits, idempotency keys and broadcast on Redis |
 | [axeon-openapi](axeon-openapi) | OpenAPI 3.1 documents generated from your routes and Rust types |
 | [axeon-client](axeon-client) | An outbound HTTP client with SSRF protection, retries and circuit breaking |
+| [axeon-otel](axeon-otel) | OpenTelemetry: a server span per request, W3C trace context, OTLP export |
+| [axeon-webhooks](axeon-webhooks) | Signed webhooks: HMAC-SHA256 with timestamps, replay protection and secret rotation |
 
 ### Templates, static files and uploads
 
@@ -654,6 +798,8 @@ you need (a minimal build compiles about half as many crates):
 | `multipart` | Streaming multipart uploads |
 | `cookies` | Cookies, sessions and CSRF protection |
 | `jwt` | JSON Web Tokens |
+| `api-keys` | API keys (`auth::api_key`) |
+| `idempotency` | `Idempotency-Key` middleware |
 | `templates` | HTML templates (minijinja) |
 
 ## Examples

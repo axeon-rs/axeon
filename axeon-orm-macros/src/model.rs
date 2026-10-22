@@ -32,6 +32,8 @@ struct FieldAttrs {
     on_delete: Option<LitStr>,
     skip: bool,
     dimensions: Option<syn::LitInt>,
+    tenant: bool,
+    version: bool,
 }
 
 struct Field {
@@ -139,6 +141,10 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                     attrs.on_delete = Some(action);
                 } else if path.is_ident("skip") {
                     attrs.skip = true;
+                } else if path.is_ident("tenant") {
+                    attrs.tenant = true;
+                } else if path.is_ident("version") {
+                    attrs.version = true;
                 } else if path.is_ident("dimensions") {
                     let lit: syn::LitInt = meta.value()?.parse()?;
                     let n: u32 = lit.base10_parse()?;
@@ -148,7 +154,7 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                     attrs.dimensions = Some(lit);
                 } else {
                     return Err(meta.error(
-                        "expected primary_key, column, unique, index, default, created_at, updated_at, belongs_to, on_delete, skip or dimensions",
+                        "expected primary_key, column, unique, index, default, created_at, updated_at, belongs_to, on_delete, skip, dimensions, tenant or version",
                     ));
                 }
                 Ok(())
@@ -157,8 +163,14 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         if attrs.on_delete.is_some() && attrs.belongs_to.is_none() {
             return Err(Error::new_spanned(&ident, "`on_delete` needs `belongs_to`"));
         }
-        if attrs.skip && (attrs.primary_key || attrs.belongs_to.is_some()) {
+        if attrs.skip && (attrs.primary_key || attrs.belongs_to.is_some() || attrs.tenant) {
             return Err(Error::new_spanned(&ident, "a `skip` field can't be a key"));
+        }
+        if attrs.tenant && attrs.primary_key {
+            return Err(Error::new_spanned(&ident, "the tenant column can't be the primary key"));
+        }
+        if attrs.version && (attrs.primary_key || attrs.tenant || attrs.skip) {
+            return Err(Error::new_spanned(&ident, "the version column can't be the primary key, the tenant column or skipped"));
         }
         let column = attrs.column.as_ref().map(LitStr::value).unwrap_or_else(|| unraw(&ident));
         fields.push(Field { ident, ty: field.ty.clone(), column, attrs });
@@ -172,18 +184,96 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         }
     }
 
-    let explicit: Vec<&&Field> = columns.iter().filter(|f| f.attrs.primary_key).collect();
-    let pk = match explicit.as_slice() {
-        [one] => **one,
-        [] => *columns.iter().find(|f| f.ident == "id").ok_or_else(|| {
+    let explicit: Vec<&Field> = columns.iter().filter(|f| f.attrs.primary_key).copied().collect();
+    let pks: Vec<&Field> = match explicit.as_slice() {
+        [] => vec![*columns.iter().find(|f| f.ident == "id").ok_or_else(|| {
             Error::new(Span::call_site(), "add an `id` field or mark the primary key with #[model(primary_key)]")
-        })?,
-        [_, second, ..] => {
-            return Err(Error::new_spanned(&second.ident, "only one primary key is supported"));
+        })?],
+        _ => explicit,
+    };
+    let composite = pks.len() > 1;
+    if composite {
+        if let Some(relation) = relations.first() {
+            return Err(Error::new_spanned(
+                &relation.target,
+                "a model with a composite primary key can't have has_many, has_one or belongs_to_many relations",
+            ));
+        }
+    }
+    let pk = pks[0];
+    let find_methods = if composite {
+        let params: Vec<Ident> = (0..pks.len()).map(|i| format_ident!("k{}", i)).collect();
+        let tys: Vec<&Type> = pks.iter().map(|f| &f.ty).collect();
+        let columns: Vec<&str> = pks.iter().map(|f| f.column.as_str()).collect();
+        let doc = format!("The key: `({})`.", columns.join(", "));
+        quote! {
+            /// Fetches the row with this primary key.
+            #[doc = #doc]
+            pub async fn find<'c>(
+                ex: impl ::axeon_orm::Executor<'c>,
+                key: (#(impl ::core::convert::Into<#tys>),*),
+            ) -> ::axeon_orm::Result<::core::option::Option<Self>> {
+                let (#(#params),*) = key;
+                let values = ::std::vec![#(::axeon_orm::SqlType::to_value(&::core::convert::Into::<#tys>::into(#params))),*];
+                ::axeon_orm::__private::find_by_key(ex, values).await
+            }
+
+            /// Fetches the row with this primary key, or fails with `Error::NotFound`.
+            pub async fn find_or_fail<'c>(
+                ex: impl ::axeon_orm::Executor<'c>,
+                key: (#(impl ::core::convert::Into<#tys>),*),
+            ) -> ::axeon_orm::Result<Self> {
+                Self::find(ex, key).await?.ok_or(::axeon_orm::Error::NotFound)
+            }
+        }
+    } else {
+        let pk_ty = &pk.ty;
+        quote! {
+            /// Fetches the row with this primary key.
+            pub async fn find<'c>(
+                ex: impl ::axeon_orm::Executor<'c>,
+                key: impl ::core::convert::Into<#pk_ty>,
+            ) -> ::axeon_orm::Result<::core::option::Option<Self>> {
+                ::axeon_orm::__private::find(ex, ::axeon_orm::SqlType::to_value(&key.into())).await
+            }
+
+            /// Fetches the row with this primary key, or fails with `Error::NotFound`.
+            pub async fn find_or_fail<'c>(
+                ex: impl ::axeon_orm::Executor<'c>,
+                key: impl ::core::convert::Into<#pk_ty>,
+            ) -> ::axeon_orm::Result<Self> {
+                Self::find(ex, key).await?.ok_or(::axeon_orm::Error::NotFound)
+            }
         }
     };
     let pk_column = &pk.column;
-    let pk_ty = &pk.ty;
+    let pk_columns: Vec<&String> = pks.iter().map(|f| &f.column).collect();
+
+    let tenants: Vec<&&Field> = columns.iter().filter(|f| f.attrs.tenant).collect();
+    let tenant = match tenants.as_slice() {
+        [] => quote! { ::core::option::Option::None },
+        [one] => {
+            let column = &one.column;
+            quote! { ::core::option::Option::Some(#column) }
+        }
+        [_, second, ..] => return Err(Error::new_spanned(&second.ident, "only one tenant column is supported")),
+    };
+
+    let versions: Vec<&&Field> = columns.iter().filter(|f| f.attrs.version).collect();
+    let (version, version_check) = match versions.as_slice() {
+        [] => (quote! { ::core::option::Option::None }, quote! {}),
+        [one] => {
+            let (column, ty) = (&one.column, &one.ty);
+            let check = quote! {
+                const _: () = ::core::assert!(
+                    <#ty as ::axeon_orm::SqlType>::KIND.is_integer() && !<#ty as ::axeon_orm::SqlType>::NULLABLE,
+                    "a #[model(version)] column must be a non-nullable i32 or i64"
+                );
+            };
+            (quote! { ::core::option::Option::Some(#column) }, check)
+        }
+        [_, second, ..] => return Err(Error::new_spanned(&second.ident, "only one version column is supported")),
+    };
 
     // impl Model.
     let column_defs = columns.iter().map(|f| {
@@ -192,8 +282,11 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
             ::axeon_orm::ColumnDef::new(#col, <#ty as ::axeon_orm::SqlType>::KIND, <#ty as ::axeon_orm::SqlType>::NULLABLE)
                 .values(<#ty as ::axeon_orm::SqlType>::VALUES)
         };
-        if std::ptr::eq(*f, pk) {
+        if pks.iter().any(|k| std::ptr::eq(*k, *f)) {
             def = quote! { #def.primary_key() };
+            if composite {
+                def = quote! { #def.composite_key() };
+            }
         }
         if f.attrs.unique {
             def = quote! { #def.unique() };
@@ -283,6 +376,10 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
             let related_key =
                 relation.related_key.as_ref().map(LitStr::value).unwrap_or_else(|| format!("{}_id", target_snake));
             let doc = format!("The `{}` records linked to this one through `{}`.", target_name, pivot);
+            let message = format!("{}::{}: belongs_to_many needs a model with a single-column primary key", name, accessor);
+            assertions.push(quote! {
+                assert!(<#target as ::axeon_orm::Model>::PRIMARY_KEYS.len() == 1, #message);
+            });
             relation_items.push(quote! {
                 #[doc = #doc]
                 pub const #const_ident: ::axeon_orm::BelongsToMany<Self, #target> =
@@ -321,6 +418,10 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         let const_ident = format_ident!("{}", accessor.to_uppercase());
         let col = &field.column;
         let doc = format!("The record `{}` points to.", col);
+        let message = format!("{}.{}: belongs_to needs a model with a single-column primary key", name, col);
+        assertions.push(quote! {
+            assert!(<#target as ::axeon_orm::Model>::PRIMARY_KEYS.len() == 1, #message);
+        });
         relation_items.push(quote! {
             #[doc = #doc]
             pub const #const_ident: ::axeon_orm::BelongsTo<Self, #target> = ::axeon_orm::BelongsTo::new(#col);
@@ -336,7 +437,10 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
         impl ::axeon_orm::Model for #name {
             const TABLE: &'static str = #table;
             const PRIMARY_KEY: &'static str = #pk_column;
+            const PRIMARY_KEYS: &'static [&'static str] = &[#(#pk_columns),*];
             const COLUMNS: &'static [::axeon_orm::ColumnDef] = &[#(#column_defs),*];
+            const TENANT: ::core::option::Option<&'static str> = #tenant;
+            const VERSION: ::core::option::Option<&'static str> = #version;
 
             fn from_row_prefixed(row: &::axeon_orm::Row, prefix: &str) -> ::axeon_orm::Result<Self> {
                 ::core::result::Result::Ok(Self { #(#decode),* })
@@ -350,6 +454,8 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
             }
         }
 
+        #version_check
+
         #[allow(dead_code)]
         impl #name {
             #(#column_consts)*
@@ -360,21 +466,7 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream> {
                 ::axeon_orm::Query::new()
             }
 
-            /// Fetches the row with this primary key.
-            pub async fn find<'c>(
-                ex: impl ::axeon_orm::Executor<'c>,
-                key: impl ::core::convert::Into<#pk_ty>,
-            ) -> ::axeon_orm::Result<::core::option::Option<Self>> {
-                ::axeon_orm::__private::find(ex, ::axeon_orm::SqlType::to_value(&key.into())).await
-            }
-
-            /// Fetches the row with this primary key, or fails with `Error::NotFound`.
-            pub async fn find_or_fail<'c>(
-                ex: impl ::axeon_orm::Executor<'c>,
-                key: impl ::core::convert::Into<#pk_ty>,
-            ) -> ::axeon_orm::Result<Self> {
-                Self::find(ex, key).await?.ok_or(::axeon_orm::Error::NotFound)
-            }
+            #find_methods
 
             /// Fetches every row.
             pub async fn all<'c>(ex: impl ::axeon_orm::Executor<'c>) -> ::axeon_orm::Result<::std::vec::Vec<Self>> {

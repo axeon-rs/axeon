@@ -26,6 +26,21 @@ pub enum Error {
     },
     /// A migration failed or doesn't match what was applied before.
     Migration(String),
+    /// A pagination cursor from a client is damaged or was made for a
+    /// different sort order.
+    InvalidCursor(String),
+    /// A tenant-scoped model was used through a [`Db`](crate::Db) or
+    /// transaction with no tenant scope: a bug, since it could have leaked
+    /// another tenant's rows.
+    TenantScope(String),
+    /// The database cancelled a statement that ran longer than its
+    /// [statement timeout](crate::DbOptions::statement_timeout).
+    StatementTimeout(String),
+    /// The row changed since it was loaded: its `#[model(version)]` column
+    /// no longer matches. Reload it and try again.
+    StaleRecord(String),
+    /// A write named a row of another tenant than the scope's.
+    WrongTenant(String),
     /// Bad configuration, e.g. an unsupported database URL.
     Config(String),
     /// The transaction was already committed, rolled back, or is in use.
@@ -49,6 +64,11 @@ impl fmt::Display for Error {
             Error::LockNotAvailable(msg) => write!(f, "row lock not available: {}", msg),
             Error::Decode { column, message } => write!(f, "cannot decode column `{}`: {}", column, message),
             Error::Migration(msg) => write!(f, "migration error: {}", msg),
+            Error::InvalidCursor(msg) => write!(f, "invalid cursor: {}", msg),
+            Error::TenantScope(msg) => write!(f, "missing tenant scope: {}", msg),
+            Error::WrongTenant(msg) => write!(f, "wrong tenant: {}", msg),
+            Error::StaleRecord(msg) => write!(f, "stale record: {}", msg),
+            Error::StatementTimeout(msg) => write!(f, "statement timed out: {}", msg),
             Error::Config(msg) => write!(f, "configuration error: {}", msg),
             Error::Transaction(msg) => write!(f, "transaction error: {}", msg),
             Error::Database(error) => write!(f, "database error: {}", error),
@@ -74,6 +94,7 @@ impl From<sqlx::Error> for Error {
                 Error::ForeignKeyViolation(db.message().to_string())
             }
             sqlx::Error::Database(db) if is_lock_not_available(&*db) => Error::LockNotAvailable(db.message().to_string()),
+            sqlx::Error::Database(db) if is_statement_timeout(&*db) => Error::StatementTimeout(db.message().to_string()),
             sqlx::Error::ColumnDecode { index, source } => Error::Decode { column: index, message: source.to_string() },
             error => Error::Database(error),
         }
@@ -88,4 +109,14 @@ fn is_lock_not_available(error: &dyn sqlx::error::DatabaseError) -> bool {
         return error.number() == 3572;
     }
     error.code().as_deref() == Some("55P03")
+}
+
+/// PostgreSQL's `query_canceled` (57014, raised by `statement_timeout`), or
+/// MySQL's `ER_QUERY_TIMEOUT` (3024, from `max_execution_time`).
+fn is_statement_timeout(error: &dyn sqlx::error::DatabaseError) -> bool {
+    #[cfg(feature = "mysql")]
+    if let Some(error) = error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>() {
+        return error.number() == 3024;
+    }
+    error.code().as_deref() == Some("57014")
 }

@@ -3,7 +3,7 @@
 use crate::db::{Backend, Conn, Executor, Row};
 use crate::error::{Error, Result};
 use crate::query::Column;
-use crate::sql::{column_list, Sql};
+use crate::sql::{column_list, Cond, Sql};
 use crate::value::{Kind, Value};
 use std::borrow::Cow;
 use std::marker::PhantomData;
@@ -32,10 +32,22 @@ use std::marker::PhantomData;
 pub trait Model: Sized + Send + Sync + Unpin + 'static {
     /// The table name.
     const TABLE: &'static str;
-    /// The primary key column.
+    /// The primary key column (the first one, for a composite key).
     const PRIMARY_KEY: &'static str;
+    /// Every primary key column: one, or several for a composite key
+    /// (several `#[model(primary_key)]` fields).
+    const PRIMARY_KEYS: &'static [&'static str] = &[Self::PRIMARY_KEY];
     /// Every column, in field order.
     const COLUMNS: &'static [ColumnDef];
+    /// The tenant column (`#[model(tenant)]`), if rows belong to tenants.
+    /// Queries on such a model then need a tenant scope; see
+    /// [`Db::for_tenant`](crate::Db::for_tenant).
+    const TENANT: Option<&'static str> = None;
+    /// The optimistic-locking version column (`#[model(version)]`), if
+    /// any: updates and deletes of an instance only apply while the stored
+    /// version still matches, and fail with
+    /// [`Error::StaleRecord`](crate::Error::StaleRecord) otherwise.
+    const VERSION: Option<&'static str> = None;
     /// Builds the model from a row holding all of its columns.
     fn from_row(row: &Row) -> Result<Self> {
         Self::from_row_prefixed(row, "")
@@ -130,6 +142,12 @@ impl ColumnDef {
     }
 
     #[doc(hidden)]
+    pub const fn composite_key(mut self) -> Self {
+        self.auto_increment = false;
+        self
+    }
+
+    #[doc(hidden)]
     pub const fn unique(mut self) -> Self {
         self.unique = true;
         self
@@ -203,10 +221,23 @@ fn value_of<M: Model>(model: &M, column: &'static str) -> Value {
     model.get(column).unwrap_or_else(|| panic!("{} has no column `{}`", std::any::type_name::<M>(), column))
 }
 
+/// The row whose `column` equals `key`, within the tenant scope.
 pub(crate) async fn fetch_one_where<M: Model>(conn: &mut Conn<'_>, column: &'static str, key: Value) -> Result<Option<M>> {
+    fetch_one_by(conn, vec![Cond::Compare(column, "=", key)]).await
+}
+
+/// `key column = value` for every primary key column of `model`.
+fn key_conds<M: Model>(model: &M) -> Vec<Cond> {
+    M::PRIMARY_KEYS.iter().map(|column| Cond::Compare(column, "=", value_of(model, column))).collect()
+}
+
+/// The first row matching `conds`, within the tenant scope.
+async fn fetch_one_by<M: Model>(conn: &mut Conn<'_>, mut conds: Vec<Cond>) -> Result<Option<M>> {
+    conds.extend(conn.scope().filter_for::<M>()?);
     let mut sql = Sql::new(conn.backend());
     sql.push("SELECT ").push(&column_list::<M>(conn.backend())).push(" FROM ").ident(M::TABLE);
-    sql.push(" WHERE ").ident(column).push(" = ").arg(key).push(" LIMIT 1");
+    sql.where_clause(&conds);
+    sql.push(" LIMIT 1");
     let (sql, args) = sql.finish();
     conn.fetch_optional(sql, args).await?.map(|row| M::from_row(&row)).transpose()
 }
@@ -214,6 +245,13 @@ pub(crate) async fn fetch_one_where<M: Model>(conn: &mut Conn<'_>, column: &'sta
 #[doc(hidden)]
 pub async fn find<'c, M: Model>(ex: impl Executor<'c>, key: Value) -> Result<Option<M>> {
     fetch_one_where(&mut ex.into_conn(), M::PRIMARY_KEY, key).await
+}
+
+/// Fetches by a composite key: one value per primary key column, in order.
+#[doc(hidden)]
+pub async fn find_by_key<'c, M: Model>(ex: impl Executor<'c>, key: Vec<Value>) -> Result<Option<M>> {
+    let conds = M::PRIMARY_KEYS.iter().zip(key).map(|(column, value)| Cond::Compare(column, "=", value)).collect();
+    fetch_one_by(&mut ex.into_conn(), conds).await
 }
 
 /// The columns an `INSERT` writes and their values: all but
@@ -256,6 +294,8 @@ fn write_insert<M: Model>(sql: &mut Sql, backend: Backend, values: Vec<(&'static
 #[doc(hidden)]
 pub async fn insert<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M> {
     let mut conn = ex.into_conn();
+    conn.writable()?;
+    conn.scope().check_row(model)?;
     let backend = conn.backend();
     let mut sql = Sql::new(backend);
     write_insert::<M>(&mut sql, backend, insert_values(model));
@@ -273,8 +313,7 @@ pub async fn insert<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M>
 async fn insert_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, model: &M) -> Result<M> {
     let (sql, args) = sql.finish();
     let id = conn.insert_mysql(sql, args).await?;
-    let key = mysql_key(model, id);
-    fetch_one_where(conn, M::PRIMARY_KEY, key).await?.ok_or(Error::NotFound)
+    fetch_one_by(conn, mysql_key(model, id)).await?.ok_or(Error::NotFound)
 }
 
 #[cfg(not(feature = "mysql"))]
@@ -282,15 +321,15 @@ async fn insert_mysql<M: Model>(_: &mut Conn<'_>, _: Sql, _: &M) -> Result<M> {
     unreachable!("MySQL connections need the `mysql` feature")
 }
 
-/// The primary key of a row MySQL just wrote: `id` from `LAST_INSERT_ID()`
-/// for an auto-increment key, else the model's own key.
+/// The key of a row MySQL just wrote, as conditions: `id` from
+/// `LAST_INSERT_ID()` for an auto-increment key, else the model's own key.
 #[cfg(feature = "mysql")]
-fn mysql_key<M: Model>(model: &M, id: u64) -> Value {
+fn mysql_key<M: Model>(model: &M, id: u64) -> Vec<Cond> {
     let pk = primary_key::<M>();
     match (pk.auto_increment, pk.kind) {
-        (true, Kind::I32) => Value::I32(id as i32),
-        (true, _) => Value::I64(id as i64),
-        (false, _) => value_of(model, pk.name),
+        (true, Kind::I32) => vec![Cond::Compare(pk.name, "=", Value::I32(id as i32))],
+        (true, _) => vec![Cond::Compare(pk.name, "=", Value::I64(id as i64))],
+        (false, _) => key_conds(model),
     }
 }
 
@@ -363,6 +402,72 @@ fn write_conflict_target<M>(sql: &mut Sql, backend: Backend, conflict: &OnConfli
 #[doc(hidden)]
 pub async fn upsert<'c, M: Model>(ex: impl Executor<'c>, model: &M, conflict: &OnConflict<M>) -> Result<M> {
     let mut conn = ex.into_conn();
+    conn.writable()?;
+    conn.scope().check_row(model)?;
+    let guard = conn.scope().filter_for::<M>()?;
+    let result = upsert_scoped(&mut conn, model, conflict, guard.is_some()).await;
+    match result {
+        // The conflicting row belongs to another tenant, so it was left alone.
+        Err(Error::NotFound) if guard.is_some() => Err(other_tenants_row::<M>()),
+        result => result,
+    }
+}
+
+fn other_tenants_row<M: Model>() -> Error {
+    Error::WrongTenant(format!("a `{}` row with the same key belongs to another tenant", M::TABLE))
+}
+
+/// `col = excluded.col` on conflict (and `version = version + 1`); with a
+/// tenant column, only when the existing row has the same tenant (else the
+/// row is left as it is).
+fn write_conflict_update<M: Model>(sql: &mut Sql, backend: Backend, update: &[&'static str], guarded: bool) {
+    let tenant = M::TENANT.filter(|_| guarded);
+    let mut update: Vec<&'static str> = update.iter().copied().filter(|c| Some(*c) != M::VERSION).collect();
+    update.extend(M::VERSION);
+    let excluded = crate::sql::ident(backend, "excluded");
+    // The value a column gets: the new row's, or the bumped version.
+    let new_value = |sql: &mut Sql, column: &str| {
+        if Some(column) == M::VERSION {
+            sql.ident(M::TABLE).push(".").ident(column).push(" + 1");
+        } else {
+            sql.push(&excluded).push(".").ident(column);
+        }
+    };
+    if backend == Backend::MySql {
+        sql.push(" AS ").push(&excluded).push(" ON DUPLICATE KEY UPDATE ");
+        for (i, column) in update.iter().enumerate() {
+            if i > 0 {
+                sql.push(", ");
+            }
+            sql.ident(column).push(" = ");
+            match tenant {
+                // Assignments run left to right and the tenant column never
+                // changes here, so it compares the existing row's tenant.
+                Some(tenant) => {
+                    sql.push("IF(").ident(M::TABLE).push(".").ident(tenant).push(" <=> ").push(&excluded).push(".").ident(tenant);
+                    sql.push(", ");
+                    new_value(sql, column);
+                    sql.push(", ").ident(M::TABLE).push(".").ident(column).push(")");
+                }
+                None => new_value(sql, column),
+            }
+        }
+        return;
+    }
+    sql.push(" DO UPDATE SET ");
+    for (i, column) in update.iter().enumerate() {
+        if i > 0 {
+            sql.push(", ");
+        }
+        sql.ident(column).push(" = ");
+        new_value(sql, column);
+    }
+    if let Some(tenant) = tenant {
+        sql.push(" WHERE ").ident(M::TABLE).push(".").ident(tenant).push(" = ").ident("excluded").push(".").ident(tenant);
+    }
+}
+
+async fn upsert_scoped<M: Model>(conn: &mut Conn<'_>, model: &M, conflict: &OnConflict<M>, guarded: bool) -> Result<M> {
     let backend = conn.backend();
     let inserted = insert_values(model);
     let mut update = conflict.update_columns(&inserted);
@@ -374,28 +479,15 @@ pub async fn upsert<'c, M: Model>(ex: impl Executor<'c>, model: &M, conflict: &O
     write_insert::<M>(&mut sql, backend, inserted);
     let pk = primary_key::<M>();
     if backend == Backend::MySql {
+        write_conflict_update::<M>(&mut sql, backend, &update, guarded);
         // `LAST_INSERT_ID(id)` makes an update report the existing row's id.
-        let new = crate::sql::ident(backend, "excluded");
-        sql.push(" AS ").push(&new).push(" ON DUPLICATE KEY UPDATE ");
-        for (i, column) in update.iter().enumerate() {
-            if i > 0 {
-                sql.push(", ");
-            }
-            sql.ident(column).push(" = ").push(&new).push(".").ident(column);
-        }
         if pk.auto_increment {
             sql.push(", ").ident(pk.name).push(" = LAST_INSERT_ID(").ident(pk.name).push(")");
         }
-        return upsert_mysql(&mut conn, sql, model, conflict).await;
+        return upsert_mysql(conn, sql, model, conflict).await;
     }
     write_conflict_target(&mut sql, backend, conflict);
-    sql.push(" DO UPDATE SET ");
-    for (i, column) in update.iter().enumerate() {
-        if i > 0 {
-            sql.push(", ");
-        }
-        sql.ident(column).push(" = ").ident("excluded").push(".").ident(column);
-    }
+    write_conflict_update::<M>(&mut sql, backend, &update, guarded);
     sql.push(" RETURNING ").push(&column_list::<M>(backend));
     let (sql, args) = sql.finish();
     let row = conn.fetch_optional(sql, args).await?.ok_or(Error::NotFound)?;
@@ -411,7 +503,7 @@ async fn upsert_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, model: &M, confli
     let id = conn.insert_mysql(sql, args).await?;
     let pk = primary_key::<M>();
     if pk.auto_increment {
-        return fetch_one_where(conn, pk.name, mysql_key(model, id)).await?.ok_or(Error::NotFound);
+        return fetch_one_by(conn, mysql_key(model, id)).await?.ok_or(Error::NotFound);
     }
     let conds = conflict.target.iter().map(|c| crate::sql::Cond::Compare(c, "=", value_of(model, c))).collect();
     crate::Query::<M>::new().cond(crate::sql::Cond::And(conds)).fetch(conn).await?.into_iter().next().ok_or(Error::NotFound)
@@ -425,6 +517,8 @@ async fn upsert_mysql<M: Model>(_: &mut Conn<'_>, _: Sql, _: &M, _: &OnConflict<
 #[doc(hidden)]
 pub async fn insert_or_ignore<'c, M: Model>(ex: impl Executor<'c>, model: &M, conflict: &OnConflict<M>) -> Result<Option<M>> {
     let mut conn = ex.into_conn();
+    conn.writable()?;
+    conn.scope().check_row(model)?;
     let backend = conn.backend();
     let mut sql = Sql::new(backend);
     write_insert::<M>(&mut sql, backend, insert_values(model));
@@ -446,7 +540,7 @@ async fn insert_or_ignore_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, model: 
     let (sql, args) = sql.finish();
     match conn.insert_mysql_unless_duplicate(sql, args).await? {
         None => Ok(None),
-        Some(id) => fetch_one_where(conn, M::PRIMARY_KEY, mysql_key(model, id)).await,
+        Some(id) => fetch_one_by(conn, mysql_key(model, id)).await,
     }
 }
 
@@ -458,49 +552,89 @@ async fn insert_or_ignore_mysql<M: Model>(_: &mut Conn<'_>, _: Sql, _: &M) -> Re
 #[doc(hidden)]
 pub async fn update<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<M> {
     let mut conn = ex.into_conn();
+    conn.writable()?;
+    conn.scope().check_row(model)?;
+    let tenant = conn.scope().filter_for::<M>()?;
     let backend = conn.backend();
     let mut sql = Sql::new(backend);
     sql.push("UPDATE ").ident(M::TABLE).push(" SET ");
     let mut first = true;
     for column in M::COLUMNS.iter().filter(|c| !c.primary_key) {
-        let value = match column.timestamp {
-            Some(Timestamp::UpdatedAt) => now(column.kind).unwrap_or_else(|| value_of(model, column.name)),
-            _ => value_of(model, column.name),
-        };
         if !first {
             sql.push(", ");
         }
         first = false;
+        if Some(column.name) == M::VERSION {
+            sql.ident(column.name).push(" = ").ident(column.name).push(" + 1");
+            continue;
+        }
+        let value = match column.timestamp {
+            Some(Timestamp::UpdatedAt) => now(column.kind).unwrap_or_else(|| value_of(model, column.name)),
+            _ => value_of(model, column.name),
+        };
         sql.ident(column.name).push(" = ").arg(value);
     }
     if first {
         // Only a primary key: nothing to change, but still check the row exists.
-        return fetch_one_where(&mut conn, M::PRIMARY_KEY, value_of(model, M::PRIMARY_KEY)).await?.ok_or(Error::NotFound);
+        return fetch_one_by(&mut conn, key_conds(model)).await?.ok_or(Error::NotFound);
     }
-    let key = value_of(model, M::PRIMARY_KEY);
-    sql.push(" WHERE ").ident(M::PRIMARY_KEY).push(" = ").arg(key.clone());
+    let key = key_conds(model);
+    // The stored row must be the tenant's too, not only the new values.
+    let mut conds = key.clone();
+    conds.extend(tenant);
+    conds.extend(version_cond(model));
+    sql.where_clause(&conds);
     if backend == Backend::MySql {
-        // No `RETURNING`, and affected rows count only changed rows: read
-        // the row back to both reload it and tell whether it exists.
+        // No `RETURNING`, and affected rows count only changed rows; with
+        // a version column every match changes it, so 0 means no match.
         let (sql, args) = sql.finish();
-        conn.execute(sql, args).await?;
-        return fetch_one_where(&mut conn, M::PRIMARY_KEY, key).await?.ok_or(Error::NotFound);
+        let changed = conn.execute(sql, args).await?;
+        if changed == 0 && M::VERSION.is_some() {
+            return Err(missing_or_stale::<M>(&mut conn, key).await);
+        }
+        return fetch_one_by(&mut conn, key).await?.ok_or(Error::NotFound);
     }
     sql.push(" RETURNING ").push(&column_list::<M>(backend));
     let (sql, args) = sql.finish();
-    let row = conn.fetch_optional(sql, args).await?.ok_or(Error::NotFound)?;
-    M::from_row(&row)
+    match conn.fetch_optional(sql, args).await? {
+        Some(row) => M::from_row(&row),
+        None => Err(missing_or_stale::<M>(&mut conn, key).await),
+    }
+}
+
+/// `version = <loaded value>`, for models with a version column.
+fn version_cond<M: Model>(model: &M) -> Option<Cond> {
+    M::VERSION.map(|column| Cond::Compare(column, "=", value_of(model, column)))
+}
+
+/// Why a keyed write matched no row: the row is gone ([`Error::NotFound`])
+/// or, with a version column, another write changed it first
+/// ([`Error::StaleRecord`]).
+async fn missing_or_stale<M: Model>(conn: &mut Conn<'_>, key: Vec<Cond>) -> Error {
+    if M::VERSION.is_none() {
+        return Error::NotFound;
+    }
+    match fetch_one_by::<M>(conn, key).await {
+        Ok(Some(_)) => Error::StaleRecord(format!("this `{}` row was changed since it was loaded", M::TABLE)),
+        Ok(None) => Error::NotFound,
+        Err(error) => error,
+    }
 }
 
 #[doc(hidden)]
 pub async fn delete<'c, M: Model>(ex: impl Executor<'c>, model: &M) -> Result<()> {
     let mut conn = ex.into_conn();
+    conn.writable()?;
+    let key = key_conds(model);
+    let mut conds = key.clone();
+    conds.extend(conn.scope().filter_for::<M>()?);
+    conds.extend(version_cond(model));
     let mut sql = Sql::new(conn.backend());
     sql.push("DELETE FROM ").ident(M::TABLE);
-    sql.push(" WHERE ").ident(M::PRIMARY_KEY).push(" = ").arg(value_of(model, M::PRIMARY_KEY));
+    sql.where_clause(&conds);
     let (sql, args) = sql.finish();
     match conn.execute(sql, args).await? {
-        0 => Err(Error::NotFound),
+        0 => Err(missing_or_stale::<M>(&mut conn, key).await),
         _ => Ok(()),
     }
 }
@@ -538,6 +672,10 @@ pub async fn upsert_many<'c, M: Model>(ex: impl Executor<'c>, models: &[M], conf
 async fn bulk<'c, M: Model>(ex: impl Executor<'c>, models: &[M], conflict: Option<&OnConflict<M>>) -> Result<Vec<M>> {
     let Some(first) = models.first() else { return Ok(Vec::new()) };
     let mut conn = ex.into_conn();
+    conn.writable()?;
+    for model in models {
+        conn.scope().check_row(model)?;
+    }
     let backend = conn.backend();
     let columns = insert_values(first).len();
     if columns == 0 {
@@ -565,6 +703,7 @@ async fn bulk<'c, M: Model>(ex: impl Executor<'c>, models: &[M], conflict: Optio
 
 async fn bulk_chunks<M: Model>(conn: &mut Conn<'_>, models: &[M], conflict: Option<&OnConflict<M>>, per_statement: usize) -> Result<Vec<M>> {
     let backend = conn.backend();
+    let guarded = conn.scope().filter_for::<M>()?.is_some();
     let pk = primary_key::<M>();
     let mut stored = Vec::with_capacity(models.len());
     for chunk in models.chunks(per_statement) {
@@ -596,25 +735,10 @@ async fn bulk_chunks<M: Model>(conn: &mut Conn<'_>, models: &[M], conflict: Opti
             sql.push(")");
         }
         if let (Some(conflict), Some(update)) = (conflict, &update) {
-            if backend == Backend::MySql {
-                let new = crate::sql::ident(backend, "excluded");
-                sql.push(" AS ").push(&new).push(" ON DUPLICATE KEY UPDATE ");
-                for (i, column) in update.iter().enumerate() {
-                    if i > 0 {
-                        sql.push(", ");
-                    }
-                    sql.ident(column).push(" = ").push(&new).push(".").ident(column);
-                }
-            } else {
+            if backend != Backend::MySql {
                 write_conflict_target(&mut sql, backend, conflict);
-                sql.push(" DO UPDATE SET ");
-                for (i, column) in update.iter().enumerate() {
-                    if i > 0 {
-                        sql.push(", ");
-                    }
-                    sql.ident(column).push(" = ").ident("excluded").push(".").ident(column);
-                }
             }
+            write_conflict_update::<M>(&mut sql, backend, update, guarded);
         }
 
         let fetched: Vec<M> = if backend == Backend::MySql {
@@ -624,6 +748,10 @@ async fn bulk_chunks<M: Model>(conn: &mut Conn<'_>, models: &[M], conflict: Opti
             let (text, args) = sql.finish();
             conn.fetch_all(text, args).await?.iter().map(M::from_row).collect::<Result<_>>()?
         };
+        if guarded && conflict.is_some() && fetched.len() < chunk.len() {
+            // Rows of another tenant with the same keys were left alone.
+            return Err(other_tenants_row::<M>());
+        }
         stored.extend(in_input_order(chunk, fetched, conflict, pk)?);
     }
     Ok(stored)
@@ -652,7 +780,7 @@ async fn bulk_mysql<M: Model>(conn: &mut Conn<'_>, sql: Sql, chunk: &[M], confli
             }
             Ok(rows)
         }
-        None => fetch_by_keys(conn, chunk, &[pk.name]).await,
+        None => fetch_by_keys(conn, chunk, M::PRIMARY_KEYS).await,
         Some(conflict) => fetch_by_keys(conn, chunk, &conflict.target).await,
     }
 }
@@ -687,7 +815,7 @@ fn in_input_order<M: Model>(input: &[M], mut stored: Vec<M>, conflict: Option<&O
     }
     let keys: Vec<&'static str> = match conflict {
         Some(conflict) => conflict.target.clone(),
-        None => vec![pk.name],
+        None => M::PRIMARY_KEYS.to_vec(),
     };
     let mut by_key: std::collections::HashMap<Vec<Value>, M> = stored.into_iter().map(|row| (key_of(&row, &keys), row)).collect();
     input

@@ -1,5 +1,81 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Shared rate limits:** `middleware::rate_limit` adds a `RateLimitStore`
+  trait (in-memory by default; Redis in `axeon-redis`), so every instance
+  of an app enforces one limit. `RateLimiter::new(Quota)` with
+  `Quota::per_minute/per_hour/per_day(..).burst(..)` (GCRA) or
+  `Quota::daily(n)` / `fixed_window` (resets at UTC midnight),
+  `quota_by` for per-plan limits, `prefix`, `fail_open` and
+  `headers(true)` for `RateLimit-Limit`, `-Remaining`, `-Reset` and
+  `-Policy`. Existing `RateLimiter::per_minute(..).burst(..)` code behaves
+  as before.
+
+- **API keys:** `auth::api_key` (feature `api-keys`, on by default).
+  `generate_key("vs_live")` makes `vs_live_<id>_<secret>` keys with a
+  256-bit secret, returning the key (show once), its ID and a `KeyHash` to
+  store. `ApiKeyAuth::new(prefix, lookup)` reads `Authorization: Bearer`
+  or `X-API-Key`, looks the ID up with your async function, compares the
+  hash in constant time, caches lookups (60 s by default), attaches an
+  `ApiKey` extension (ID and scopes) plus your identity, and with
+  `on_used` reports used IDs in batches for a `last_used_at` column.
+
+- **Idempotency keys:** `middleware::idempotency::Idempotency` (feature
+  `idempotency`, on by default). A `POST` or `PATCH` with an
+  `Idempotency-Key` header that repeats an earlier one gets the stored
+  response (`Idempotent-Replayed: true`) instead of running again; the
+  same key with a different method, path, query or body gets 422, and a
+  repeat while the first still runs gets 409 with `Retry-After`. Keys are
+  hashed with the caller's credentials (or `scope_by`), responses below 500
+  are kept for 24 hours, and server errors release the key for a retry.
+  `IdempotencyStore` trait with `MemoryIdempotencyStore`; Redis and
+  PostgreSQL stores in axeon-redis and axeon-orm.
+
+- **HTTP caching for API responses:** `cache::CacheControl` (a
+  `Cache-Control` builder), `cache::ETag` (strong, weak, or from a body),
+  `Response::with_etag`, `with_last_modified`, `with_cache_control` and
+  `not_modified`, and `Request::is_fresh` to answer `If-None-Match` /
+  `If-Modified-Since` before doing the work. `cache::ConditionalGet`
+  middleware gives successful `GET`/`HEAD` responses a weak ETag and turns
+  matching conditional requests into `304 Not Modified`.
+
+- `MatchedRoute`: the route pattern a request matched, for global
+  middleware (which runs before routing). `MatchedRoute::watch(&mut req)`
+  shares one slot between middleware; `Metrics` uses it too.
+
+- **Authorization guards:** `auth::Grants` (the caller's scopes and roles,
+  as a request extension; `catalog:*` and `*` wildcards) and the
+  `require_scope`, `require_any_scope`, `require_role` and
+  `require_any_role` middleware: 401 without grants, 403 (with an RFC 6750
+  `insufficient_scope` challenge for scopes) when lacking.
+  `Request::grants`, `require_scope` and `require_role` for checks inside
+  handlers. `ApiKeyAuth` attaches `Grants` with the key's scopes.
+
+- **Language negotiation:** `locale::Locales` picks the best supported
+  language per request from `Accept-Language` (quality values, RFC 4647
+  fallback, `q=0` exclusions), or from a query parameter or cookie;
+  as middleware it attaches a `Locale` (`Request::locale`) and sets
+  `Content-Language` and `Vary: Accept-Language`.
+
+- **Host-based routing:** `Server::host("*.stores.example.com", router)`
+  (or an exact host) serves those hosts from their own router, with
+  `Request::subdomain` for the wildcard label and body limits per host
+  route; `Request::host` gives the normalized requested host. The
+  `host::ResolveHost` middleware resolves hosts known only at runtime
+  (customers' own domains) with an async lookup, caches the result,
+  attaches it as an extension and answers 404 for unknown hosts.
+
+### Fixed
+
+- `Server::with_tls` no longer panics with "Could not automatically
+  determine the process-level CryptoProvider" when another dependency
+  compiles in rustls' ring provider next to aws-lc-rs (as axeon-orm 0.3's
+  `tls` feature did). It uses the process default provider, installing
+  aws-lc-rs if none is set. All companion crates now use aws-lc-rs.
+
 ## 1.1.0 (2026-10-22)
 
 New features for production backends, all additive: no breaking changes, and

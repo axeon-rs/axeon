@@ -181,3 +181,168 @@ mod csrf {
         assert!(again.get_header("set-cookie").is_none());
     }
 }
+
+#[cfg(feature = "api-keys")]
+#[tokio::test]
+async fn api_keys_authenticate_cache_and_report_use() {
+    use axeon::auth::api_key::{generate_key, ApiKey, ApiKeyAuth, ApiKeyRecord, KeyHash};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Org(i64);
+
+    let live = generate_key("vs_live");
+    let other = generate_key("vs_live");
+    // The "database": id -> (hash, scopes, org); `other` is not stored.
+    type Row = (KeyHash, Vec<String>, i64);
+    let table: Arc<HashMap<String, Row>> =
+        Arc::new([(live.id.clone(), (live.hash, vec!["catalog:read".to_string()], 7))].into_iter().collect());
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let used = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+    let mut app = Server::new();
+    let (t, l, u) = (Arc::clone(&table), Arc::clone(&lookups), Arc::clone(&used));
+    app.middleware(
+        ApiKeyAuth::new("vs_live", move |id: String| {
+            let (table, lookups) = (Arc::clone(&t), Arc::clone(&l));
+            async move {
+                lookups.fetch_add(1, Ordering::SeqCst);
+                if id == "aaaaaaaaaaaaaaaa" {
+                    return Err(ServerError::InternalError("database down".into()));
+                }
+                Ok(table.get(&id).map(|(hash, scopes, org)| ApiKeyRecord {
+                    hash: *hash,
+                    scopes: scopes.clone(),
+                    identity: Org(*org),
+                }))
+            }
+        })
+        .on_used(Duration::ZERO, move |ids| {
+            let used = Arc::clone(&u);
+            async move { used.lock().unwrap().push(ids) }
+        }),
+    );
+    app.get("/me", |req| async move {
+        let key = req.extension::<ApiKey>().unwrap();
+        let org = req.extension::<Org>().unwrap();
+        format!("{} {} {}", key.id, key.has_scope("catalog:read"), org.0)
+    });
+    let app = app.into_app().await.unwrap();
+    let get = |header: &'static str, value: String| app.call(Request::new(Method::GET, "/me").with_header(header, &value));
+
+    let ok = get("authorization", format!("Bearer {}", live.key)).await;
+    assert_eq!((ok.status, ok.body_text().to_string()), (200, format!("{} true 7", live.id)));
+    assert_eq!(get("x-api-key", live.key.clone()).await.status, 200);
+    // Cached: two requests, one lookup.
+    assert_eq!(lookups.load(Ordering::SeqCst), 1);
+
+    let missing = app.call(Request::new(Method::GET, "/me")).await;
+    assert_eq!(missing.status, 401);
+    assert_eq!(missing.get_header("www-authenticate"), Some("Bearer"));
+    for bad in [
+        format!("{}x", live.key),                       // wrong secret, known ID
+        other.key.clone(),                              // unknown ID
+        live.key.replacen("vs_live", "vs_test", 1),     // other prefix
+        "vs_live_nonsense".to_string(),                 // malformed
+    ] {
+        let response = get("x-api-key", bad.clone()).await;
+        assert_eq!(response.status, 401, "{}", bad);
+        assert!(response.get_header("www-authenticate").unwrap().contains("invalid_token"));
+    }
+    // Lookup failures are server errors, not 401s.
+    assert_eq!(get("x-api-key", "vs_live_aaaaaaaaaaaaaaaa_secret".to_string()).await.status, 500);
+
+    // Used IDs are reported (on a spawned task).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let reported: Vec<String> = used.lock().unwrap().concat();
+    assert!(!reported.is_empty() && reported.iter().all(|id| *id == live.id), "{:?}", reported);
+}
+
+#[tokio::test]
+async fn scope_and_role_guards() {
+    use axeon::auth::{require_any_scope, require_role, require_scope, Grants};
+    use axeon::middleware::from_fn;
+    use axeon::Router;
+
+    let mut app = Server::new();
+    // Stands in for authentication: grants from headers.
+    app.middleware(from_fn(|mut req, next| async move {
+        if let Some(scopes) = req.get_header("x-scopes").map(String::from) {
+            let roles = req.get_header("x-roles").unwrap_or_default().to_string();
+            req.insert_extension(Grants::new().scopes_from(&scopes).roles(roles.split_whitespace()));
+        }
+        next.handle(req).await
+    }));
+    app.route("/products").middleware(require_scope("catalog:read")).get(|_req| async { "products" });
+    app.route("/selections")
+        .middleware(require_any_scope(["selections:write", "admin"]))
+        .post(|_req| async { "saved" });
+    app.get("/export", |req| async move {
+        req.require_scope("catalog:export")?;
+        Ok::<_, ServerError>("exported")
+    });
+    let mut ops = Router::new();
+    ops.middleware(require_role("operator"));
+    ops.get("/cases", |req| async move { req.grants().map(|g| g.role_list().collect::<Vec<_>>().join(",")) });
+    app.mount("/ops", ops);
+    let app = app.into_app().await.unwrap();
+
+    let call = |method: Method, path: &str, scopes: Option<&str>, roles: &str| {
+        let mut req = Request::new(method, path).with_header("x-roles", roles);
+        if let Some(scopes) = scopes {
+            req = req.with_header("x-scopes", scopes);
+        }
+        app.call(req)
+    };
+
+    // Not authenticated: 401.
+    let anonymous = call(Method::GET, "/products", None, "").await;
+    assert_eq!((anonymous.status, anonymous.get_header("www-authenticate")), (401, Some("Bearer")));
+    // Authenticated without the scope: 403 with the RFC 6750 challenge.
+    let lacking = call(Method::GET, "/products", Some("selections:read"), "").await;
+    assert_eq!(lacking.status, 403);
+    assert_eq!(lacking.get_header("www-authenticate"), Some("Bearer error=\"insufficient_scope\", scope=\"catalog:read\""));
+    assert!(lacking.body_text().contains("requires scope catalog:read"));
+    // Granted, directly or by wildcard.
+    assert_eq!(call(Method::GET, "/products", Some("catalog:read"), "").await.status, 200);
+    assert_eq!(call(Method::GET, "/products", Some("catalog:*"), "").await.status, 200);
+    // Any of several.
+    assert_eq!(call(Method::POST, "/selections", Some("admin"), "").await.status, 200);
+    assert_eq!(call(Method::POST, "/selections", Some("selections:read"), "").await.status, 403);
+    // Checks inside handlers.
+    assert_eq!(call(Method::GET, "/export", Some("catalog:read"), "").await.status, 403);
+    assert_eq!(call(Method::GET, "/export", Some("catalog:export"), "").await.status, 200);
+    assert_eq!(call(Method::GET, "/export", None, "").await.status, 401);
+    // Roles on a whole router.
+    assert_eq!(call(Method::GET, "/ops/cases", Some(""), "buyer").await.status, 403);
+    let operator = call(Method::GET, "/ops/cases", Some(""), "operator reviewer").await;
+    assert_eq!((operator.status, operator.body_text().to_string()), (200, "operator,reviewer".to_string()));
+
+    // A guard without names is a setup error.
+    let mut broken = Server::new();
+    broken.middleware(require_any_scope(Vec::<String>::new()));
+    assert!(broken.into_app().await.is_err());
+}
+
+#[cfg(feature = "api-keys")]
+#[tokio::test]
+async fn api_keys_grant_their_scopes() {
+    use axeon::auth::api_key::{generate_key, ApiKeyAuth, ApiKeyRecord};
+    use axeon::auth::require_scope;
+
+    let key = generate_key("vs_test");
+    let hash = key.hash;
+    let mut app = Server::new();
+    app.middleware(ApiKeyAuth::new("vs_test", move |_id: String| async move {
+        Ok::<_, ServerError>(Some(ApiKeyRecord { hash, scopes: vec!["catalog:read".into()], identity: () }))
+    }));
+    app.route("/products").middleware(require_scope("catalog:read")).get(|_req| async { "ok" });
+    app.route("/admin").middleware(require_scope("admin")).get(|_req| async { "ok" });
+    let app = app.into_app().await.unwrap();
+    let get = |path: &str| app.call(Request::new(Method::GET, path).with_header("x-api-key", &key.key));
+    assert_eq!(get("/products").await.status, 200);
+    assert_eq!(get("/admin").await.status, 403);
+}

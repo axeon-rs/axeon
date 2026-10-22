@@ -2,9 +2,13 @@
 
 use crate::error::{Error, Result};
 use crate::model::Model;
+use crate::tenant::Scope;
 use crate::value::{Kind, SqlType, Value};
+use futures::stream::BoxStream;
 use sqlx::AssertSqlSafe;
-use std::time::Duration;
+use crate::observe::Observer;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(not(any(feature = "postgres", feature = "sqlite", feature = "mysql")))]
 compile_error!("axeon-orm needs at least one database feature: `postgres`, `sqlite` or `mysql`");
@@ -28,6 +32,8 @@ pub struct DbOptions {
     min_connections: u32,
     acquire_timeout: Duration,
     idle_timeout: Option<Duration>,
+    statement_timeout: Option<Duration>,
+    observer: Observer,
 }
 
 impl Default for DbOptions {
@@ -37,6 +43,8 @@ impl Default for DbOptions {
             min_connections: 0,
             acquire_timeout: Duration::from_secs(30),
             idle_timeout: Some(Duration::from_secs(600)),
+            statement_timeout: None,
+            observer: Observer::default(),
         }
     }
 }
@@ -70,6 +78,34 @@ impl DbOptions {
         self.idle_timeout = timeout;
         self
     }
+
+    /// The longest a statement may run before the database cancels it with
+    /// [`Error::StatementTimeout`], so one bad query can't hold a pooled
+    /// connection: PostgreSQL's `statement_timeout`, or MySQL's
+    /// `max_execution_time` (which covers `SELECT`s only). Ignored on SQLite.
+    /// Override per transaction with
+    /// [`Transaction::statement_timeout`] (PostgreSQL). Default: none.
+    pub fn statement_timeout(mut self, timeout: Duration) -> Self {
+        self.statement_timeout = Some(timeout.max(Duration::from_millis(1)));
+        self
+    }
+
+    /// Logs statements that take `threshold` or longer as warnings (target
+    /// `axeon_orm::slow_query`) with their duration, operation, table and
+    /// SQL. The SQL holds placeholders, never values. Default: off.
+    pub fn slow_query(mut self, threshold: Duration) -> Self {
+        self.observer = self.observer.slow(Some(threshold));
+        self
+    }
+
+    /// Records every statement on an Axeon metrics registry:
+    /// `db_query_duration_seconds` (histogram) and `db_query_errors_total`,
+    /// labelled by `operation` (`select`, `insert`...) and `table`.
+    #[cfg(feature = "axeon")]
+    pub fn metrics(mut self, metrics: &axeon::metrics::Metrics) -> Self {
+        self.observer = self.observer.metrics(metrics);
+        self
+    }
 }
 
 /// A database connection pool. Cheap to clone; clones share the pool.
@@ -87,6 +123,19 @@ impl DbOptions {
 #[derive(Clone, Debug)]
 pub struct Db {
     inner: Pool,
+    scope: Scope,
+    observer: Arc<Observer>,
+    /// Read replicas, from [`Db::with_replicas`].
+    replicas: Option<Arc<Replicas>>,
+    /// A replica handle: writes are refused.
+    read_only: bool,
+}
+
+/// Replica pools, taken in turn.
+#[derive(Debug)]
+struct Replicas {
+    pools: Vec<Pool>,
+    next: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Debug)]
@@ -109,17 +158,26 @@ impl Db {
 
     /// Connects with custom pool settings.
     pub async fn connect_with(url: &str, options: DbOptions) -> Result<Db> {
+        let observer = Arc::new(options.observer.clone());
+        // SQLite has no statement timeout; the setting is ignored there.
+        #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(unused_variables))]
+        let timeout_ms = options.statement_timeout.map(|t| t.as_millis().max(1).to_string());
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
             #[cfg(feature = "postgres")]
             {
+                use std::str::FromStr;
+                let mut connect = sqlx::postgres::PgConnectOptions::from_str(url)?;
+                if let Some(ms) = &timeout_ms {
+                    connect = connect.options([("statement_timeout", ms.as_str())]);
+                }
                 let pool = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(options.max_connections)
                     .min_connections(options.min_connections)
                     .acquire_timeout(options.acquire_timeout)
                     .idle_timeout(options.idle_timeout)
-                    .connect(url)
+                    .connect_with(connect)
                     .await?;
-                return Ok(Db { inner: Pool::Postgres(pool) });
+                return Ok(Db { inner: Pool::Postgres(pool), scope: Scope::Unset, observer: observer.clone(), replicas: None, read_only: false });
             }
             #[cfg(not(feature = "postgres"))]
             return Err(Error::Config("PostgreSQL support needs the `postgres` feature".into()));
@@ -142,7 +200,7 @@ impl Db {
                     // connection open forever.
                     pool = pool.max_connections(1).min_connections(1).idle_timeout(None).max_lifetime(None);
                 }
-                return Ok(Db { inner: Pool::Sqlite(pool.connect_with(connect).await?) });
+                return Ok(Db { inner: Pool::Sqlite(pool.connect_with(connect).await?), scope: Scope::Unset, observer: observer.clone(), replicas: None, read_only: false });
             }
             #[cfg(not(feature = "sqlite"))]
             return Err(Error::Config("SQLite support needs the `sqlite` feature".into()));
@@ -153,14 +211,22 @@ impl Db {
                 use std::str::FromStr;
                 let url = url.replacen("mariadb://", "mysql://", 1);
                 let connect = sqlx::mysql::MySqlConnectOptions::from_str(&url)?;
-                let pool = sqlx::mysql::MySqlPoolOptions::new()
+                let mut pool = sqlx::mysql::MySqlPoolOptions::new()
                     .max_connections(options.max_connections)
                     .min_connections(options.min_connections)
                     .acquire_timeout(options.acquire_timeout)
-                    .idle_timeout(options.idle_timeout)
-                    .connect_with(connect)
-                    .await?;
-                return Ok(Db { inner: Pool::MySql(pool) });
+                    .idle_timeout(options.idle_timeout);
+                if let Some(ms) = timeout_ms.clone() {
+                    pool = pool.after_connect(move |conn, _| {
+                        let set = format!("SET SESSION max_execution_time = {}", ms);
+                        Box::pin(async move {
+                            sqlx::Executor::execute(conn, AssertSqlSafe(set)).await?;
+                            Ok(())
+                        })
+                    });
+                }
+                let pool = pool.connect_with(connect).await?;
+                return Ok(Db { inner: Pool::MySql(pool), scope: Scope::Unset, observer: observer.clone(), replicas: None, read_only: false });
             }
             #[cfg(not(feature = "mysql"))]
             return Err(Error::Config("MySQL support needs the `mysql` feature".into()));
@@ -169,6 +235,108 @@ impl Db {
             "unsupported database URL `{}`: expected postgres://, sqlite: or mysql://",
             url.split('@').next_back().unwrap_or_default()
         )))
+    }
+
+    /// The same pool, scoped to one tenant: queries on models with a
+    /// `#[model(tenant)]` column see only rows whose tenant column equals
+    /// `tenant`, and writes of other tenants' rows fail with
+    /// [`Error::WrongTenant`]. Transactions begun on it keep the scope.
+    /// Cheap: the pool is shared.
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, Model};
+    /// #[derive(Model)]
+    /// struct Selection {
+    ///     id: i64,
+    ///     #[model(tenant)]
+    ///     org_id: i64,
+    ///     product_id: i64,
+    /// }
+    ///
+    /// # async fn run(db: Db, org_id: i64) -> axeon_orm::Result<()> {
+    /// let org = db.for_tenant(org_id);
+    /// let mine = Selection::query().all(&org).await?; // WHERE org_id = $1
+    /// // Without a scope, tenant-scoped models refuse to run:
+    /// assert!(Selection::query().all(&db).await.is_err());
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Not covered: raw SQL (`execute`, `postgres()` and the like), pivot
+    /// tables, and models without a tenant column.
+    pub fn for_tenant(&self, tenant: impl Into<Value>) -> Db {
+        Db { inner: self.inner.clone(), scope: Scope::Tenant(tenant.into()), observer: self.observer.clone(), replicas: self.replicas.clone(), read_only: self.read_only }
+    }
+
+    /// The same pool, seeing every tenant's rows: for background jobs,
+    /// migrations and operator tools. The explicit opt-out from tenant
+    /// scopes; a plain `Db` refuses to touch tenant-scoped models.
+    pub fn all_tenants(&self) -> Db {
+        Db { inner: self.inner.clone(), scope: Scope::All, observer: self.observer.clone(), replicas: self.replicas.clone(), read_only: self.read_only }
+    }
+
+    /// Adds read replicas: [`replica`](Db::replica) then hands out handles
+    /// on them in turn. Connect each with [`Db::connect_with`] (same
+    /// backend); this `Db` stays the primary for writes and for reads
+    /// that must see the latest data.
+    ///
+    /// ```no_run
+    /// # use axeon_orm::{Db, DbOptions, Model};
+    /// # #[derive(Model)] struct Product { id: i64, category: String }
+    /// # async fn run() -> axeon_orm::Result<()> {
+    /// let db = Db::connect("postgres://primary/app").await?.with_replicas(vec![
+    ///     Db::connect("postgres://replica-1/app").await?,
+    ///     Db::connect("postgres://replica-2/app").await?,
+    /// ]);
+    ///
+    /// // A catalog read that tolerates a little replication lag:
+    /// let lighting = Product::query().filter(Product::CATEGORY.eq("lighting")).all(&db.replica()).await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// When a replica's backend differs from the primary's.
+    pub fn with_replicas(mut self, replicas: Vec<Db>) -> Db {
+        for replica in &replicas {
+            assert_eq!(replica.backend(), self.backend(), "a replica must use the same database as the primary");
+        }
+        let pools = replicas.into_iter().map(|r| r.inner).collect::<Vec<_>>();
+        self.replicas = (!pools.is_empty()).then(|| Arc::new(Replicas { pools, next: Default::default() }));
+        self
+    }
+
+    /// A handle on the next read replica (in turn), or on the primary when
+    /// there are none, so the same code runs without replicas. It keeps
+    /// this handle's tenant scope and metrics, and refuses writes with
+    /// [`Error::Config`]. Replicas lag behind the primary: read what you
+    /// just wrote from the primary.
+    pub fn replica(&self) -> Db {
+        let inner = match &self.replicas {
+            Some(replicas) => {
+                let turn = replicas.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                replicas.pools[turn % replicas.pools.len()].clone()
+            }
+            None => self.inner.clone(),
+        };
+        Db { inner, scope: self.scope.clone(), observer: self.observer.clone(), replicas: None, read_only: true }
+    }
+
+    /// How many read replicas this `Db` has.
+    pub fn replica_count(&self) -> usize {
+        self.replicas.as_ref().map_or(0, |r| r.pools.len())
+    }
+
+    /// Whether this is a [`replica`](Db::replica) handle, which refuses writes.
+    pub fn is_replica(&self) -> bool {
+        self.read_only
+    }
+
+    /// The tenant this handle is scoped to, if any.
+    pub fn tenant(&self) -> Option<&Value> {
+        match &self.scope {
+            Scope::Tenant(tenant) => Some(tenant),
+            _ => None,
+        }
     }
 
     /// Which database this pool talks to.
@@ -194,7 +362,7 @@ impl Db {
             #[cfg(feature = "mysql")]
             Pool::MySql(pool) => Tx::MySql(pool.begin().await?),
         };
-        Ok(Transaction { inner, failed: false })
+        Ok(Transaction { inner, failed: false, scope: self.scope.clone(), observer: self.observer.clone(), read_only: self.read_only })
     }
 
     /// Checks the database answers, e.g. for a readiness probe.
@@ -273,21 +441,21 @@ impl Db {
 #[cfg(feature = "mysql")]
 impl From<sqlx::MySqlPool> for Db {
     fn from(pool: sqlx::MySqlPool) -> Self {
-        Db { inner: Pool::MySql(pool) }
+        Db { inner: Pool::MySql(pool), scope: Scope::Unset, observer: Arc::default(), replicas: None, read_only: false }
     }
 }
 
 #[cfg(feature = "postgres")]
 impl From<sqlx::PgPool> for Db {
     fn from(pool: sqlx::PgPool) -> Self {
-        Db { inner: Pool::Postgres(pool) }
+        Db { inner: Pool::Postgres(pool), scope: Scope::Unset, observer: Arc::default(), replicas: None, read_only: false }
     }
 }
 
 #[cfg(feature = "sqlite")]
 impl From<sqlx::SqlitePool> for Db {
     fn from(pool: sqlx::SqlitePool) -> Self {
-        Db { inner: Pool::Sqlite(pool) }
+        Db { inner: Pool::Sqlite(pool), scope: Scope::Unset, observer: Arc::default(), replicas: None, read_only: false }
     }
 }
 
@@ -300,6 +468,12 @@ pub struct Transaction {
     /// `COMMIT` into a silent rollback, so `commit` must report it.
     /// Tracked for SQLite too, so both databases behave alike.
     failed: bool,
+    /// The tenant scope, from the `Db` it began on.
+    scope: Scope,
+    /// Query timing, from the `Db` it began on.
+    observer: Arc<Observer>,
+    /// Begun on a replica handle: writes are refused.
+    read_only: bool,
 }
 
 #[derive(Debug)]
@@ -313,6 +487,18 @@ enum Tx {
 }
 
 impl Transaction {
+    /// Limits how long each later statement in this transaction may run
+    /// (PostgreSQL's `SET LOCAL statement_timeout`), e.g. a short limit
+    /// for an API read or a longer one for a report. Ends with the
+    /// transaction. Fails with [`Error::Config`] on other databases.
+    pub async fn statement_timeout(&mut self, timeout: Duration) -> Result<()> {
+        if self.backend() != Backend::Postgres {
+            return Err(Error::Config("per-transaction statement timeouts need PostgreSQL".into()));
+        }
+        let ms = timeout.as_millis().max(1);
+        Conn::Tx(self).execute_raw(format!("SET LOCAL statement_timeout = {}", ms)).await
+    }
+
     /// Makes the transaction's changes permanent.
     ///
     /// If any statement in the transaction failed, `commit` rolls back and
@@ -497,6 +683,32 @@ pub enum Conn<'c> {
     Tx(&'c mut Transaction),
 }
 
+/// A connection with a different tenant scope, from [`Conn::rescoped`];
+/// a transaction gets its own scope back when this is dropped.
+pub(crate) enum Rescoped<'a> {
+    Db(Db),
+    Tx(&'a mut Transaction, Option<Scope>),
+}
+
+impl Rescoped<'_> {
+    pub(crate) fn conn(&mut self) -> Conn<'_> {
+        match self {
+            Rescoped::Db(db) => Conn::Db(db),
+            Rescoped::Tx(tx, _) => Conn::Tx(tx),
+        }
+    }
+}
+
+impl Drop for Rescoped<'_> {
+    fn drop(&mut self) {
+        if let Rescoped::Tx(tx, previous) = self {
+            if let Some(previous) = previous.take() {
+                tx.scope = previous;
+            }
+        }
+    }
+}
+
 macro_rules! bind_all {
     ($query:expr, $args:expr) => {{
         let mut query = $query;
@@ -551,19 +763,19 @@ macro_rules! run {
     ($conn:expr, $sql:expr, $args:expr, |$q:ident, $ex:ident| $body:expr) => {
         match $conn {
             #[cfg(feature = "postgres")]
-            Conn::Db(Db { inner: Pool::Postgres(pool) }) => {
+            Conn::Db(Db { inner: Pool::Postgres(pool), .. }) => {
                 let $q = bind_all!(sqlx::query::<sqlx::Postgres>(AssertSqlSafe($sql)), $args);
                 let $ex = pool;
                 $body
             }
             #[cfg(feature = "sqlite")]
-            Conn::Db(Db { inner: Pool::Sqlite(pool) }) => {
+            Conn::Db(Db { inner: Pool::Sqlite(pool), .. }) => {
                 let $q = bind_all!(sqlx::query::<sqlx::Sqlite>(AssertSqlSafe($sql)), $args);
                 let $ex = pool;
                 $body
             }
             #[cfg(feature = "mysql")]
-            Conn::Db(Db { inner: Pool::MySql(pool) }) => {
+            Conn::Db(Db { inner: Pool::MySql(pool), .. }) => {
                 let $q = bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe($sql)), $args);
                 let $ex = pool;
                 $body
@@ -591,6 +803,37 @@ macro_rules! run {
 }
 
 impl Conn<'_> {
+    /// Fails for a [replica](Db::replica) handle (or a transaction begun
+    /// on one), before a write reaches the replica.
+    pub(crate) fn writable(&self) -> Result<()> {
+        let read_only = match self {
+            Conn::Db(db) => db.read_only,
+            Conn::Tx(tx) => tx.read_only,
+        };
+        if read_only {
+            return Err(Error::Config("writes must go to the primary, not a replica handle".into()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scope(&self) -> &Scope {
+        match self {
+            Conn::Db(db) => &db.scope,
+            Conn::Tx(tx) => &tx.scope,
+        }
+    }
+
+    /// Runs with another tenant scope, e.g. for a query that opted out.
+    pub(crate) fn rescoped(&mut self, scope: Scope) -> Rescoped<'_> {
+        match self {
+            Conn::Db(db) => Rescoped::Db(Db { inner: db.inner.clone(), scope, observer: db.observer.clone(), replicas: db.replicas.clone(), read_only: db.read_only }),
+            Conn::Tx(tx) => {
+                let previous = std::mem::replace(&mut tx.scope, scope);
+                Rescoped::Tx(tx, Some(previous))
+            }
+        }
+    }
+
     pub(crate) fn backend(&self) -> Backend {
         match self {
             Conn::Db(db) => db.backend(),
@@ -598,8 +841,24 @@ impl Conn<'_> {
         }
     }
 
-    /// Marks the transaction failed when a statement in it fails.
-    fn track<T>(&mut self, result: Result<T>) -> Result<T> {
+    fn observer(&self) -> &Observer {
+        match self {
+            Conn::Db(db) => &db.observer,
+            Conn::Tx(tx) => &tx.observer,
+        }
+    }
+
+    /// Starts timing a statement, keeping its SQL only if it's recorded.
+    fn watch(&self, sql: &str) -> Option<(String, Instant)> {
+        self.observer().active().then(|| (sql.to_string(), Instant::now()))
+    }
+
+    /// Marks the transaction failed when a statement in it fails, and
+    /// records the statement's duration.
+    fn track<T>(&mut self, watched: Option<(String, Instant)>, result: Result<T>) -> Result<T> {
+        if let Some((sql, started)) = watched {
+            self.observer().record(&sql, started.elapsed(), result.is_ok());
+        }
         if let (Err(_), Conn::Tx(tx)) = (&result, self) {
             tx.failed = true;
         }
@@ -607,28 +866,84 @@ impl Conn<'_> {
     }
 
     pub(crate) async fn fetch_all(&mut self, sql: String, args: Vec<Value>) -> Result<Vec<Row>> {
+        let watched = self.watch(&sql);
         let result = run!(self, sql, args, |q, ex| {
             q.fetch_all(ex).await.map(|rows| rows.into_iter().map(Into::into).collect()).map_err(Error::from)
         });
-        self.track(result)
+        self.track(watched, result)
+    }
+
+    /// The rows as they arrive, holding the connection (or transaction)
+    /// until the stream is dropped. An error inside a transaction marks it
+    /// failed, as the other methods do.
+    pub(crate) fn fetch_stream<'c>(self, sql: String, args: Vec<Value>) -> BoxStream<'c, Result<Row>>
+    where
+        Self: 'c,
+    {
+        use futures::StreamExt;
+        fn rows<'s, R: Into<Row> + Send + 's>(
+            stream: BoxStream<'s, std::result::Result<R, sqlx::Error>>,
+            failed: Option<&'s mut bool>,
+        ) -> BoxStream<'s, Result<Row>> {
+            let mut failed = failed;
+            stream
+                .map(move |row| {
+                    if row.is_err() {
+                        if let Some(failed) = failed.as_deref_mut() {
+                            *failed = true;
+                        }
+                    }
+                    row.map(Into::into).map_err(Error::from)
+                })
+                .boxed()
+        }
+        match self {
+            #[cfg(feature = "postgres")]
+            Conn::Db(Db { inner: Pool::Postgres(pool), .. }) => {
+                rows(bind_all!(sqlx::query::<sqlx::Postgres>(AssertSqlSafe(sql)), args).fetch(pool), None)
+            }
+            #[cfg(feature = "sqlite")]
+            Conn::Db(Db { inner: Pool::Sqlite(pool), .. }) => {
+                rows(bind_all!(sqlx::query::<sqlx::Sqlite>(AssertSqlSafe(sql)), args).fetch(pool), None)
+            }
+            #[cfg(feature = "mysql")]
+            Conn::Db(Db { inner: Pool::MySql(pool), .. }) => {
+                rows(bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe(sql)), args).fetch(pool), None)
+            }
+            #[cfg(feature = "postgres")]
+            Conn::Tx(Transaction { inner: Tx::Postgres(tx), failed, .. }) => {
+                rows(bind_all!(sqlx::query::<sqlx::Postgres>(AssertSqlSafe(sql)), args).fetch(&mut **tx), Some(failed))
+            }
+            #[cfg(feature = "sqlite")]
+            Conn::Tx(Transaction { inner: Tx::Sqlite(tx), failed, .. }) => {
+                rows(bind_all!(sqlx::query::<sqlx::Sqlite>(AssertSqlSafe(sql)), args).fetch(&mut **tx), Some(failed))
+            }
+            #[cfg(feature = "mysql")]
+            Conn::Tx(Transaction { inner: Tx::MySql(tx), failed, .. }) => {
+                rows(bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe(sql)), args).fetch(&mut **tx), Some(failed))
+            }
+        }
     }
 
     pub(crate) async fn fetch_optional(&mut self, sql: String, args: Vec<Value>) -> Result<Option<Row>> {
+        let watched = self.watch(&sql);
         let result = run!(self, sql, args, |q, ex| q.fetch_optional(ex).await.map(|r| r.map(Into::into)).map_err(Error::from));
-        self.track(result)
+        self.track(watched, result)
     }
 
     pub(crate) async fn execute(&mut self, sql: String, args: Vec<Value>) -> Result<u64> {
+        let watched = self.watch(&sql);
         let result = run!(self, sql, args, |q, ex| q.execute(ex).await.map(|r| r.rows_affected()).map_err(Error::from));
-        self.track(result)
+        self.track(watched, result)
     }
 
     /// Runs an `INSERT` on MySQL, which has no `RETURNING`; returns the
     /// auto-increment id it assigned.
     #[cfg(feature = "mysql")]
     pub(crate) async fn insert_mysql(&mut self, sql: String, args: Vec<Value>) -> Result<u64> {
+        let watched = self.watch(&sql);
         let result = self.insert_mysql_inner(sql, args).await;
-        self.track(result)
+        self.track(watched, result)
     }
 
     /// Like [`insert_mysql`](Conn::insert_mysql), but a unique violation
@@ -636,9 +951,10 @@ impl Conn<'_> {
     /// failed statement.
     #[cfg(feature = "mysql")]
     pub(crate) async fn insert_mysql_unless_duplicate(&mut self, sql: String, args: Vec<Value>) -> Result<Option<u64>> {
+        let watched = self.watch(&sql);
         match self.insert_mysql_inner(sql, args).await {
-            Err(Error::UniqueViolation(_)) => Ok(None),
-            result => self.track(result).map(Some),
+            Err(Error::UniqueViolation(_)) => self.track(watched, Ok(None)),
+            result => self.track(watched, result).map(Some),
         }
     }
 
@@ -646,7 +962,7 @@ impl Conn<'_> {
     async fn insert_mysql_inner(&mut self, sql: String, args: Vec<Value>) -> Result<u64> {
         let query = bind_all!(sqlx::query::<sqlx::MySql>(AssertSqlSafe(sql)), args);
         let result = match self {
-            Conn::Db(Db { inner: Pool::MySql(pool) }) => query.execute(pool).await.map_err(Error::from),
+            Conn::Db(Db { inner: Pool::MySql(pool), .. }) => query.execute(pool).await.map_err(Error::from),
             Conn::Tx(Transaction { inner: Tx::MySql(tx), .. }) => query.execute(&mut **tx).await.map_err(Error::from),
             #[allow(unreachable_patterns)]
             _ => Err(Error::Config("insert_mysql on another database".into())),
@@ -656,19 +972,20 @@ impl Conn<'_> {
 
     /// Runs SQL without parameters; may hold several statements.
     pub(crate) async fn execute_raw(&mut self, sql: String) -> Result<()> {
+        let watched = self.watch(&sql);
         let result = self.execute_raw_inner(sql).await;
-        self.track(result)
+        self.track(watched, result)
     }
 
     async fn execute_raw_inner(&mut self, sql: String) -> Result<()> {
         let raw = sqlx::raw_sql(AssertSqlSafe(sql));
         match self {
             #[cfg(feature = "postgres")]
-            Conn::Db(Db { inner: Pool::Postgres(pool) }) => {
+            Conn::Db(Db { inner: Pool::Postgres(pool), .. }) => {
                 raw.execute(pool).await?;
             }
             #[cfg(feature = "sqlite")]
-            Conn::Db(Db { inner: Pool::Sqlite(pool) }) => {
+            Conn::Db(Db { inner: Pool::Sqlite(pool), .. }) => {
                 raw.execute(pool).await?;
             }
             #[cfg(feature = "postgres")]
@@ -680,7 +997,7 @@ impl Conn<'_> {
                 raw.execute(&mut **tx).await?;
             }
             #[cfg(feature = "mysql")]
-            Conn::Db(Db { inner: Pool::MySql(pool) }) => {
+            Conn::Db(Db { inner: Pool::MySql(pool), .. }) => {
                 raw.execute(pool).await?;
             }
             #[cfg(feature = "mysql")]

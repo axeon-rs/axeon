@@ -75,8 +75,14 @@ fn is_indexed(column: &ColumnDef) -> bool {
     column.primary_key || column.unique || column.index || column.references.is_some()
 }
 
-fn column_sql(column: &ColumnDef, backend: Backend) -> String {
+/// A column definition; without `inline_keys`, `PRIMARY KEY` and `UNIQUE`
+/// are left for table-level constraints (partitioned tables).
+fn column_sql_with(column: &ColumnDef, backend: Backend, inline_keys: bool) -> String {
     let name = ident(backend, column.name);
+    if column.primary_key && column.auto_increment && !inline_keys {
+        let serial = if column.kind == Kind::I32 { "SERIAL" } else { "BIGSERIAL" };
+        return format!("{} {} NOT NULL", name, serial);
+    }
     if column.primary_key && column.auto_increment {
         return match (backend, column.kind) {
             (Backend::Postgres, Kind::I32) => format!("{} SERIAL PRIMARY KEY", name),
@@ -91,12 +97,12 @@ fn column_sql(column: &ColumnDef, backend: Backend) -> String {
     if let (Some(dimensions), Backend::Postgres) = (column.dimensions, backend) {
         sql.push_str(&format!("({})", dimensions));
     }
-    if column.primary_key {
+    if column.primary_key && inline_keys {
         sql.push_str(" PRIMARY KEY");
-    } else if !column.nullable {
+    } else if !column.nullable || column.primary_key {
         sql.push_str(" NOT NULL");
     }
-    if column.unique {
+    if column.unique && inline_keys {
         sql.push_str(" UNIQUE");
     }
     if let Some(values) = column.values {
@@ -140,7 +146,15 @@ fn foreign_key(backend: Backend, column: &str, table: &str, target: &str, on_del
 /// `#[model(index)]` column.
 pub fn create_table<M: Model>(backend: Backend) -> String {
     let table = ident(backend, M::TABLE);
-    let mut lines: Vec<String> = M::COLUMNS.iter().map(|c| format!("    {}", column_sql(c, backend))).collect();
+    let composite = M::PRIMARY_KEYS.len() > 1;
+    let mut lines: Vec<String> = M::COLUMNS
+        .iter()
+        .map(|c| format!("    {}", column_sql_with(c, backend, !(composite && c.primary_key))))
+        .collect();
+    if composite {
+        let key: Vec<String> = M::PRIMARY_KEYS.iter().map(|c| ident(backend, c)).collect();
+        lines.push(format!("    PRIMARY KEY ({})", key.join(", ")));
+    }
     let indexed = M::COLUMNS.iter().filter(|c| c.index && !c.unique && !c.primary_key);
     let index_name = |column: &str| ident(backend, &format!("{}_{}_index", M::TABLE, column));
     let mut after = String::new();
@@ -165,6 +179,44 @@ pub fn create_table<M: Model>(backend: Backend) -> String {
         }
     }
     format!("CREATE TABLE IF NOT EXISTS {} (\n{}\n);{}", table, lines.join(",\n"), after)
+}
+
+/// `CREATE TABLE IF NOT EXISTS` for a PostgreSQL table partitioned by range
+/// of `column`, whose primary key must include it.
+#[cfg(all(feature = "postgres", feature = "chrono"))]
+pub(crate) fn create_partitioned_table<M: Model>(column: &str) -> crate::Result<String> {
+    let backend = Backend::Postgres;
+    if let Some(unique) = M::COLUMNS.iter().find(|c| c.unique && c.name != column) {
+        return Err(crate::Error::Config(format!(
+            "`{}.{}` is unique, but a partitioned table's unique constraints must include `{}`",
+            M::TABLE,
+            unique.name,
+            column
+        )));
+    }
+    let table = ident(backend, M::TABLE);
+    let mut lines: Vec<String> = M::COLUMNS.iter().map(|c| format!("    {}", column_sql_with(c, backend, false))).collect();
+    let mut key: Vec<String> = M::PRIMARY_KEYS.iter().map(|c| ident(backend, c)).collect();
+    if !M::PRIMARY_KEYS.contains(&column) {
+        key.push(ident(backend, column));
+    }
+    lines.push(format!("    PRIMARY KEY ({})", key.join(", ")));
+    let mut after = String::new();
+    for indexed in M::COLUMNS.iter().filter(|c| c.index && !c.unique && !c.primary_key) {
+        after.push_str(&format!(
+            "\nCREATE INDEX IF NOT EXISTS {} ON {} ({});",
+            ident(backend, &format!("{}_{}_index", M::TABLE, indexed.name)),
+            table,
+            ident(backend, indexed.name)
+        ));
+    }
+    Ok(format!(
+        "CREATE TABLE IF NOT EXISTS {} (\n{}\n) PARTITION BY RANGE ({});{}",
+        table,
+        lines.join(",\n"),
+        ident(backend, column),
+        after
+    ))
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for a many-to-many pivot table: both key

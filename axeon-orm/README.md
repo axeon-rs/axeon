@@ -100,6 +100,12 @@ let recent = Post::query()
     .await?;
 
 let page = Post::query().paginate(&db, 2, 20).await?;   // items, total, last_page
+// Keyset pagination for public APIs: no OFFSET or COUNT(*), opaque cursor.
+let page = Post::query().order_by(Post::ID.desc()).cursor_paginate(&db, after.as_deref(), 20).await?;
+// page.items, page.next_cursor (None on the last page)
+
+// Whole tables in constant memory (reindexing, exports), e.g. in batches:
+let mut batches = Product::query().stream(&db).try_chunks(500);   // futures::TryStreamExt
 let n = Post::query().filter(Post::USER_ID.eq(ada.id)).count(&db).await?;
 
 let mut user = user;
@@ -186,6 +192,37 @@ let tags = post.tags().all(&db).await?;
 let posts_with_tags = Post::query().with(Post::TAGS).all(&db).await?;
 ```
 
+### Composite keys and pivot tables with data
+
+Mark several fields `#[model(primary_key)]` for a composite key. That also
+covers pivot rows that carry data, such as a margin on a buyer's
+selection: make the pivot table a model.
+
+```rust
+#[derive(Model)]
+#[model(table = "selections")]
+struct Selection {
+    #[model(primary_key, belongs_to = Buyer)]
+    buyer_id: i64,
+    #[model(primary_key, belongs_to = Product)]
+    product_id: i64,
+    margin: f64,
+}
+
+let s = Selection::find_or_fail(&db, (buyer.id, product.id)).await?;   // find by the tuple
+let rows: Vec<(Selection, Product)> = Selection::query()
+    .filter(Selection::BUYER_ID.eq(buyer.id))
+    .join(Selection::PRODUCT)                                           // pivot data + the product
+    .all(&db)
+    .await?;
+```
+
+Insert, update, delete, upserts (`OnConflict::on(..).and(..)`), bulk
+inserts and cursor pagination use every key column. A composite-key model
+can `belongs_to` others, but can't have `has_many`, `has_one` or
+`belongs_to_many` relations, and can't be the target of a `belongs_to`
+(both are compile errors).
+
 ### Filtering by relations
 
 ```rust
@@ -216,6 +253,43 @@ let rows: Vec<(Post, User)> = Post::query()
 // Keep users without a profile.
 let rows: Vec<(User, Option<Profile>)> = User::query().left_join(User::PROFILE).all(&db).await?;
 ```
+
+### Reports: more tables, GROUP BY and HAVING
+
+`select::Select` joins any number of tables through their relations and
+decodes each row into your own `Deserialize` struct (or JSON):
+
+```rust
+use axeon_orm::select::{Agg, Select};
+
+#[derive(Deserialize)]
+struct Row { supplier: String, category: String, products: i64, avg_price: Option<f64> }
+
+let rows: Vec<Row> = Select::from::<Supplier>()
+    .join(Supplier::PRODUCTS)                 // from any table already in the report
+    .join(Product::CATEGORY)
+    .left_join(Product::REVIEWS)              // keep products without reviews
+    .column_as(Supplier::NAME, "supplier")
+    .column_as(Category::NAME, "category")
+    .aggregate(Agg::count_distinct(Product::ID), "products")
+    .aggregate(Agg::avg(Product::PRICE), "avg_price")
+    .filter(Supplier::ACTIVE.eq(true))        // WHERE, on any joined model
+    .group_by(Supplier::NAME)
+    .group_by(Category::NAME)
+    .having(Agg::count().gte(3))              // HAVING
+    .order_by_alias("products", true)
+    .limit(50)
+    .fetch(&db)                               // or .fetch_json(&db) for a dashboard
+    .await?;
+```
+
+- Aggregates: `count`, `count_of`, `count_distinct`, `sum` (`i64` or
+  `f64`), `avg` (`f64`), `min` and `max` (the column's type); read
+  nullable results (left joins, empty groups) as `Option`.
+- Each model appears once (no self-joins); mistakes such as a column of a
+  model that isn't joined fail with `Error::Config` when the report runs.
+- Tenant scopes apply to every table (in `ON` for left joins), and
+  `to_sql` shows the SQL for `EXPLAIN`.
 
 ## Full-text and hybrid search (PostgreSQL)
 
@@ -332,6 +406,123 @@ build the SQL text from user input. Fragments are parenthesized, so an
 `OR` inside one can't escape it. Column names inside them aren't quoted or
 qualified; in a join, the main table is `t0` and the joined one `t1`.
 
+## Optimistic locking
+
+Mark an integer column with `#[model(version)]` to stop concurrent edits
+from overwriting each other silently:
+
+```rust
+#[derive(Model)]
+struct ProductVersion {
+    id: i64,
+    title: String,
+    #[model(version)]
+    version: i64,
+}
+
+let mut mine = ProductVersion::find_or_fail(&db, id).await?;
+mine.title = "New title".into();
+match mine.update(&db).await {                  // UPDATE ... WHERE id = $1 AND version = $2
+    Ok(()) => {}                                // mine.version is now one higher
+    Err(Error::StaleRecord(_)) => { /* someone saved first: reload, merge, retry */ }
+    Err(other) => return Err(other),
+}
+```
+
+- `update` and `delete` on an instance apply only while the stored version
+  equals the loaded one; otherwise they fail with `Error::StaleRecord`
+  (409 in Axeon handlers). A row that no longer exists is still `NotFound`.
+- `update` increments the version and reloads it into the struct.
+  `Query::update` and upserts increment it too, so copies loaded before
+  them are stale (`Query::update` leaves it alone if you assign it).
+
+## Tenant scopes
+
+Mark the column that says which tenant (organization, account, workspace)
+a row belongs to. Such a model only runs through a `Db` that names the
+tenant, or one that opts out explicitly, so a forgotten `org_id` filter is
+an error instead of a data leak.
+
+```rust
+#[derive(Model)]
+struct Selection {
+    id: i64,
+    #[model(tenant, index)]
+    org_id: i64,
+    product_id: i64,
+}
+
+let org = db.for_tenant(org_id);                       // cheap; shares the pool
+let mine = Selection::query().all(&org).await?;        // WHERE org_id = $1
+Selection::query().all(&db).await;                     // Err(Error::TenantScope)
+
+let everyone = db.all_tenants();                       // jobs, operator tools
+let n = Selection::query().count(&everyone).await?;
+let n = Selection::query().all_tenants().count(&org).await?; // per query
+```
+
+- Every read, aggregate, update and delete gets `org_id = <tenant>`, as do
+  `find`, eager loading (`with`), relation accessors, `has` / `where_has`
+  subqueries and both sides of joins (a left join keeps rows without an
+  allowed match).
+- Writes check the row: inserting, updating or bulk-inserting a row of
+  another tenant fails with `Error::WrongTenant` (403 in Axeon), as does
+  `update` setting the tenant column to another value. `update` and
+  `delete` on an instance also require the *stored* row to be the
+  tenant's, so a forged `org_id` gets `NotFound`.
+- Upserts never overwrite another tenant's row that conflicts on a global
+  unique key: `upsert` and `upsert_many` fail with `WrongTenant`, and
+  `insert_or_ignore` returns `None`.
+- Transactions keep the scope of the `Db` they began on.
+- Not covered: raw SQL (`db.execute`, `db.postgres()`, `Expr::raw` still
+  gets the filter added beside it), pivot tables, and models without a
+  tenant column.
+
+## Read replicas
+
+```rust
+let db = Db::connect(&primary_url).await?.with_replicas(vec![
+    Db::connect(&replica_1_url).await?,
+    Db::connect(&replica_2_url).await?,
+]);
+
+// Reads that tolerate replication lag go to a replica, in turn:
+let products = Product::query().filter(Product::CATEGORY.eq("lighting")).all(&db.replica()).await?;
+// Writes, and reads right after them, stay on `db`.
+```
+
+- `db.replica()` is a handle like any `Db` (queries, `find`, streams,
+  reports, cursors), with the same tenant scope and metrics; without
+  replicas it reads the primary, so the same code runs everywhere.
+- Writes through it (and through transactions begun on it) fail with
+  `Error::Config` before reaching the replica.
+- Routing is explicit because only the app knows which reads can be a
+  little stale.
+
+## Query observability
+
+```rust
+let db = Db::connect_with(&url, DbOptions::new()
+    .metrics(&metrics)                              // on Axeon's /metrics
+    .slow_query(Duration::from_millis(200))         // warn! with the SQL, never its values
+    .statement_timeout(Duration::from_secs(5)))     // the database cancels longer statements
+    .await?;
+
+// A tighter limit for one transaction (PostgreSQL):
+let mut tx = db.begin().await?;
+tx.statement_timeout(Duration::from_millis(300)).await?;
+```
+
+- `db_query_duration_seconds` (histogram) and `db_query_errors_total`,
+  labelled by `operation` (`select`, `insert`, `update`, `delete`) and
+  `table`, cover every statement except streamed ones.
+- Slow statements are logged at `warn` with target
+  `axeon_orm::slow_query`: duration, operation, table, a fingerprint for
+  grouping, and the SQL with placeholders.
+- A cancelled statement fails with `Error::StatementTimeout` (503 in Axeon
+  handlers). PostgreSQL applies the timeout to every statement; MySQL's
+  `max_execution_time` covers only `SELECT`s; SQLite has none.
+
 ## Transactions
 
 ```rust
@@ -365,6 +556,32 @@ tx.commit().await?;
 Joins lock only the main table's rows; `count`, `exists` and aggregates
 don't lock. SQLite has no row locks (a write transaction locks the whole
 database), so these are left out there.
+
+## Partitioned tables (PostgreSQL)
+
+For fast-growing, append-mostly tables (audit events, LLM call logs), one
+partition per month or day keeps recent queries fast and makes retention
+a `DROP` instead of a huge `DELETE`:
+
+```rust
+use axeon_orm::partition::Partitioning;
+
+let audit = Partitioning::monthly(AuditEvent::CREATED_AT);     // or ::daily
+audit.create_table::<AuditEvent>(&db).await?;                   // or save create_table_sql() as a migration
+
+// Daily, from a scheduled job:
+audit.ensure(&db, 3).await?;                                    // this month and the next 3
+audit.drop_before(&db, Utc::now() - Duration::days(400)).await?;
+```
+
+- The model is used as usual. Rows whose time has no partition can't be
+  inserted, so keep partitions created ahead with `ensure`.
+- PostgreSQL requires the primary key to include the partition column,
+  so the table's key is `(id, created_at)`; ids still come from one
+  sequence. Other unique columns are refused, and upserts on `id` alone
+  don't work on these tables.
+- Partition bounds are UTC whatever the session time zone; `partitions()`
+  lists them, and `#[model(index)]` indexes reach every partition.
 
 ## LISTEN / NOTIFY
 
@@ -428,6 +645,13 @@ app.get("/users/:id", |req| async move {
     Ok::<_, ServerError>(Json(user))
 });
 
+// Idempotency-Key records in PostgreSQL (prune them from a scheduled job):
+axeon_orm::idempotency::install(&db).await?;
+app.middleware(Idempotency::new().store(PgIdempotencyStore::new(db.clone())));
+
+// Scope req.db() and transactions to the caller's tenant (after auth):
+app.middleware(TenantScope::new(|req| req.extension::<Member>().map(|m| m.org_id)));
+
 // Or one transaction per request, committed on success:
 app.middleware(Transactional::new(db));
 app.post("/transfer", |req| async move {
@@ -451,16 +675,52 @@ app.post("/transfer", |req| async move {
 | `json` | yes | JSON columns (`serde_json::Value`, `sqlx::types::Json<T>`) |
 | `axeon` | yes | Axeon integration |
 | `uuid` | no | `Uuid` columns |
+| `testing` | no | Test helpers (`axeon_orm::testing`); enable it in `[dev-dependencies]` |
 
 ## Not yet
 
-Planned for later versions: composite primary keys, extra columns on pivot
-tables, `GROUP BY` beyond `count_by`, joins across more than two tables,
-and down migrations. For anything
+Planned for later versions: relations from composite-key models,
+self-joins in reports, and down migrations. For anything
 the ORM can't express, use sqlx directly via `db.postgres()` /
 `db.sqlite()`.
 
-## Testing
+## Testing your app
+
+With the `testing` feature (in `[dev-dependencies]`), `axeon_orm::testing`
+gives each test its own database, and builds test records:
+
+```rust
+use axeon_orm::testing::{rollback, Factory, TestDb};
+
+impl Factory for User {
+    fn definition(n: u64) -> Self {
+        User { id: 0, name: format!("User {n}"), email: format!("user{n}@example.com"), ..Default::default() }
+    }
+}
+
+#[tokio::test]
+async fn deactivates_users() -> axeon_orm::Result<()> {
+    let db = TestDb::new().await?;                 // own schema on $AXEON_TEST_DATABASE_URL, else SQLite
+    Migrator::from_dir("migrations")?.run(&db).await?;
+
+    let ada = User::factory().with(|u| u.name = "Ada".into()).create(&*db).await?;
+    let others = User::factory().count(20).create_many(&*db).await?;   // one bulk insert
+
+    // Or keep a test's writes from sticking at all:
+    rollback(&db, async |tx| { /* ... queries with &mut *tx ... */ Ok(()) }).await?;
+
+    db.cleanup().await                             // drops the schema
+}
+```
+
+- `TestDb` makes a PostgreSQL schema or MySQL database per test (or an
+  in-memory SQLite database), so tests run in parallel against a real
+  server without seeing each other's rows. A test that panics before
+  `cleanup` still has its schema dropped when the `TestDb` is dropped.
+- Factory sequence numbers count up per model across the test process,
+  so unique columns built from them don't collide.
+
+## Testing axeon-orm
 
 SQLite tests always run. For PostgreSQL and MySQL, start the databases
 and point the tests at them:

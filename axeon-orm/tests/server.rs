@@ -98,3 +98,73 @@ async fn helpers_explain_missing_setup() {
     assert_eq!(app.call(Request::new(Method::GET, "/db")).await.status, 500);
     assert_eq!(app.call(Request::new(Method::GET, "/tx")).await.status, 500);
 }
+
+#[derive(Model, Clone, Debug, Serialize, Deserialize)]
+struct Selection {
+    id: i64,
+    #[model(tenant)]
+    org_id: i64,
+    product: String,
+}
+
+#[tokio::test]
+async fn tenant_scope_scopes_db_and_transactions() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    db.create_table::<Selection>().await.unwrap();
+    let all = db.all_tenants();
+    for (org, product) in [(1, "lamp"), (1, "desk"), (2, "chair")] {
+        Selection { id: 0, org_id: org, product: product.into() }.insert(&all).await.unwrap();
+    }
+
+    let mut app = Server::new();
+    app.state(db.clone());
+    // Stands in for authentication: the org comes from a header.
+    app.middleware(TenantScope::new(|req| req.get_header("x-org").and_then(|o| o.parse::<i64>().ok())));
+    app.get("/selections", |req| async move {
+        let mine = Selection::query().order_by(Selection::ID.asc()).all(req.db()?).await?;
+        Ok::<_, ServerError>(Json(mine.into_iter().map(|s| s.product).collect::<Vec<_>>()))
+    });
+    // One connection in an in-memory SQLite pool, so only this route holds
+    // a transaction.
+    app.route("/selections/new").middleware(Transactional::new(db.clone())).post(|req| async move {
+        let selection = req.json::<Selection>()?;
+        let mut tx = req.tx()?;
+        let stored = selection.insert(&mut *tx).await?;
+        Ok::<_, ServerError>((201, Json(stored)))
+    });
+    let app = app.into_app().await.unwrap();
+    let list = |org: Option<&'static str>| {
+        let req = Request::new(Method::GET, "/selections");
+        app.call(match org {
+            Some(org) => req.with_header("x-org", org),
+            None => req,
+        })
+    };
+
+    assert_eq!(list(Some("1")).await.body_text(), r#"["lamp","desk"]"#);
+    assert_eq!(list(Some("2")).await.body_text(), r#"["chair"]"#);
+    // No tenant: tenant-scoped models refuse to run, with no details leaked.
+    let unscoped = list(None).await;
+    assert_eq!(unscoped.status, 500);
+    assert!(!unscoped.body_text().contains("chair"));
+
+    // The transaction is scoped too: org 1 can't write org 2's rows.
+    let create = |org: &'static str, owner: i64| {
+        app.call(
+            Request::new(Method::POST, "/selections/new")
+                .with_header("x-org", org)
+                .with_json(&serde_json::json!({ "id": 0, "org_id": owner, "product": "sofa" })),
+        )
+    };
+    assert_eq!(create("1", 2).await.status, 403);
+    assert_eq!(create("1", 1).await.status, 201);
+    assert_eq!(Selection::query().count(&db.for_tenant(1i64)).await.unwrap(), 3);
+    assert_eq!(Selection::query().count(&db.for_tenant(2i64)).await.unwrap(), 1);
+}
+
+#[test]
+fn stale_records_are_conflicts() {
+    let error: ServerError = axeon_orm::Error::StaleRecord("changed".into()).into();
+    assert_eq!(error.status_code(), 409);
+    assert!(error.to_string().contains("reload"));
+}

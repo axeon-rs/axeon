@@ -536,9 +536,45 @@ pub(crate) struct CompiledRouter {
     param_names: Vec<Vec<Arc<str>>>,
 }
 
-/// A slot global middleware can read after routing: the matched pattern.
+/// The route pattern a request matched (e.g. `/users/:id`), for global
+/// middleware, which runs before routing: watch the request on the way in,
+/// read the pattern once the response is back. For metrics and tracing,
+/// where the pattern keeps label cardinality low.
+///
+/// ```rust
+/// use axeon::middleware::from_fn;
+/// use axeon::{MatchedRoute, Server};
+///
+/// let mut app = Server::new();
+/// app.middleware(from_fn(|mut req, next| async move {
+///     let route = MatchedRoute::watch(&mut req);
+///     let response = next.handle(req).await?;
+///     println!("{} -> {}", route.get().unwrap_or("(no route)"), response.status);
+///     Ok(response)
+/// }));
+/// app.get("/users/:id", |_req| async { "user" });
+/// ```
 #[derive(Clone, Default)]
-pub(crate) struct RouteSlot(pub(crate) Arc<std::sync::OnceLock<Arc<str>>>);
+pub struct MatchedRoute(pub(crate) Arc<std::sync::OnceLock<Arc<str>>>);
+
+impl MatchedRoute {
+    /// The request's slot, created if no earlier middleware watches it, so
+    /// several middleware share one.
+    pub fn watch(req: &mut Request) -> MatchedRoute {
+        if let Some(route) = req.extension::<MatchedRoute>() {
+            return route.clone();
+        }
+        let route = MatchedRoute::default();
+        req.insert_extension(route.clone());
+        route
+    }
+
+    /// The matched pattern, once routing has run; `None` for requests no
+    /// route matched (404s, static files).
+    pub fn get(&self) -> Option<&str> {
+        self.0.get().map(|pattern| &**pattern)
+    }
+}
 
 impl CompiledRouter {
     /// The body settings of the route that will handle this request.

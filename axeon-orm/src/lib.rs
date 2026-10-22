@@ -192,9 +192,12 @@
 
 mod db;
 mod error;
+mod cursor;
 mod model;
+mod observe;
 mod query;
 mod sql;
+mod tenant;
 mod value;
 
 pub mod migrate;
@@ -204,14 +207,22 @@ pub mod search;
 pub mod vector;
 #[cfg(all(feature = "axeon", feature = "postgres"))]
 pub mod broadcast;
+#[cfg(all(feature = "axeon", feature = "postgres"))]
+pub mod idempotency;
 #[cfg(feature = "postgres")]
 pub mod notify;
+#[cfg(all(feature = "postgres", feature = "chrono"))]
+pub mod partition;
 pub mod relation;
 pub mod schema;
+pub mod select;
+#[cfg(feature = "testing")]
+pub mod testing;
 #[cfg(feature = "axeon")]
 pub mod server;
 
 pub use crate::db::{Backend, Db, DbOptions, Executor, Row, Transaction};
+pub use crate::cursor::CursorPage;
 pub use crate::error::{Error, Result};
 pub use crate::model::{ColumnDef, Model, OnConflict, Reference, Timestamp};
 pub use crate::query::{Assignment, Column, Expr, JoinQuery, Numeric, Order, Page, Query, RawArgs};
@@ -238,7 +249,7 @@ pub use sqlx;
 pub mod prelude {
     pub use crate::{Db, Executor, Model, Query, Transaction};
     #[cfg(feature = "axeon")]
-    pub use crate::server::{DbRequest, HealthExt, Transactional};
+    pub use crate::server::{DbRequest, HealthExt, TenantScope, Transactional};
 }
 
 #[cfg(feature = "json")]
@@ -253,7 +264,7 @@ mod sealed {
 #[doc(hidden)]
 pub mod __private {
     pub use crate::db::Conn;
-    pub use crate::model::{column_name, delete, find, has_column, insert, insert_many, insert_or_ignore, update, upsert, upsert_many};
+    pub use crate::model::{column_name, delete, find, find_by_key, has_column, insert, insert_many, insert_or_ignore, update, upsert, upsert_many};
 
     pub fn decode_error(column: &str, error: impl std::fmt::Display) -> crate::Error {
         crate::Error::decode(column, error)
@@ -334,6 +345,44 @@ pub mod __private {
 /// #[derive(axeon_orm::Model)]
 /// struct Case { id: i64, status: Status }
 /// let _ = Case::query().filter(Case::STATUS.eq("open"));
+/// ```
+///
+/// A version column that isn't a non-nullable integer:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::Model)]
+/// struct Doc { id: i64, #[model(version)] version: String }
+/// ```
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::Model)]
+/// struct Doc { id: i64, #[model(version)] version: Option<i64> }
+/// ```
+///
+/// Relations from a model with a composite primary key:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::Model)]
+/// struct Post { id: i64, selection_id: i64 }
+/// #[derive(axeon_orm::Model)]
+/// #[model(has_many(Post))]
+/// struct Selection { #[model(primary_key)] a: i64, #[model(primary_key)] b: i64 }
+/// ```
+///
+/// `belongs_to` a model with a composite primary key:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::Model)]
+/// struct Pair { #[model(primary_key)] a: i64, #[model(primary_key)] b: i64 }
+/// #[derive(axeon_orm::Model)]
+/// struct Note { id: i64, #[model(belongs_to = Pair)] pair_id: i64 }
+/// ```
+///
+/// Two version columns:
+///
+/// ```compile_fail
+/// #[derive(axeon_orm::Model)]
+/// struct Doc { id: i64, #[model(version)] a: i64, #[model(version)] b: i64 }
 /// ```
 #[doc(hidden)]
 pub mod compile_fail_tests {}
