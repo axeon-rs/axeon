@@ -255,7 +255,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -366,7 +366,7 @@ dependencies = [
  "redis",
  "rustls",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tokio",
  "tracing",
 ]
@@ -377,7 +377,7 @@ version = "0.1.0"
 dependencies = [
  "axeon",
  "hmac 0.12.1",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tokio",
 ]
 
